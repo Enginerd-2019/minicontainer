@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+*.o
+minicontainer
+test_spawn
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug and profiling
+*.dSYM/
+*.su
+*.out
+vgcore.*
+core
+
+# Temporary files
+*.tmp
+*.log
