@@ -1,44 +1,49 @@
-#include "spawn.h"
+#define _GNU_SOURCE
+#include "namespace.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <getopt.h>
 #include <stdbool.h>
 
-// External environ variable (provided by libc)
 extern char **environ;
 
 static void usage(const char *progname) {
     fprintf(stderr, "Usage: %s [OPTIONS] <command> [args...]\n", progname);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --debug         Enable debug output\n");
+    fprintf(stderr, "  --pid           Enable PID namespace\n");
     fprintf(stderr, "  --env KEY=VALUE Set environment variable\n");
     fprintf(stderr, "  --help          Show this help\n");
     fprintf(stderr, "\nExample:\n");
-    fprintf(stderr, "  %s /bin/ls -la\n", progname);
-    fprintf(stderr, "  %s --env PATH=/bin --env HOME=/root /bin/sh\n", progname);
+    fprintf(stderr, "  %s --pid /bin/sh -c 'echo $$'  # Should print 1\n", progname);
+    fprintf(stderr, "  %s --pid --env FOO=bar /bin/sh -c 'echo $FOO'\n", progname);
 }
 
 int main(int argc, char *argv[]) {
     bool enable_debug = false;
+    bool enable_pid_namespace = false;
 
-    // Simple environment variable storage (stretch goal)
+    // Environment variable storage (from Phase 0)
     char *custom_env[256] = {NULL};
     int env_count = 0;
 
-    // Parse options
     static struct option long_options[] = {
         {"debug", no_argument, NULL, 'd'},
+        {"pid", no_argument, NULL, 'p'},
         {"env", required_argument, NULL, 'e'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "+de:h", long_options, NULL)) != -1) {
+    // NOTE: '+' prefix stops parsing at first non-option (fixes Phase 0 bug)
+    while ((opt = getopt_long(argc, argv, "+dpe:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'd':
                 enable_debug = true;
+                break;
+            case 'p':
+                enable_pid_namespace = true;
                 break;
             case 'e':
                 if (env_count >= 255) {
@@ -63,19 +68,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Setup signal handling
-    if (spawn_init_signals() < 0) {
-        return 1;
-    }
-
-    // Build argv for child
-    const char *program = argv[optind];
-    char **child_argv = &argv[optind];
-
-    // Build envp (either custom or inherit)
+    // Build envp (either custom or inherit) - from Phase 0
     char **envp = NULL;
     if (env_count > 0) {
-        // Copy existing environment and append custom vars
         int existing_count = 0;
         while (environ[existing_count]) existing_count++;
 
@@ -94,18 +89,20 @@ int main(int argc, char *argv[]) {
         envp[existing_count + env_count] = NULL;
     }
 
-    // Configure spawn
-    spawn_config_t config = {
-        .program = program,
-        .argv = child_argv,
+    // Configure namespace
+    namespace_config_t config = {
+        .program = argv[optind],
+        .argv = &argv[optind],
         .envp = envp,
-        .enable_debug = enable_debug
+        .enable_debug = enable_debug,
+        .enable_pid_namespace = enable_pid_namespace
     };
 
-    // Spawn process
-    spawn_result_t result = spawn_process(&config);
+    // Execute
+    namespace_result_t result = namespace_exec(&config);
 
     // Cleanup
+    namespace_cleanup(&result);
     if (envp) {
         free(envp);
     }

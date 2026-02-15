@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 0 - Foundation (fork/execve Baseline)
-**Last Updated:** 2026-02-10
+**Phase:** 1 - PID Namespace Isolation
+**Last Updated:** 2026-02-15
 
 ---
 
@@ -286,6 +286,35 @@ The `+` prefix in the optstring enables POSIX mode, which stops parsing at the f
 ```
 
 **Fix Applied:** 2026-02-10
+
+---
+
+### Error #4: Linker Failure — Undefined References to namespace_exec/namespace_cleanup
+
+**Location:** `Makefile` (link step)
+
+**Symptom:**
+```
+/usr/bin/ld: build/main.o: in function `main':
+main.c:(.text+0x514): undefined reference to `namespace_exec'
+main.c:(.text+0x523): undefined reference to `namespace_cleanup'
+collect2: error: ld returned 1 exit status
+```
+
+**Root Cause:**
+When transitioning `main.c` from Phase 0 (spawn API) to Phase 1 (namespace API), the Makefile was not updated to match. It still compiled and linked only `spawn.c`, but `main.c` now calls `namespace_exec()` and `namespace_cleanup()` from `namespace.c`.
+
+**Changes required:**
+1. Added `namespace.c` / `namespace.o` to source and object file variables
+2. Changed `$(MINICONTAINER)` link target from `$(MAIN_OBJ) $(SPAWN_OBJ)` to `$(MAIN_OBJ) $(NAMESPACE_OBJ)`
+3. Updated `main.o` dependency from `spawn.h` to `namespace.h`
+4. Added `-D_GNU_SOURCE` to CFLAGS (required for `clone()` and `CLONE_NEWPID` in `<sched.h>`)
+
+**Impact:**
+- **Severity:** Critical - build failure, no binary produced
+- **Phase transition note:** When moving between phases, the Makefile must be updated alongside source changes. The guide's compilation instructions (Phase 1, Section 10.1) show the correct gcc invocation but don't provide an updated Makefile.
+
+**Fix Applied:** 2026-02-15
 
 ---
 
