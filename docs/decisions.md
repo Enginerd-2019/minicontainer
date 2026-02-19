@@ -100,6 +100,25 @@ int main() {
 
 ---
 
+### 7. Superseding spawn.c with namespace.c (Phase 1)
+
+**Decision:** Replace `spawn.c` (`fork()`) with `namespace.c` (`clone()`) as the core execution module, rather than modifying `spawn.c` in place.
+
+**Rationale:**
+- **Clean separation:** `clone()` has a fundamentally different calling convention than `fork()` — it requires a child function pointer and explicit stack, making an in-place swap awkward
+- **Superset behavior:** `namespace_exec()` handles both namespaced and non-namespaced execution via conditional flags (`SIGCHLD` alone vs `SIGCHLD | CLONE_NEWPID`), so it fully replaces `spawn_process()`
+- **Testability:** Keeping `spawn.c`/`spawn.h` allows Phase 0 tests (`test_spawn.c`) to continue running unchanged as a regression baseline
+- **New API surface:** `namespace_config_t` adds `enable_pid_namespace` field; `namespace_result_t` adds `stack_ptr` for cleanup — these don't fit cleanly into the Phase 0 types
+
+**What changed in main.c:**
+- `#include "spawn.h"` → `#include "namespace.h"`
+- `spawn_config_t` → `namespace_config_t`
+- `spawn_process()` → `namespace_exec()`
+- `spawn_init_signals()` removed (namespace_exec handles wait internally; SIGCHLD handler could race with explicit waitpid)
+- Added `namespace_cleanup()` call to free clone stack
+
+---
+
 ### 6. Exit Code Conventions
 
 **Decision:** Follow shell conventions for exit codes.
@@ -160,6 +179,40 @@ int main() {
 
 **Forbidden functions:**
 - `printf()`, `malloc()`, `free()` ✗
+
+---
+
+### 5. Why clone() Instead of fork() (Phase 1)
+
+**Choice:** Use `clone()` with namespace flags instead of continuing with `fork()`.
+
+**Rationale:**
+- **Namespace support:** `fork()` cannot create new namespaces — `clone()` accepts `CLONE_NEWPID`, `CLONE_NEWNS`, etc. as flags
+- **Extensibility:** The same `clone()` call will absorb additional namespace flags in Phase 2+ (`CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWNET`) without changing the calling pattern
+- **Backward compatibility:** Without `CLONE_NEWPID`, `clone()` with just `SIGCHLD` behaves like `fork()`, so one codepath handles both modes
+- **Trade-off:** `clone()` requires manual stack allocation (unlike `fork()`), but this is a one-time cost that enables all future namespace features
+
+**Why not `unshare()` + `fork()`?**
+- `unshare(CLONE_NEWPID)` affects the *calling* process's children, not the caller itself — the parent would need to fork after unshare, adding complexity
+- `clone()` creates the child directly in the new namespace in a single syscall
+
+---
+
+### 6. malloc() for clone() Stack
+
+**Choice:** Use `malloc()` to allocate the child's stack rather than `mmap()`.
+
+**Rationale:**
+- **Simplicity:** `malloc(STACK_SIZE)` is a single call vs `mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0)`
+- **Portability:** `malloc()` handles alignment automatically on all platforms
+- **Sufficient for our use case:** The stack is only used briefly before `execve()` replaces the process image entirely — the kernel allocates a new stack for the exec'd program
+- **Easy cleanup:** `free()` in `namespace_cleanup()` vs `munmap()` with size tracking
+
+**Stack size:** 1 MB (`1024 * 1024`), which is standard for most programs and sufficient for the brief period before `execve()`.
+
+**Stack direction:** x86_64 stacks grow downward, so `clone()` receives `stack + STACK_SIZE` (top), not `stack` (base).
+
+**Alternative considered:** `mmap()` with `MAP_STACK` and `MAP_GROWSDOWN` would provide guard pages for stack overflow detection, but adds complexity not needed at this phase.
 
 ---
 
@@ -387,59 +440,49 @@ When transitioning `main.c` from Phase 0 (spawn API) to Phase 1 (namespace API),
 
 ## Future Considerations
 
-### Phase 1: PID Namespace Isolation
+### ✅ Phase 1: PID Namespace Isolation (Complete)
 
-**Changes needed:**
-- Replace `fork()` with `clone(CLONE_NEWPID | SIGCHLD, ...)`
-- Allocate stack for child (clone requires explicit stack)
-- Move execve logic into callback function
-- Child will see itself as PID 1
+**What was done:**
+- Replaced `fork()` with `clone(CLONE_NEWPID | SIGCHLD, ...)`
+- Allocated stack for child via `malloc()`
+- Moved execve logic into `child_func()` callback
+- Child sees itself as PID 1
 
-**API compatibility:**
-- `spawn_config_t` structure will remain compatible
-- `spawn_process()` signature unchanged (internal implementation differs)
-
----
-
-### Phase 2: Filesystem Isolation (chroot)
-
-**Changes needed:**
-- Add `rootfs` field to `spawn_config_t`
-- Call `chroot()` in child before execve
-- Handle `/proc`, `/dev` mounting
-
-**Security concerns:**
-- chroot is not a security boundary (can be escaped)
-- Requires root privileges
+**API outcome (differs from original plan):**
+- Created new `namespace_config_t` and `namespace_result_t` types rather than extending `spawn_config_t`
+- `spawn_process()` replaced by `namespace_exec()`, not modified
+- Added `namespace_cleanup()` for stack deallocation
+- See Architecture Decision #7 for rationale
 
 ---
 
-### Phase 3: Mount Namespace
+### Phase 2: Mount Namespace & Filesystem Isolation
 
 **Changes needed:**
-- Add `CLONE_NEWNS` to clone flags
-- Implement proper mount propagation
-- Create private `/proc` mount for child
+- Add `CLONE_NEWNS` to clone flags in `namespace_exec()`
+- Add `rootfs_path` field to `namespace_config_t`
+- Use `pivot_root()` (not `chroot()`) in child for proper isolation
+- Mount `/proc` inside container for accurate `ps` output
+- Add `--rootfs` flag to main.c
+
+---
+
+### Phase 3: UTS & User Namespace
+
+**Changes needed:**
+- Add `CLONE_NEWUTS` to clone flags for hostname isolation
+- Add `CLONE_NEWUSER` for UID/GID mapping
+- Enable rootless (unprivileged) container creation
 
 ---
 
 ### Phase 4: Resource Limits (cgroups)
 
 **Changes needed:**
-- Add cgroup configuration to spawn_config_t
-- Create/configure cgroup before fork
+- Add cgroup configuration to `namespace_config_t`
+- Create/configure cgroup before clone
 - Move child into cgroup
 - Cleanup cgroup on exit
-
-**Example fields:**
-```c
-typedef struct {
-    // ... existing fields
-    const char *cgroup_path;
-    size_t memory_limit_bytes;
-    int cpu_shares;
-} spawn_config_t;
-```
 
 ---
 
@@ -454,12 +497,18 @@ typedef struct {
 
 ## Testing Strategy
 
-### Unit Tests (tests/test_spawn.c)
+### Phase 0 Unit Tests (tests/test_spawn.c)
 
 - ✓ Basic execution (`/bin/true`)
 - ✓ Exit code propagation
 - ✓ Signal death handling
 - ✓ execve failure (command not found)
+
+### Phase 1 Unit Tests (tests/test_namespace.c — requires root)
+
+- ✓ PID namespace isolation (child is PID 1)
+- ✓ Non-namespaced execution (fallback path)
+- ✓ Stack allocation and cleanup
 
 ### Integration Tests (Makefile: make examples)
 
@@ -467,6 +516,8 @@ typedef struct {
 - ✓ Debug output
 - ✓ Environment variables
 - ✓ Exit code forwarding
+- ✓ PID namespace with `--pid` flag
+- ✓ PID namespace with debug output
 
 ### Stress Tests
 
@@ -478,12 +529,17 @@ typedef struct {
 
 ## References
 
-- POSIX fork(2): Creates child process
-- POSIX execve(2): Replaces process image
-- POSIX waitpid(2): Waits for child state change
-- POSIX sigaction(2): Installs signal handlers
-- POSIX signal-safety(7): Async-signal-safe functions
+- clone(2): Creates child process with namespace flags
+- fork(2): Creates child process
+- execve(2): Replaces process image
+- waitpid(2): Waits for child state change
+- sigaction(2): Installs signal handlers
+- namespaces(7): Overview of Linux namespaces
+- pid_namespaces(7): PID namespace details
+- signal-safety(7): Async-signal-safe functions
 - [Phase 0 Implementation Guide](../phase0_foundation_implementation_guide.md)
+- [Phase 1 Implementation Guide](../phase1_pid_namespace_implementation_guide.md)
+- [LWN: Namespaces in operation](https://lwn.net/Articles/531114/)
 - [Linux System Programming by Robert Love](https://www.oreilly.com/library/view/linux-system-programming/9781449341527/)
 
 ---
