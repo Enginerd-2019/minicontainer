@@ -392,6 +392,44 @@ When transitioning `main.c` from Phase 0 (spawn API) to Phase 1 (namespace API),
 
 ---
 
+### Error #5: MS_BIND | MS_PRIVATE Combined in Single mount() Call
+
+**Location:** `src/mount.c:46`
+
+**Original Code:**
+```c
+if(mount(abs_path, abs_path, NULL, MS_BIND | MS_PRIVATE, NULL) < 0){
+```
+
+**Problem:**
+Per `mount(2)`, propagation type flags (`MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE`) cannot be combined with other flags in a single `mount()` call. The kernel silently ignores `MS_PRIVATE` when combined with `MS_BIND`, leaving the mount with the parent's default propagation (typically shared). This means mount/unmount events could propagate between the container and host namespaces, defeating the purpose of namespace isolation. On stricter kernels, `pivot_root` may also return `EINVAL` if the new root is not in a private mount subtree.
+
+**Fixed Code:**
+```c
+if(mount(abs_path, abs_path, NULL, MS_BIND | MS_REC, NULL) < 0){
+    perror("mount(MS_BIND)");
+    return -1;
+}
+
+if(mount("", abs_path, NULL, MS_PRIVATE | MS_REC, NULL) < 0){
+    perror("mount(MS_PRIVATE)");
+    return -1;
+}
+```
+
+**What changed:**
+- Split into two `mount()` calls: bind mount first, then set propagation
+- Added `MS_REC` to both calls so submounts are included in the bind and also marked private
+
+**Impact:**
+- **Severity:** High - mount propagation was not actually being set to private
+- **Symptom:** Silent; the call succeeded but `MS_PRIVATE` was ignored
+- **Root Cause:** `mount(2)` man page states propagation flags require a separate call
+
+**Fix Applied:** 2026-02-22
+
+---
+
 ## Known Limitations
 
 ### 1. No PATH Search
