@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 1 - PID Namespace Isolation
-**Last Updated:** 2026-02-15
+**Phase:** 2 - Mount Namespace & Filesystem Isolation
+**Last Updated:** 2026-02-19
 
 ---
 
@@ -134,6 +134,27 @@ int main() {
 - **Compatibility:** Matches bash/sh behavior
 - **Familiarity:** Standard Unix convention
 - **Debugging:** Easy to identify failure modes
+
+---
+
+### 8. Build Minimal rootfs Manually vs. Download Alpine minirootfs (Phase 2)
+
+**Decision:** Build the rootfs by hand (Option 2) rather than downloading a pre-built Alpine minirootfs.
+
+**Options considered:**
+- **Option 1 — Alpine minirootfs:** Download a ~2.7 MB tarball containing a complete musl-based userland (busybox, apk, /etc skeleton)
+- **Option 2 — Manual rootfs:** Create the directory tree manually, copy only the specific binaries needed (`/bin/sh`, `/bin/ls`, `/bin/echo`), and resolve shared library dependencies with `ldd`
+
+**Rationale:**
+- **Educational value:** Manually assembling a rootfs teaches exactly what a root filesystem requires — which directories the kernel expects, which shared libraries a dynamically-linked binary depends on, and how the ELF loader (`ld-linux-x86-64.so.2`) resolves them. Downloading a tarball hides all of this.
+- **Minimal surface area:** The hand-built rootfs contains only the binaries explicitly copied. Alpine's minirootfs ships busybox (300+ applets), apk, and configuration files that are irrelevant to understanding mount namespace isolation.
+- **No network dependency:** Option 2 works entirely offline using binaries already on the host. Option 1 requires downloading from `dl-cdn.alpinelinux.org`, adding a failure mode unrelated to the project.
+- **Faster iteration:** Rebuilding the rootfs is a few `cp` commands. No re-downloading or re-extracting.
+
+**Trade-offs:**
+- The manual rootfs is host-libc-dependent (glibc binaries from the host won't work inside a musl-based container, but that's irrelevant here since the container uses the same host libraries)
+- Adding new binaries requires manually resolving their library dependencies via `ldd`
+- Alpine minirootfs would provide a more "realistic" container environment with a package manager
 
 ---
 
