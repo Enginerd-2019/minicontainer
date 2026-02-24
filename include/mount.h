@@ -1,7 +1,6 @@
 #ifndef MOUNT_H
 #define MOUNT_H
 
-#define _GNU_SOURCE
 #include <sched.h>
 #include <stdbool.h>
 #include <sys/types.h>

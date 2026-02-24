@@ -3,6 +3,11 @@ build/
 *.o
 minicontainer
 test_spawn
+test_namespace
+test_mount
+
+# Generated rootfs (built from host binaries, not source)
+rootfs/
 
 # Editor files
 *.swp

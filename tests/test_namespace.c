@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include "namespace.h"
 #include <assert.h>
 #include <stdio.h>

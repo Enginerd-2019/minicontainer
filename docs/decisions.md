@@ -428,6 +428,40 @@ if(mount("", abs_path, NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 
 **Fix Applied:** 2026-02-22
 
+### Error #6: pivot_root EINVAL Due to Shared Root Propagation
+
+**Location:** `src/mount.c` — `setup_rootfs()`
+
+**Symptom:**
+```
+pivot_root: Invalid argument
+[child] Failed to setup rootfs
+```
+
+**Problem:**
+Systemd sets `/` to shared propagation at boot. `CLONE_NEWNS` inherits this propagation into the child's mount namespace. `pivot_root` requires the current root to not be shared — if it is, the kernel returns `EINVAL`. The original code made `abs_path` (the new rootfs) private but never addressed the current root's propagation.
+
+**Fixed Code:**
+```c
+// Added as first mount operation in setup_rootfs, before bind mount
+if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
+    perror("mount(MS_PRIVATE /)");
+    return -1;
+}
+```
+
+**What changed:**
+- Make the entire inherited mount tree private before any other mount operations
+- This is safe because we're in a new mount namespace (`CLONE_NEWNS`) — the parent's mounts are unaffected
+
+**Impact:**
+- **Severity:** Critical — `pivot_root` fails on all systemd-based systems without this
+- **Symptom:** `pivot_root: Invalid argument` at runtime
+- **Root Cause:** Inherited shared propagation from systemd
+- **Prior art:** runc, Docker, and LXC all perform this step
+
+**Fix Applied:** 2026-02-23
+
 ---
 
 ## Known Limitations
