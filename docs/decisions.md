@@ -630,8 +630,6 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 - namespaces(7): Overview of Linux namespaces
 - pid_namespaces(7): PID namespace details
 - signal-safety(7): Async-signal-safe functions
-- [Phase 0 Implementation Guide](../phase0_foundation_implementation_guide.md)
-- [Phase 1 Implementation Guide](../phase1_pid_namespace_implementation_guide.md)
 - [LWN: Namespaces in operation](https://lwn.net/Articles/531114/)
 - [Linux System Programming by Robert Love](https://www.oreilly.com/library/view/linux-system-programming/9781449341527/)
 
