@@ -2,7 +2,7 @@
 
 **Project:** minicontainer - Minimal Container Runtime
 **Phase:** 2 - Mount Namespace & Filesystem Isolation
-**Last Updated:** 2026-02-19
+**Last Updated:** 2026-02-27
 
 ---
 
@@ -155,6 +155,79 @@ int main() {
 - The manual rootfs is host-libc-dependent (glibc binaries from the host won't work inside a musl-based container, but that's irrelevant here since the container uses the same host libraries)
 - Adding new binaries requires manually resolving their library dependencies via `ldd`
 - Alpine minirootfs would provide a more "realistic" container environment with a package manager
+
+---
+
+### 9. Superseding namespace.c with mount.c (Phase 2)
+
+**Decision:** Replace `namespace.c` (`clone(CLONE_NEWPID)`) with `mount.c` (`clone(CLONE_NEWPID | CLONE_NEWNS)`) as the core execution module, following the same pattern used when superseding `spawn.c` in Phase 1.
+
+**Rationale:**
+- **New responsibilities:** Phase 2 adds rootfs pivot, `/proc` mounting, and mount propagation management — these are filesystem operations that don't belong in `namespace.c` which was scoped to PID isolation
+- **Superset behavior:** `mount_exec()` handles PID namespace, mount namespace, and non-namespaced execution via conditional flags, fully replacing `namespace_exec()`
+- **Clean API surface:** `mount_config_t` adds `enable_mount_namespace` and `rootfs_path` fields; `mount_result_t` is structurally identical to `namespace_result_t` but namespaced under the mount module
+- **Testability:** Keeping `namespace.c`/`namespace.h` allows Phase 1 tests to continue running unchanged
+
+**What changed in main.c:**
+- `#include "namespace.h"` → `#include "mount.h"`
+- `namespace_config_t` → `mount_config_t` (with new fields)
+- `namespace_exec()` → `mount_exec()`
+- `namespace_cleanup()` → `mount_cleanup()`
+- Added `--rootfs <path>` option (auto-enables mount namespace)
+- Removed `--env` option (simplification; environment inheritance via `envp = NULL`)
+
+**What changed in Makefile:**
+- `$(MINICONTAINER)` link target: `main.o + namespace.o` → `main.o + mount.o`
+- Added `test_mount` target linked against `mount.o`
+
+---
+
+### 10. Why pivot_root() Instead of chroot() (Phase 2)
+
+**Decision:** Use `pivot_root()` syscall via `syscall(SYS_pivot_root, ...)` instead of `chroot()`.
+
+**Rationale:**
+- **True isolation:** `chroot()` only changes the apparent root directory — processes can escape via `fchdir()` to an open fd, `..` traversal from a working directory outside the root, or a second `chroot()` call. `pivot_root()` actually swaps the root mount, leaving no reference to the old root once it's unmounted
+- **Mount namespace integration:** `pivot_root()` is designed to work with `CLONE_NEWNS` — the old root becomes a submount that can be cleanly unmounted. `chroot()` has no mount semantics
+- **Industry standard:** runc, crun, and Docker all use `pivot_root()` for container rootfs setup
+- **Kernel enforcement:** `pivot_root()` requires the new root to be a mount point in a private subtree, which forces the caller to set up proper mount isolation — a correctness guardrail that `chroot()` lacks
+
+**Trade-offs:**
+- `pivot_root()` has no glibc wrapper — must use `syscall(SYS_pivot_root, new_root, put_old)` directly
+- Requires the new root to be a mount point (handled by bind-mounting it to itself)
+- Requires non-shared mount propagation (handled by `mount(MS_PRIVATE | MS_REC)`)
+- More setup steps than `chroot(path); chdir("/");`
+
+---
+
+### 11. Mount Propagation Strategy (Phase 2)
+
+**Decision:** Make the entire mount tree private (`MS_PRIVATE | MS_REC`) before performing any other mount operations in `setup_rootfs()`.
+
+**Rationale:**
+- **Systemd compatibility:** Systemd sets `/` to shared propagation at boot. `CLONE_NEWNS` inherits this into the child. Without making mounts private, `pivot_root()` returns `EINVAL` on all systemd-based systems
+- **Isolation guarantee:** Private propagation ensures mount/unmount events inside the container don't leak to the host namespace, and vice versa
+- **Two-call pattern:** `mount(2)` requires propagation flags in a separate call from other flags. The bind mount and propagation change for the rootfs are therefore two calls, not one (see Error #5)
+
+**Order of operations in `setup_rootfs()`:**
+1. `mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL)` — make inherited tree private
+2. `mount(abs_path, abs_path, NULL, MS_BIND | MS_REC, NULL)` — bind mount rootfs to itself
+3. `mount("", abs_path, NULL, MS_PRIVATE | MS_REC, NULL)` — make rootfs subtree private
+4. `chdir(abs_path)` → `mkdir("old_root")` → `pivot_root(".", "old_root")`
+5. `chdir("/")` → `umount2("/old_root", MNT_DETACH)` → `rmdir("/old_root")`
+
+---
+
+### 12. Lazy Unmount for Old Root (Phase 2)
+
+**Decision:** Use `umount2("/old_root", MNT_DETACH)` (lazy unmount) instead of `umount("/old_root")`.
+
+**Rationale:**
+- **Robustness:** A regular `umount()` fails with `EBUSY` if any process has an open file descriptor or working directory under the mount point. `MNT_DETACH` detaches the mount from the namespace immediately, then cleans up resources as references are dropped
+- **Simplicity:** No need to track and close all references to the old root before unmounting
+- **Safety:** The container is already in its new rootfs at this point; the old root is unreachable from the new namespace tree after detach
+
+**Trade-off:** Lazy unmount means the actual cleanup of kernel resources is deferred. In practice this is negligible since the old root references drain almost immediately after detach.
 
 ---
 
@@ -474,42 +547,13 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 - `execve()` does not search PATH (unlike `execvp()`)
 - Explicit paths prevent security issues (PATH injection)
 
-**Workaround:** Users must specify full paths.
+**Workaround:** Users must specify full paths. When using `--rootfs`, the path must resolve inside the rootfs.
 
 **Future:** Consider adding `which` lookup or `execvp()` option.
 
 ---
 
-### 2. Environment Variable Merging
-
-**Limitation:** Custom environment variables are appended, not merged/overwritten.
-
-**Example:**
-```bash
-# If PATH is already set in parent:
-./minicontainer --env PATH=/custom /bin/sh
-# Child will have TWO PATH entries!
-```
-
-**Impact:** Last value wins (shell behavior), but wasteful.
-
-**Future:** Implement proper deduplication/override logic.
-
----
-
-### 3. Fixed Environment Array Size
-
-**Limitation:** Maximum 255 custom environment variables (hardcoded in main.c).
-
-**Rationale:**
-- Simple fixed-size array avoids dynamic allocation complexity
-- 255 is far more than typical use case
-
-**Future:** Use dynamic array (realloc) for unlimited size.
-
----
-
-### 4. No File Descriptor Management
+### 2. No File Descriptor Management
 
 **Limitation:** Child inherits all open file descriptors from parent.
 
@@ -521,13 +565,33 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 
 ---
 
-### 5. Single Command Execution
+### 3. Single Command Execution
 
 **Limitation:** Can only run one command, then exits.
 
-**Rationale:** Phase 0 is deliberately simple - just fork/execve baseline.
+**Rationale:** Deliberately simple — lifecycle management comes in Phase 6.
 
-**Future:** Phase 2+ will add container lifecycle management.
+**Future:** Phase 6 will add start/stop/exec container lifecycle management.
+
+---
+
+### 4. Rootfs Must Be Pre-Built
+
+**Limitation:** The `--rootfs` flag expects a pre-existing directory with a complete filesystem tree. There is no image pull, layer extraction, or rootfs generation.
+
+**Rationale:** Educational focus — manually building a rootfs teaches what a root filesystem requires (see Architecture Decision #8).
+
+**Workaround:** Build rootfs manually by copying binaries and their shared library dependencies via `ldd`.
+
+---
+
+### 5. No tmpfs or Device Mounts
+
+**Limitation:** Only `/proc` is automatically mounted inside the container. `/tmp`, `/dev`, `/sys`, and other standard mounts are not set up.
+
+**Impact:** Programs that expect `/dev/null`, `/dev/urandom`, or `/tmp` will fail inside the container unless the rootfs includes them as regular files/directories.
+
+**Future:** Add `/dev` (minimal device nodes), `/tmp` (tmpfs), and `/sys` (sysfs) mounts in the child setup.
 
 ---
 
@@ -549,22 +613,37 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 
 ---
 
-### Phase 2: Mount Namespace & Filesystem Isolation
+### ✅ Phase 2: Mount Namespace & Filesystem Isolation (Complete)
 
-**Changes needed:**
-- Add `CLONE_NEWNS` to clone flags in `namespace_exec()`
-- Add `rootfs_path` field to `namespace_config_t`
-- Use `pivot_root()` (not `chroot()`) in child for proper isolation
-- Mount `/proc` inside container for accurate `ps` output
-- Add `--rootfs` flag to main.c
+**What was done:**
+- Created new `mount.c`/`mount.h` module superseding `namespace.c` (see Architecture Decision #9)
+- Added `CLONE_NEWNS` to clone flags alongside `CLONE_NEWPID`
+- Implemented `setup_rootfs()`: bind mount → private propagation → `pivot_root()` → unmount old root
+- Implemented `mount_proc()`: mounts `/proc` filesystem after pivot for PID namespace visibility
+- Created `mount_config_t` with `enable_mount_namespace` and `rootfs_path` fields
+- Added `--rootfs <path>` CLI flag that auto-enables mount namespace
+- Removed `--env` flag from main.c (simplified; environment inherited via `envp = NULL`)
+
+**API outcome (differs from original plan):**
+- Created new `mount_config_t` and `mount_result_t` types rather than extending `namespace_config_t`
+- `namespace_exec()` replaced by `mount_exec()`, not modified
+- `mount_exec()` handles both PID and mount namespaces via conditional flag building
+- See Architecture Decision #9 for rationale
+
+**Key implementation details:**
+- `pivot_root()` called via `syscall(SYS_pivot_root)` — no glibc wrapper exists (see Decision #10)
+- Mount propagation set to private before any other mount ops — required for systemd compatibility (see Decision #11, Error #6)
+- Bind mount and propagation change are separate `mount()` calls — kernel requirement (see Error #5)
+- Old root lazily unmounted via `MNT_DETACH` (see Decision #12)
 
 ---
 
 ### Phase 3: UTS & User Namespace
 
 **Changes needed:**
-- Add `CLONE_NEWUTS` to clone flags for hostname isolation
+- Add `CLONE_NEWUTS` to clone flags in `mount_exec()` for hostname isolation
 - Add `CLONE_NEWUSER` for UID/GID mapping
+- Add `hostname` and `uid_map`/`gid_map` fields to `mount_config_t`
 - Enable rootless (unprivileged) container creation
 
 ---
@@ -572,7 +651,7 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 ### Phase 4: Resource Limits (cgroups)
 
 **Changes needed:**
-- Add cgroup configuration to `namespace_config_t`
+- Add cgroup configuration to `mount_config_t`
 - Create/configure cgroup before clone
 - Move child into cgroup
 - Cleanup cgroup on exit
@@ -603,18 +682,23 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 - ✓ Non-namespaced execution (fallback path)
 - ✓ Stack allocation and cleanup
 
+### Phase 2 Unit Tests (tests/test_mount.c — requires root + rootfs)
+
+- ✓ Rootfs isolation (container sees only rootfs contents)
+- ✓ /proc mount (proc filesystem mounted and accessible inside container)
+
 ### Integration Tests (Makefile: make examples)
 
 - ✓ Real commands (`/bin/ls`, `/bin/echo`)
 - ✓ Debug output
-- ✓ Environment variables
 - ✓ Exit code forwarding
 - ✓ PID namespace with `--pid` flag
-- ✓ PID namespace with debug output
+- ✓ Rootfs isolation with `--rootfs ./rootfs`
+- ✓ Full isolation (`--pid --rootfs ./rootfs`)
+- ✓ Debug with full isolation
 
 ### Stress Tests
 
-- Zombie prevention (1000+ rapid spawns)
 - Memory leak detection (valgrind)
 - Error path coverage
 
@@ -622,6 +706,10 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 
 ## References
 
+- pivot_root(2): Change the root filesystem
+- mount(2): Mount filesystem, set propagation flags
+- umount2(2): Unmount filesystem with flags (MNT_DETACH)
+- mount_namespaces(7): Mount namespace details and propagation
 - clone(2): Creates child process with namespace flags
 - fork(2): Creates child process
 - execve(2): Replaces process image
@@ -631,6 +719,7 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 - pid_namespaces(7): PID namespace details
 - signal-safety(7): Async-signal-safe functions
 - [LWN: Namespaces in operation](https://lwn.net/Articles/531114/)
+- [LWN: Mount namespaces and shared subtrees](https://lwn.net/Articles/689856/)
 - [Linux System Programming by Robert Love](https://www.oreilly.com/library/view/linux-system-programming/9781449341527/)
 
 ---
