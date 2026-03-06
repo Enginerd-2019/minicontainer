@@ -638,27 +638,41 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 
 ---
 
-### Phase 3: UTS & User Namespace
+### Phase 3: OverlayFS (Copy-on-Write Filesystem)
 
 **Changes needed:**
-- Add `CLONE_NEWUTS` to clone flags in `mount_exec()` for hostname isolation
+- Create new `overlay.c`/`overlay.h` module superseding `mount.c`
+- Mount OverlayFS over rootfs: read-only base image (lowerdir) + writable upper layer (upperdir)
+- Generate unique container ID for per-container overlay directories
+- Create `setup_overlay()` and `teardown_overlay()` for overlay lifecycle
+- `overlay_exec()` replaces `mount_exec()` as the top-level execution function
+- Add `--overlay` and `--container-dir` CLI flags
+- Automatic cleanup of writable layer on container exit
+- Backward compatible: without `--overlay`, behavior is identical to Phase 2
+
+---
+
+### Phase 4: UTS & User Namespace
+
+**Changes needed:**
+- Add `CLONE_NEWUTS` to clone flags for hostname isolation
 - Add `CLONE_NEWUSER` for UID/GID mapping
-- Add `hostname` and `uid_map`/`gid_map` fields to `mount_config_t`
+- Add `hostname` and `uid_map`/`gid_map` fields to config
 - Enable rootless (unprivileged) container creation
 
 ---
 
-### Phase 4: Resource Limits (cgroups)
+### Phase 5: Resource Limits (cgroups)
 
 **Changes needed:**
-- Add cgroup configuration to `mount_config_t`
+- Add cgroup configuration to config
 - Create/configure cgroup before clone
 - Move child into cgroup
 - Cleanup cgroup on exit
 
 ---
 
-### Phase 5: Network Isolation
+### Phase 6: Network Isolation
 
 **Changes needed:**
 - Add `CLONE_NEWNET` to clone flags
