@@ -553,15 +553,16 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 
 ---
 
-### 2. No File Descriptor Management
+### 2. No File Descriptor Management (Security — CVE-2024-21626, CVE-2016-9962)
 
 **Limitation:** Child inherits all open file descriptors from parent.
 
 **Impact:**
-- Could leak file descriptors (sockets, pipes, etc.)
-- Security concern in production environments
+- After `clone()`, the child has copies of every parent fd. Any fd referencing the host filesystem survives `pivot_root()` + `umount2("/old_root", MNT_DETACH)` because lazy unmount detaches the *mount*, not the *file descriptions*.
+- A container process that discovers a leaked fd can read/write host files outside the mount namespace — this is a container escape.
+- This is the exact mechanism exploited by **CVE-2024-21626 (Leaky Vessels)**: a leaked fd during runc's `clone()`-to-`execve()` window allowed full container escape. **CVE-2016-9962** is the same root cause.
 
-**Future:** Set `FD_CLOEXEC` on all fds except stdin/stdout/stderr, or close all fds > 2.
+**Phase 3 fix:** `close_inherited_fds()` iterates `/proc/self/fd` after `mount_proc()` and closes every fd above `STDERR_FILENO` before `execve()`. See Phase 3 guide §1.2.2.
 
 ---
 
@@ -592,6 +593,33 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 **Impact:** Programs that expect `/dev/null`, `/dev/urandom`, or `/tmp` will fail inside the container unless the rootfs includes them as regular files/directories.
 
 **Future:** Add `/dev` (minimal device nodes), `/tmp` (tmpfs), and `/sys` (sysfs) mounts in the child setup.
+
+---
+
+### 6. Environment Variable Leak After pivot_root (Security)
+
+**Limitation:** After `pivot_root()` into the container rootfs, the child process still inherits the host's full `environ`. Variables like `PATH=/home/tcrumb/.local/bin:/usr/local/bin:/usr/bin`, `HOME=/home/tcrumb`, and `SHELL=/bin/bash` reference paths that do not exist inside the container rootfs.
+
+**Impact:**
+- Programs that read `HOME` to create `~/.config/` would write to a nonexistent path
+- Programs that read `SHELL` to spawn a subshell would fail if `/bin/bash` isn't in the rootfs
+- Basic commands work by accident because `/usr/bin` and `/bin` happen to appear in the host's `PATH`, and the rootfs has binaries there — but this is fundamentally broken
+- The `--env KEY=VALUE` flag from Phase 0 was dropped in Phase 2's `main.c` (no `case 'e':` in the getopt switch)
+
+**Phase 3 fix:** `build_container_env()` constructs a minimal container-appropriate environment (`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root`, `TERM=xterm`). The `--env` flag is restored with proper key-replacement semantics. See Phase 3 guide §1.2.1.
+
+---
+
+### 7. No Copy-on-Write Filesystem
+
+**Limitation:** Container writes modify the base rootfs directory directly on the host. There is no isolation between container runs.
+
+**Impact:**
+- Running `rm /bin/ls` in one container permanently deletes it for all future containers
+- No way to share a single base image across multiple concurrent containers
+- No clean-slate guarantee between container runs
+
+**Phase 3 fix:** OverlayFS layers a writable `upperdir` on top of a read-only `lowerdir` (the rootfs). The container sees a merged view; writes go to the upper layer only. On container exit, the upper layer is discarded and the base image is untouched. See Phase 3 guide §1.3.
 
 ---
 
@@ -638,7 +666,7 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 
 ---
 
-### Phase 3: OverlayFS (Copy-on-Write Filesystem)
+### Phase 3: OverlayFS & Security Corrections
 
 **Changes needed:**
 - Create new `overlay.c`/`overlay.h` module superseding `mount.c`
@@ -649,6 +677,11 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 - Add `--overlay` and `--container-dir` CLI flags
 - Automatic cleanup of writable layer on container exit
 - Backward compatible: without `--overlay`, behavior is identical to Phase 2
+
+**Security corrections (addressing Known Limitations #2, #6, #7):**
+- **Environment isolation (KL #6):** `build_container_env()` constructs a minimal container environment (`PATH`, `HOME`, `TERM`). Restores `--env KEY=VALUE` with key-replacement semantics. Fixes the host `environ` leak that has existed since Phase 0.
+- **File descriptor audit (KL #2):** `close_inherited_fds()` closes all fds above stderr before `execve()`. Fixes the fd leak vulnerability (CVE-2024-21626, CVE-2016-9962) that has existed since Phase 0.
+- **Mount hardening:** Overlay mounted with `MS_NODEV | MS_NOSUID` to block device node access and SUID escalation inside the container.
 
 ---
 

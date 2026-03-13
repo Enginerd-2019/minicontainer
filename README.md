@@ -435,12 +435,15 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 
 ## Known Limitations
 
-1. **No PATH search** - Must use absolute paths (`/bin/ls`, not `ls`)
-2. **No FD management** - Child inherits all open file descriptors
-3. **Single command** - Runs one command then exits (no daemon mode)
-4. **Requires root for namespaces** - `CLONE_NEWPID`/`CLONE_NEWNS` need `CAP_SYS_ADMIN` (user namespaces in Phase 3 will allow unprivileged use)
-5. **Rootfs must be pre-built** - No image pull or layer support; rootfs directory must exist before running
-6. **No tmpfs mounts** - Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
+1. **No PATH search** — Must use absolute paths (`/bin/ls`, not `ls`)
+2. **No FD management** — Child inherits all open file descriptors from the parent. Any fd referencing the host filesystem survives `pivot_root` + `MNT_DETACH` and could be used to access host files from inside the container. This is the same class of vulnerability as CVE-2024-21626 (Leaky Vessels) and CVE-2016-9962. **Fixed in Phase 3** via `close_inherited_fds()`.
+3. **Environment variable leak** — After `pivot_root()`, the child still inherits the host's full `environ` (`PATH`, `HOME`, `SHELL`, etc.). These variables reference paths that do not exist inside the container rootfs. The `--env` flag from Phase 0 was also dropped in Phase 2. **Fixed in Phase 3** via `build_container_env()` and restored `--env` support.
+4. **No copy-on-write filesystem** — Container writes modify the base rootfs directly. Running `rm /bin/ls` in one container permanently deletes it for all future containers. **Fixed in Phase 3** via OverlayFS.
+5. **No mount hardening** — When Phase 3 adds the overlay mount, it must use `MS_NODEV | MS_NOSUID` to block device node access and SUID escalation inside the container. Without these flags, a root process in the container could create device nodes or exploit setuid binaries. **Addressed in Phase 3**.
+6. **Single command** — Runs one command then exits (no daemon mode)
+7. **Requires root for namespaces** — `CLONE_NEWPID`/`CLONE_NEWNS` need `CAP_SYS_ADMIN`
+8. **Rootfs must be pre-built** — No image pull or layer support; rootfs directory must exist before running
+9. **No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
 
 ---
 
@@ -467,10 +470,13 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] --rootfs flag
 - [x] Unit tests (requires root + rootfs)
 
-### 📋 Phase 3: UTS & User Namespace
-- [ ] CLONE_NEWUTS for hostname isolation
-- [ ] CLONE_NEWUSER for UID/GID mapping
-- [ ] Rootless containers
+### 📋 Phase 3: OverlayFS & Security Corrections
+- [ ] OverlayFS copy-on-write filesystem (read-only base image + writable upper layer)
+- [ ] Per-container writable layers with automatic cleanup on exit
+- [ ] `--overlay` and `--container-dir` CLI flags
+- [ ] **Security fix:** `build_container_env()` — construct minimal container environment, restore `--env` flag (Known Limitation #3)
+- [ ] **Security fix:** `close_inherited_fds()` — close all inherited parent fds before `execve()` (Known Limitation #2, CVE-2024-21626, CVE-2016-9962)
+- [ ] **Security fix:** Mount overlay with `MS_NODEV | MS_NOSUID` (Known Limitation #5)
 
 ### 📋 Phase 4: Resource Limits (cgroups)
 - [ ] Memory limits
