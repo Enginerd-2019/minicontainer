@@ -34,8 +34,7 @@ int spawn_init_signals(void){
         return 0; // Already initialized
     }
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
+    struct sigaction sa = {0};
 
     sa.sa_handler = sigchld_handler;
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
