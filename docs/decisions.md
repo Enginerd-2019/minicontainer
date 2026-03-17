@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 2 - Mount Namespace & Filesystem Isolation
-**Last Updated:** 2026-02-27
+**Phase:** 3 - OverlayFS & Security Corrections
+**Last Updated:** 2026-03-13
 
 ---
 
@@ -535,6 +535,74 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 
 **Fix Applied:** 2026-02-23
 
+### Error #7: Silent Option Swallowing with POSIX-Strict getopt
+
+**Location:** `src/main.c` — getopt loop (all phases from Phase 1 onward)
+
+**Symptom:**
+```bash
+./minicontainer --rootfs ./rootfs /bin/sh --pid --overlay
+# Container runs without PID namespace or overlay — no error message
+```
+
+**Problem:**
+The `+` prefix in the getopt optstring (introduced in Phase 1 to fix Error #3) enforces POSIX-strict parsing, which stops option processing at the first non-option argument. This correctly prevents child command flags like `-la` from being misinterpreted as minicontainer options. However, the tradeoff is that any minicontainer flag placed **after** the command path is silently absorbed into the child's `argv`. The container runs but without the isolation the user intended, and there is no diagnostic output.
+
+The risk scales with each phase: Phase 3 adds `--overlay`, `--container-dir`, and `--env`, making it increasingly likely that a user places a flag after the command by mistake.
+
+**Fixed Code:**
+```c
+// Detect whether the user wrote '--' to explicitly separate args
+bool explicit_separator = false;
+if (optind > 1 && strcmp(argv[optind - 1], "--") == 0) {
+    explicit_separator = true;
+}
+
+// Catch minicontainer flags that landed after the command
+if (!explicit_separator) {
+    static const char *known_flags[] = {
+        "--debug", "--pid", "--rootfs", "--overlay",
+        "--container-dir", "--env", "--help", NULL
+    };
+
+    for (int i = optind + 1; i < argc; i++) {
+        for (int j = 0; known_flags[j]; j++) {
+            if (strcmp(argv[i], known_flags[j]) == 0) {
+                fprintf(stderr,
+                    "Error: '%s' appears after command '%s' (argv[%d])\n"
+                    "All minicontainer options must precede the command.\n"
+                    "Use '--' to pass flags to the child: "
+                    "%s [options] -- %s %s\n",
+                    argv[i], argv[optind], i,
+                    argv[0], argv[optind], argv[i]);
+                return 1;
+            }
+        }
+    }
+}
+```
+
+**Design decisions:**
+- **Scan starts at `optind + 1`:** `argv[optind]` is the command itself — it shouldn't trigger the check even if it collides with a flag name
+- **`--` suppresses the scan:** Standard POSIX convention for separating tool options from child arguments. Eliminates false positives when a child command legitimately uses `--help`, `--debug`, etc. — this same mechanism handles short flag collisions like `-e` or `-p`, so a separate short-flag check would add noise without adding safety
+- **Long options only:** Short flags like `-d` or `-p` are not checked because they're commonly used by child programs (`echo -e`, `kill -p`). The `--` separator already covers any case where a short flag collision matters
+- **`known_flags` must stay in sync with `long_options[]`:** When adding flags in future phases (e.g., `--hostname` in Phase 4), add them to both arrays
+
+**Trade-offs:**
+- **Misplaced short flags are undetected:** `./minicontainer --rootfs ./rootfs /bin/sh -p` silently passes `-p` to `/bin/sh` with no PID namespace. Accepted because short flags are pervasive in child arguments (`echo -e`, `grep -c`), and flagging them would produce false positives on common invocations. The `--` separator handles disambiguation when needed.
+- **Maintenance burden:** `known_flags` must be manually kept in sync with `long_options[]`. A flag added to one but not the other silently bypasses the check. No compile-time enforcement — this is a discipline requirement mitigated by a cross-referencing comment in the code.
+- **False positives on colliding long names:** A child program that accepts `--debug` or `--help` will trigger the error. The `--` separator resolves this, and the error message itself teaches the fix.
+
+**Impact:**
+- **Severity:** Medium — silent misconfiguration with no error message
+- **Symptom:** Container runs without intended isolation; user receives no warning
+- **Root Cause:** POSIX-strict getopt stops at the first non-option, silently absorbing subsequent options into the child's argv
+- **Relationship to Error #3:** Error #3 introduced the `+` prefix to fix child flag parsing; Error #7 addresses the tradeoff introduced by that fix
+
+**Fix Applied:** 2026-03-13
+
+---
+
 ---
 
 ## Known Limitations
@@ -562,7 +630,7 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 - A container process that discovers a leaked fd can read/write host files outside the mount namespace — this is a container escape.
 - This is the exact mechanism exploited by **CVE-2024-21626 (Leaky Vessels)**: a leaked fd during runc's `clone()`-to-`execve()` window allowed full container escape. **CVE-2016-9962** is the same root cause.
 
-**Phase 3 fix:** `close_inherited_fds()` iterates `/proc/self/fd` after `mount_proc()` and closes every fd above `STDERR_FILENO` before `execve()`. See Phase 3 guide §1.2.2.
+**Phase 3 fix:** `close_inherited_fds()` iterates `/proc/self/fd` after `mount_proc()` and closes every fd above `STDERR_FILENO` before `execve()`. See Phase 3 guide §3.5.
 
 ---
 
@@ -606,7 +674,7 @@ if(mount("", "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0){
 - Basic commands work by accident because `/usr/bin` and `/bin` happen to appear in the host's `PATH`, and the rootfs has binaries there — but this is fundamentally broken
 - The `--env KEY=VALUE` flag from Phase 0 was dropped in Phase 2's `main.c` (no `case 'e':` in the getopt switch)
 
-**Phase 3 fix:** `build_container_env()` constructs a minimal container-appropriate environment (`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root`, `TERM=xterm`). The `--env` flag is restored with proper key-replacement semantics. See Phase 3 guide §1.2.1.
+**Phase 3 fix:** `build_container_env()` constructs a minimal container-appropriate environment (`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root`, `TERM=xterm`). The `--env` flag is restored with proper key-replacement semantics. See Phase 3 guide §3.4.
 
 ---
 
