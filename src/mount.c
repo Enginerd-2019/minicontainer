@@ -179,7 +179,7 @@ mount_result_t mount_exec(const mount_config_t *config){
     }
 
     if (config->enable_debug) {
-        printf("[parent] Executing: %s", config->program);
+        printf("[parent] Executing: ");
         for (int i = 0; config->argv[i]; i++) {
             printf(" %s", config->argv[i]);
         }
