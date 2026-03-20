@@ -10,7 +10,8 @@
 #include <limits.h>
 
 /**
- * Configuration for overlay filesystem container
+ * Configuration for overlay filesystem container.
+ * Supersedes mount_config_t — includes all Phase 2 fields plus overlay.
  */
 typedef struct {
     const char *program;
@@ -29,7 +30,7 @@ typedef struct {
 } overlay_config_t;
 
 /**
- * Overlay mount context (for setup and teardown)
+ * Overlay mount context (for setup and teardown).
  */
 typedef struct {
     char container_id[13];
@@ -41,7 +42,7 @@ typedef struct {
 } overlay_context_t;
 
 /**
- * Result of overlay operation
+ * Result of overlay operation.
  */
 typedef struct {
     pid_t child_pid;
@@ -53,6 +54,9 @@ typedef struct {
 
 /**
  * Execute process with optional overlay filesystem isolation.
+ *
+ * Supersedes mount_exec() — handles all Phase 2 functionality plus
+ * copy-on-write overlay filesystem.
  *
  * If enable_overlay is true, creates an overlay mount over rootfs.
  * The container sees a merged view; writes go to a disposable upper layer.
@@ -72,7 +76,7 @@ void overlay_cleanup(overlay_result_t *result);
 
 /**
  * Setup overlay filesystem.
- * Creates directories and mounts overlayfs.
+ * Creates directories and mounts overlayfs with MS_NODEV | MS_NOSUID.
  *
  * @param ctx          Overlay context (populated on success)
  * @param rootfs_path  Path to base image (lowerdir)
