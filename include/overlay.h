@@ -35,6 +35,7 @@ typedef struct {
 typedef struct {
     char container_id[13];
     char lower_path[PATH_MAX];
+    char container_base[PATH_MAX];
     char upper_path[PATH_MAX];
     char work_path[PATH_MAX];
     char merged_path[PATH_MAX];
