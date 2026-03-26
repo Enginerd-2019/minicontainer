@@ -235,3 +235,76 @@ int setup_overlay(overlay_context_t *ctx, const char *rootfs_path,
 
     return 0;
 }
+
+/**
+ * Teardown overlay filesystem.
+ * Unmounts overlay and removes all container directories.
+ */
+int teardown_overlay(overlay_context_t *ctx, bool enable_debug){
+    
+    if(!ctx){
+        return -1;
+    }
+
+    int ret = 0;
+
+    // Unmount the overlay
+    if(ctx->is_mounted){
+        if(enable_debug){
+            printf("[overlay] Unmounting: %s\n", ctx->merged_path);
+        }
+
+        if(unmount2(ctx->merged_path, MNT_DETACH) < 0){
+            perror("unmount2(overlay)");
+            ret = -1;
+        }else{
+            ctx->is_mounted = false;
+        }
+    }
+
+    // Remove upper directory tree (contains container's writes)
+    if(ctx->upper_path[0]){
+        if(enable_debug){
+            printf("[overlay] Removing upper layer: %s\n", ctx->upper_path);
+        }
+        remove_directory(ctx->upper_path);
+    }
+
+    // Remove working directory
+    if(ctx->work_path[0]){
+        if(enable_debug){
+            printf("[overlay] Removing working layer: %s\n", ctx->work_path);
+        }
+        remove_directory(ctx->work_path);
+    }
+
+    // Remove working directory tree
+    if(ctx->work_path[0]){
+        if(enable_debug){
+            printf("[overlay] Removing working layer: %s\n", ctx->work_path);
+        }
+        remove_directory(ctx->work_path);
+    }
+
+    // Remove merged directory
+    if(ctx->merged_path[0]){
+        if(enable_debug){
+            printf("[overlay] Removing working layer: %s\n", ctx->merged_path);
+        }
+        rmdir(ctx->merged_path);
+    }
+
+    // Remove container base
+    if(ctx->container_base[0]){
+        if(enable_debug){
+            printf("[overlay] Removing working layer: %s\n", ctx->container_base);
+        }
+        rmdir(ctx->container_base);
+    }
+
+    if (enable_debug) {
+        printf("[overlay] Cleanup complete\n");
+    }
+
+    return ret;
+}
