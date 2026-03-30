@@ -603,6 +603,178 @@ if (!explicit_separator) {
 
 ---
 
+### Error #8: `_GNU_SOURCE` Redefined Warning (Makefile vs Source)
+
+**Date Found:** 2026-03-30
+
+**Problem:** The Makefile defines `_GNU_SOURCE` via CFLAGS (`-D_GNU_SOURCE`),
+but source files (`main.c`, `overlay.c`, `test_overlay.c`) also `#define
+_GNU_SOURCE` at the top. GCC emits a `-Wredefined` warning for each file.
+
+**Symptom:** Build output contains warnings like:
+```
+src/overlay.c:1: warning: "_GNU_SOURCE" redefined
+<command-line>: note: this is the location of the previous definition
+```
+
+**Root Cause:** The `#define _GNU_SOURCE` in source files predates the Makefile
+adding `-D_GNU_SOURCE` to CFLAGS. Both are correct individually — the source
+`#define` ensures the file compiles standalone, while the CFLAGS flag ensures
+all files get it even if they forget. Together they produce a harmless but noisy
+warning.
+
+**Impact:**
+- **Severity:** Low — warning only, no behavior change
+- **Symptom:** Cluttered build output obscures real warnings
+
+**Fix:** Remove `#define _GNU_SOURCE` from source files that are always built
+via the Makefile. The CFLAGS definition is sufficient.
+
+**Fix Applied:** 2026-03-30
+
+---
+
+### Error #9: `unmount2` Typo — Undefined Reference at Link Time
+
+**Date Found:** 2026-03-30
+
+**Problem:** `teardown_overlay()` in `overlay.c` called `unmount2()` instead of
+`umount2()`. The compiler emitted an implicit declaration warning, and the
+linker failed with an undefined reference.
+
+**Symptom:**
+```
+src/overlay.c:258:12: warning: implicit declaration of function 'unmount2';
+    did you mean 'umount2'?
+/usr/bin/ld: overlay.c:(.text+0x7c2): undefined reference to `unmount2'
+```
+
+**Root Cause:** Typo — `unmount2` vs the correct `umount2`. The function name
+follows the Unix convention of abbreviated names (`umount`, not `unmount`).
+
+**Impact:**
+- **Severity:** High — build fails, linker error
+- **Symptom:** `make` exits with error, no binary produced
+
+**Fix:** Changed `unmount2` to `umount2` and `perror("unmount2(overlay)")` to
+`perror("umount2(overlay)")` in `teardown_overlay()`.
+
+**Fix Applied:** 2026-03-30
+
+---
+
+### Error #10: Missing `<stdlib.h>` in test_overlay.c
+
+**Date Found:** 2026-03-30
+
+**Problem:** `test_overlay.c` calls `calloc()` and `free()` but did not include
+`<stdlib.h>`. GCC emitted implicit declaration warnings for both functions.
+
+**Symptom:**
+```
+tests/test_overlay.c:16:18: warning: implicit declaration of function 'calloc'
+tests/test_overlay.c:48:5: warning: implicit declaration of function 'free'
+```
+
+**Root Cause:** The include list was missing `<stdlib.h>`. The functions still
+linked because GCC's built-in declarations provided a fallback, but the
+implicit declaration means the compiler assumed `int` return type instead of
+`void *` for `calloc` — which can cause pointer truncation on 64-bit systems
+if the compiler doesn't recognize the builtin.
+
+**Impact:**
+- **Severity:** Medium — compiles and links but with incorrect type assumptions
+  that could cause runtime failures on some platforms
+- **Symptom:** Warnings during build; potential pointer truncation on LP64
+
+**Fix:** Added `#include <stdlib.h>` to `test_overlay.c` and to the
+corresponding code listing in the Phase 3 implementation guide.
+
+**Fix Applied:** 2026-03-30
+
+---
+
+### Error #11: `close_inherited_fds()` Opens Wrong Path — `/proc/self/fs` vs `/proc/self/fd`
+
+**Date Found:** 2026-03-30
+
+**Problem:** `close_inherited_fds()` called `opendir("/proc/self/fs")` instead
+of `opendir("/proc/self/fd")`. The path `/proc/self/fs` does not exist, so
+`opendir()` always returned `NULL`, and the function always fell through to
+the brute-force fallback — even after `/proc` was successfully mounted.
+
+**Symptom:** Debug output always showed:
+```
+[child] /proc/self/fd not available, closing fds 3-1024
+```
+This appeared even after `[child] Mounted /proc`, which should have made
+`/proc/self/fd` available. The fallback still closed the fds correctly, so
+the bug had no security impact — but it defeated the efficient `/proc/self/fd`
+iteration path and produced misleading debug output.
+
+**Root Cause:** Typo — `fs` instead of `fd`. A single-character error that
+was difficult to spot in review because `/proc/self/fs` looks plausible (the
+kernel does have various `/proc/self/fs*` paths in some configurations).
+
+**Impact:**
+- **Severity:** Low — the fallback path still closed all fds correctly
+- **Symptom:** Always hit the brute-force path (1021 `close()` syscalls
+  instead of only the handful that are actually open); misleading debug output
+
+**Fix:** Changed `opendir("/proc/self/fs")` to `opendir("/proc/self/fd")`.
+
+**Fix Applied:** 2026-03-30
+
+---
+
+### Error #12: `sudo` Masks File Descriptor Leak in Testing
+
+**Date Found:** 2026-03-30
+
+**Problem:** Phase 2 testing showed no leaked fds in the container, which
+made the lack of `close_inherited_fds()` appear safe. The reason: `sudo`
+spawns a new process that does not inherit file descriptors from the calling
+shell. Fds opened in the user's terminal (editor buffers, shell redirections,
+multiplexer sockets) never reached the minicontainer parent process.
+
+**Symptom:** `ls /proc/self/fd` inside the container only showed fds 0, 1, 2
+— even without any fd cleanup code. This created a false sense of security.
+
+**Root Cause:** `sudo` creates a fresh process with a minimal fd table
+(stdin/stdout/stderr only). It does not forward arbitrary fds from the
+calling shell. This is a property of `sudo`, not of the container runtime.
+
+**Impact:**
+- **Severity:** Medium — no immediate vulnerability in Phase 2 (the parent
+  was too simple to open extra fds), but a latent issue as the runtime grows
+- **Not a code bug:** This is a testing gap, not a code defect. The code was
+  missing fd cleanup, and the test methodology (running via `sudo`) could not
+  detect it.
+
+**What `sudo` does NOT protect against:** Fds opened by the minicontainer
+parent *itself* — overlay bookkeeping, config files, log files, or future
+network sockets. Both CVE-2024-21626 and CVE-2016-9962 involved fds opened
+by the container runtime's own code, not inherited from an external shell.
+
+**Verification:** Added a debug test block in `overlay_exec()` that opens
+three fds to host files (`/etc/hostname`, `/etc/os-release`, `/etc/passwd`)
+before `clone()`. With `--debug`, the output confirms `close_inherited_fds()`
+closes them in the child:
+```
+[parent] TEST: Opened simulated leaked fds: 3, 4, 5
+[child] Closing inherited fd 3
+[child] Closing inherited fd 4
+[child] Closing inherited fd 5
+```
+This test block should be removed once verification is complete.
+
+**Fix:** `close_inherited_fds()` added in Phase 3 (§3.5). Updated Phase 2
+and Phase 3 documentation to explain the `sudo` masking behavior.
+
+**Fix Applied:** 2026-03-30
+
+---
+
 ---
 
 ## Known Limitations
@@ -623,14 +795,19 @@ if (!explicit_separator) {
 
 ### 2. No File Descriptor Management (Security — CVE-2024-21626, CVE-2016-9962)
 
-**Limitation:** Child inherits all open file descriptors from parent.
+**Limitation (Phase 2):** Child inherits all open file descriptors from parent.
 
 **Impact:**
 - After `clone()`, the child has copies of every parent fd. Any fd referencing the host filesystem survives `pivot_root()` + `umount2("/old_root", MNT_DETACH)` because lazy unmount detaches the *mount*, not the *file descriptions*.
 - A container process that discovers a leaked fd can read/write host files outside the mount namespace — this is a container escape.
 - This is the exact mechanism exploited by **CVE-2024-21626 (Leaky Vessels)**: a leaked fd during runc's `clone()`-to-`execve()` window allowed full container escape. **CVE-2016-9962** is the same root cause.
 
-**Phase 3 fix:** `close_inherited_fds()` iterates `/proc/self/fd` after `mount_proc()` and closes every fd above `STDERR_FILENO` before `execve()`. See Phase 3 guide §3.5.
+**Note:** This vulnerability appeared safe in Phase 2 testing because `sudo`
+spawns a new process that does not inherit the calling shell's fds. The Phase 2
+parent was also simple enough to not open any extra fds itself. This was
+accidental protection — see Error #12 for full analysis.
+
+**Phase 3 fix:** `close_inherited_fds()` iterates `/proc/self/fd` after `mount_proc()` and closes every fd above `STDERR_FILENO` before `execve()`. This handles both inherited fds and fds opened by the parent itself (overlay bookkeeping, config files, etc.). See Phase 3 guide §3.5 and Error #11 for a typo that initially prevented the `/proc/self/fd` path from working.
 
 ---
 

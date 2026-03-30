@@ -13,6 +13,8 @@
 #include <time.h>
 #include <ftw.h>
 #include <dirent.h>    // opendir/readdir for fd table audit 
+#include <sys/resource.h> // getrlimit for fd fallback range (§3.5)
+#include <fcntl.h>        // open(), O_RDONLY — DEBUG TEST (remove with test block)
 
 #define STACK_SIZE (1024 * 1024)
 
@@ -39,7 +41,7 @@ static void generate_container_id(char *id){
     clock_gettime(CLOCK_REALTIME, &ts);
 
     unsigned long hash = ts.tv_sec ^ ts.tv_nsec ^ getpid();
-    snprintf(id, 13, "0x12lx", hash & 0xFFFFFFFFFFFF);
+    snprintf(id, 13, "%012lx", hash & 0xFFFFFFFFFFFF);
 }
 
 /**
@@ -254,8 +256,8 @@ int teardown_overlay(overlay_context_t *ctx, bool enable_debug){
             printf("[overlay] Unmounting: %s\n", ctx->merged_path);
         }
 
-        if(unmount2(ctx->merged_path, MNT_DETACH) < 0){
-            perror("unmount2(overlay)");
+        if(umount2(ctx->merged_path, MNT_DETACH) < 0){
+            perror("umount2(overlay)");
             ret = -1;
         }else{
             ctx->is_mounted = false;
@@ -307,4 +309,280 @@ int teardown_overlay(overlay_context_t *ctx, bool enable_debug){
     }
 
     return ret;
+}
+
+/**
+ * Close all file descriptors above STDERR_FILENO.
+ *
+ * After clone(), the child inherits every open fd from the parent.
+ * Any fd referencing the host filesystem survives pivot_root + umount
+ * and can be used to escape the mount namespace (CVE-2024-21626,
+ * CVE-2016-9962).
+ *
+ * We iterate /proc/self/fd rather than brute-forcing close(3..MAX)
+ * because the fd range can be enormous (ulimit -n defaults to 1024
+ * but can be set to millions) while the actual open fd count is small.
+ */
+static void close_inherited_fds(bool enable_debug){
+    DIR *dir = opendir("/proc/self/fd");
+    
+    // Use a fallback if /proc/self/fd is not available. This should never
+    // happen in practice
+    if(!dir){
+        // /proc may not be mounted yet — fall back to rlimit range
+        struct rlimit rl;
+        int max_fd = 1024; // Double safety incase getrlimit fails
+        
+        if(getrlimit(RLIMIT_NOFILE, &rl) == 0){
+            max_fd = (int)rl.rlim_cur;
+        }
+        if(enable_debug){
+            printf("[child] /proc/self/fd not available, closing fds 3-%d\n", max_fd);
+        }
+
+        for(int fd = 3; fd < max_fd; fd++){
+            close(fd);
+        }
+        
+        return;
+    }
+
+    //If you made it here, /proc/self/fd is available, no fallback was used
+    int dir_fd = dirfd(dir);
+
+    struct dirent *entry;
+    while((entry = readdir(dir)) != NULL){
+        if(entry->d_name[0] == '.') continue;
+
+        int fd = atoi(entry->d_name);
+
+        // Keep stdin/stdout/stderr and the dirfd we're iterating
+        if(fd <= STDERR_FILENO || fd == dir_fd) continue;
+
+        if(enable_debug){
+            printf("[child] Closing inherited fd %d\n", fd);
+        }
+
+        close(fd);
+    }
+
+    closedir(dir);
+}
+
+/**
+ * Child function for containerized process.
+ */
+static int child_func(void *arg){
+    child_args_t *args = (child_args_t *)arg;
+
+    if(args->enable_debug){
+        printf("[child] PID: %d\n", getpid());
+    }
+
+    // Setup rootfs if requested
+    // rootfs_path points to merged/ when overlay is enabled
+    // or to raw rootfs when overlay is disabled 
+    if(args->rootfs_path){
+        if(setup_rootfs(args->rootfs_path, args->enable_debug) < 0){
+            fprintf(stderr, "[child] Failed to setup rootfs\n");
+            return 1;
+        }
+
+        // Mount /proc after pivot_root
+        if(mount_proc(args->enable_debug) < 0){
+            fprintf(stderr, "[child] Failed to mount /proc\n");
+            return 1;
+        }
+    }
+
+    // Phase 3 correction §3.5: close all inherited fds before exec.
+    // After clone(), the child has copies of every parent fd. Any fd
+    // referencing the host filesystem survives pivot_root + MNT_DETACH
+    // and would let the container escape the mount namespace.
+    // Must be called AFTER mount_proc() so /proc/self/fd is available.
+    close_inherited_fds(args->enable_debug);
+
+    // Execute target program
+    // Phase 3 correction §3.4: args->envp is always set to a
+    // container-appropriate environment built by build_container_env().
+    // We no longer fall back to the host's environ.
+    execve(args->program, args->argv, args->envp);
+
+    // execve only returns on error
+    perror("execve");
+    return 127;
+}
+
+overlay_result_t overlay_exec(const overlay_config_t *config){
+    overlay_result_t result = {0};
+    overlay_context_t overlay_ctx = {0};
+    bool overlay_active = false;
+
+    // Validate
+    if (!config || !config->program || !config->argv) {
+        fprintf(stderr, "overlay_exec: invalid config\n");
+        result.child_pid = -1;
+        return result;
+    }
+
+    if (config->enable_debug) {
+        printf("[parent] Executing: %s", config->program);
+        for (int i = 0; config->argv[i]; i++) {
+            printf(" %s", config->argv[i]);
+        }
+        printf("\n");
+
+        if (config->rootfs_path) {
+            printf("[parent] Rootfs: %s\n", config->rootfs_path);
+        }
+        if (config->enable_overlay) {
+            printf("[parent] Overlay: enabled\n");
+        }
+    }
+
+    // Determine the effective rootfs path
+    const char *effective_rootfs = config->rootfs_path;
+
+    // Setup overlat if requested
+    if(config->enable_overlay && config->rootfs_path){
+        if(setup_overlay(&overlay_ctx, config->rootfs_path, config->container_dir, config->enable_debug) < 0){
+            fprintf(stderr, "[parent] Failed to setup overlay\n");
+            result.child_pid = -1;
+            return result;
+        }
+
+        overlay_active = true;
+        effective_rootfs = overlay_ctx.merged_path;
+
+        if(config->enable_debug){
+            printf("[parent] Using merged rootfs: %s\n", effective_rootfs);
+        }
+    }
+
+    // Allocate stack
+    char *stack = malloc(STACK_SIZE);
+    if(!stack){
+        perror("malloc");
+        if(overlay_active){
+            teardown_overlay(&overlay_ctx, config->enable_debug);
+        }
+        result.child_pid = -1;
+        return result;
+    }
+
+    result.stack_ptr = stack;
+
+    // Prepare child args
+    child_args_t child_args = {
+        .program = config->program,
+        .argv = config->argv,
+        .envp = config->envp,
+        .enable_debug = config->enable_debug,
+        .rootfs_path = effective_rootfs
+    };
+
+    // Build flags
+    int flags = SIGCHLD;
+    if (config->enable_pid_namespace) {
+        flags |= CLONE_NEWPID;
+    }
+    if (config->enable_mount_namespace) {
+        flags |= CLONE_NEWNS;
+    }
+
+    if (config->enable_debug && (flags & CLONE_NEWNS)) {
+        printf("[parent] Creating mount namespace\n");
+    }
+
+    /* ================================================================
+     * DEBUG TEST: Simulate leaked parent file descriptors
+     *
+     * These fds simulate the kind of internal bookkeeping that a
+     * production runtime would have open at clone() time — config
+     * files, log files, overlay metadata, etc. They will be inherited
+     * by the child via clone() and should appear in the debug output
+     * as "[child] Closing inherited fd N" if close_inherited_fds()
+     * is working correctly.
+     *
+     * Remove this block once fd cleanup has been verified.
+     * ================================================================ */
+    int test_fd_1 = open("/etc/hostname", O_RDONLY);
+    int test_fd_2 = open("/etc/os-release", O_RDONLY);
+    int test_fd_3 = open("/etc/passwd", O_RDONLY);
+    if (config->enable_debug) {
+        printf("[parent] TEST: Opened simulated leaked fds: %d, %d, %d\n",
+               test_fd_1, test_fd_2, test_fd_3);
+    }
+    /* ============== END DEBUG TEST ================================ */
+
+    // Clone
+    pid_t pid = clone(child_func, stack + STACK_SIZE, flags, &child_args);
+
+    /* ================================================================
+     * DEBUG TEST: Close simulated leaked fds in the parent.
+     * The child already has its own copies via clone().
+     * ============== END DEBUG TEST ================================ */
+    if (test_fd_1 >= 0) close(test_fd_1);
+    if (test_fd_2 >= 0) close(test_fd_2);
+    if (test_fd_3 >= 0) close(test_fd_3);
+
+    if (pid < 0) {
+        perror("clone");
+        free(stack);
+        if (overlay_active) {
+            teardown_overlay(&overlay_ctx, config->enable_debug);
+        }
+        result.child_pid = -1;
+        result.stack_ptr = NULL;
+        return result;
+    }
+
+    result.child_pid = pid;
+
+    if (config->enable_debug) {
+        printf("[parent] Child PID: %d\n", pid);
+    }
+
+    // Wait for child
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        result.exit_status = -1;
+        if (overlay_active) {
+            teardown_overlay(&overlay_ctx, config->enable_debug);
+        }
+        return result;
+    }
+
+    // Parse status
+    if (WIFEXITED(status)) {
+        result.exited_normally = true;
+        result.exit_status = WEXITSTATUS(status);
+
+        if (config->enable_debug) {
+            printf("[parent] Child exited: %d\n", result.exit_status);
+        }
+    } else if (WIFSIGNALED(status)) {
+        result.exited_normally = false;
+        result.signal = WTERMSIG(status);
+        result.exit_status = 128 + result.signal;
+
+        if (config->enable_debug) {
+            printf("[parent] Child killed by signal: %d\n", result.signal);
+        }
+    }
+
+    // Teardown overlay after container exits
+    if (overlay_active) {
+        teardown_overlay(&overlay_ctx, config->enable_debug);
+    }
+
+    return result;    
+}
+
+void overlay_cleanup(overlay_result_t *result) {
+    if (result && result->stack_ptr) {
+        free(result->stack_ptr);
+        result->stack_ptr = NULL;
+    }
 }

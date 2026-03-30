@@ -1,5 +1,5 @@
 # Makefile for minicontainer - Minimal Container Runtime
-# Phase 2: Mount Namespace & Filesystem Isolation
+# Phase 3: OverlayFS Copy-on-Write Filesystem
 
 CC       = gcc
 CFLAGS   = -Wall -Wextra -std=c11 -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
@@ -25,6 +25,7 @@ MINICONTAINER  = minicontainer
 TEST_SPAWN     = test_spawn
 TEST_NAMESPACE = test_namespace
 TEST_MOUNT     = test_mount
+TEST_OVERLAY   = test_overlay
 
 # Default target
 .PHONY: all
@@ -41,8 +42,8 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
-# Link minicontainer (Phase 2: main + mount)
-$(MINICONTAINER): $(BUILD_DIR)/main.o $(BUILD_DIR)/mount.o
+# Link minicontainer (Phase 3: main + overlay + mount)
+$(MINICONTAINER): $(BUILD_DIR)/main.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(MINICONTAINER) successfully!"
 
@@ -61,9 +62,14 @@ $(TEST_MOUNT): $(BUILD_DIR)/test_mount.o $(BUILD_DIR)/mount.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_MOUNT) successfully!"
 
+# Link test_overlay (Phase 3)
+$(TEST_OVERLAY): $(BUILD_DIR)/test_overlay.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_OVERLAY) successfully!"
+
 # Build and run all tests
 .PHONY: test
-test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT)
+test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY)
 	@echo "=== Running Phase 0 spawn tests ==="
 	./$(TEST_SPAWN)
 	@echo ""
@@ -72,6 +78,9 @@ test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT)
 	@echo ""
 	@echo "=== Running Phase 2 mount tests (requires root + rootfs) ==="
 	sudo ./$(TEST_MOUNT)
+	@echo ""
+	@echo "=== Running Phase 3 overlay tests (requires root + rootfs) ==="
+	sudo ./$(TEST_OVERLAY)
 
 # Build with debug symbols
 .PHONY: debug
@@ -89,7 +98,7 @@ valgrind: debug
 .PHONY: clean
 clean:
 	@rm -rf $(BUILD_DIR)
-	@rm -f $(MINICONTAINER) $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT)
+	@rm -f $(MINICONTAINER) $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY)
 	@echo "Cleaned build artifacts"
 
 # Run example commands
@@ -112,15 +121,21 @@ examples: $(MINICONTAINER)
 	@echo ""
 	@echo "=== Example 6: Debug with full isolation ==="
 	sudo ./$(MINICONTAINER) --pid --rootfs ./rootfs --debug /bin/sh -c 'echo PID: $$$$'
+	@echo ""
+	@echo "=== Example 7: Overlay filesystem (requires root + rootfs) ==="
+	sudo ./$(MINICONTAINER) --rootfs ./rootfs --overlay /bin/sh -c 'echo hello > /tmp/test && cat /tmp/test'
+	@echo ""
+	@echo "=== Example 8: Overlay with debug ==="
+	sudo ./$(MINICONTAINER) --rootfs ./rootfs --overlay --debug /bin/ls /
 
 # Help target
 .PHONY: help
 help:
-	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 2)"
+	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 3)"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  all        - Build minicontainer (default)"
-	@echo "  test       - Build and run all tests (Phase 0 + 1 + 2)"
+	@echo "  test       - Build and run all tests (Phase 0 + 1 + 2 + 3)"
 	@echo "  debug      - Build with debug symbols (-g)"
 	@echo "  valgrind   - Run with valgrind memory checker"
 	@echo "  examples   - Run example commands"
@@ -132,6 +147,7 @@ help:
 	@echo "  make test             # Run all tests"
 	@echo "  make clean all        # Clean and rebuild"
 	@echo "  sudo ./minicontainer --pid --rootfs ./rootfs /bin/sh"
+	@echo "  sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh"
 
 # Include auto-generated header dependencies
 -include $(DEPS)
