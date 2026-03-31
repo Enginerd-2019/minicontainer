@@ -272,34 +272,26 @@ int teardown_overlay(overlay_context_t *ctx, bool enable_debug){
         remove_directory(ctx->upper_path);
     }
 
-    // Remove working directory
+    // Remove work directory tree (kernel bookkeeping)
     if(ctx->work_path[0]){
         if(enable_debug){
-            printf("[overlay] Removing working layer: %s\n", ctx->work_path);
+            printf("[overlay] Removing work dir: %s\n", ctx->work_path);
         }
         remove_directory(ctx->work_path);
     }
 
-    // Remove working directory tree
-    if(ctx->work_path[0]){
-        if(enable_debug){
-            printf("[overlay] Removing working layer: %s\n", ctx->work_path);
-        }
-        remove_directory(ctx->work_path);
-    }
-
-    // Remove merged directory
+    // Remove merged directory (mount point)
     if(ctx->merged_path[0]){
         if(enable_debug){
-            printf("[overlay] Removing working layer: %s\n", ctx->merged_path);
+            printf("[overlay] Removing merged dir: %s\n", ctx->merged_path);
         }
         rmdir(ctx->merged_path);
     }
 
-    // Remove container base
+    // Remove container base directory
     if(ctx->container_base[0]){
         if(enable_debug){
-            printf("[overlay] Removing working layer: %s\n", ctx->container_base);
+            printf("[overlay] Removing container base: %s\n", ctx->container_base);
         }
         rmdir(ctx->container_base);
     }
@@ -426,7 +418,7 @@ overlay_result_t overlay_exec(const overlay_config_t *config){
     }
 
     if (config->enable_debug) {
-        printf("[parent] Executing: %s", config->program);
+        printf("[parent] Executing:");
         for (int i = 0; config->argv[i]; i++) {
             printf(" %s", config->argv[i]);
         }

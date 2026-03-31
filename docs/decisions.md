@@ -775,6 +775,50 @@ and Phase 3 documentation to explain the `sudo` masking behavior.
 
 ---
 
+### Error #13: Duplicate Program Name in Debug Output
+
+**Date Found:** 2026-03-30
+
+**Problem:** The `[parent] Executing:` debug line printed the program name
+twice. For example: `[parent] Executing: /bin/sh /bin/sh -c env`.
+
+**Root Cause:** The debug code printed `config->program` followed by all
+elements of `config->argv`. Since `argv[0]` is also the program name, it
+appeared twice.
+
+**Fix:** Changed the format string from `printf("[parent] Executing: %s", config->program)`
+to `printf("[parent] Executing:")`, letting the `argv` loop handle the full
+command line including `argv[0]`.
+
+**Fix Applied:** 2026-03-30
+
+---
+
+### Error #14: Duplicate Work Directory Removal and Wrong Teardown Labels
+
+**Date Found:** 2026-03-30
+
+**Problem:** `teardown_overlay()` had two issues:
+1. The `work_path` block was duplicated — `remove_directory(ctx->work_path)`
+   was called twice
+2. All debug labels said "Removing working layer" for `work/`, `merged/`, and
+   `container_base`, making it impossible to tell which step was executing
+
+**Root Cause:** Copy-paste error when adding debug output to each cleanup step.
+
+**Impact:**
+- **Severity:** Low — the duplicate `remove_directory()` call on an
+  already-removed directory is harmless (nftw returns error but teardown
+  continues), and the wrong labels only affect debug readability
+
+**Fix:** Removed the duplicate `work_path` block. Changed labels to
+`Removing upper layer`, `Removing work dir`, `Removing merged dir`, and
+`Removing container base`.
+
+**Fix Applied:** 2026-03-30
+
+---
+
 ---
 
 ## Known Limitations
