@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-2%20Mount%20Namespace-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-3%20OverlayFS-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,15 +12,26 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current Phase:** Phase 2 - Mount Namespace & Filesystem Isolation
+**Current Phase:** Phase 3 - OverlayFS & Security Corrections
 
-Building on Phase 1's PID namespace isolation, this phase introduces **filesystem isolation** using Linux mount namespaces. The containerized process runs in its own root filesystem via `pivot_root()`, with a private `/proc` mount that reflects only the container's process tree.
+Building on Phase 2's mount namespace isolation, this phase introduces **copy-on-write filesystem isolation** using OverlayFS, a **clean container environment**, and **file descriptor cleanup** to prevent container escapes. The base rootfs image is never modified — all container writes go to a per-container upper layer that is discarded on exit.
 
 ---
 
 ## Features
 
-### Phase 2 (Current)
+### Phase 3 (Current)
+
+- ✅ **OverlayFS Copy-on-Write** - Base image stays read-only; writes go to per-container upper layer
+- ✅ **Automatic Cleanup** - Upper layer, work directory, and merged mount removed on container exit
+- ✅ **Clean Environment** - Minimal `PATH`, `HOME`, `TERM` instead of host's full `environ`
+- ✅ **`--env KEY=VALUE`** - Custom environment variables with proper key replacement (no duplicates)
+- ✅ **File Descriptor Cleanup** - `close_inherited_fds()` prevents container escape via leaked fds (CVE-2024-21626, CVE-2016-9962)
+- ✅ **Mount Hardening** - Overlay mounted with `MS_NODEV | MS_NOSUID` to block device node access and SUID escalation
+- ✅ **Misplaced Flag Detection** - Warns when minicontainer flags appear after the command
+- ✅ **Auto-enable PID Namespace** - `--rootfs` now implies `--pid`
+
+### Phase 2
 
 - ✅ **Mount Namespace Isolation** - `CLONE_NEWNS` gives the container its own mount table
 - ✅ **Root Filesystem Pivot** - `pivot_root()` switches the container to a custom rootfs
@@ -62,17 +73,25 @@ This compiles the `minicontainer` executable in the current directory.
 # Basic usage (no namespace)
 ./minicontainer /bin/ls -la
 
+# Rootfs + overlay (copy-on-write, base image untouched)
+sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh
+
+# Custom environment variables
+sudo ./minicontainer --rootfs ./rootfs --overlay \
+    --env FOO=bar /bin/sh -c 'echo $FOO'
+
+# Custom container directory for overlay data
+sudo ./minicontainer --rootfs ./rootfs --overlay \
+    --container-dir ./my_containers /bin/sh
+
 # PID namespace isolation (requires root or CAP_SYS_ADMIN)
 sudo ./minicontainer --pid /bin/sh -c 'echo $$'    # Prints: 1
 
-# Rootfs isolation (auto-enables mount namespace, requires root)
-sudo ./minicontainer --rootfs ./rootfs /bin/ls /
-
-# Full isolation: PID + mount namespace with custom rootfs
+# Full isolation: PID + mount namespace with custom rootfs (no overlay)
 sudo ./minicontainer --pid --rootfs ./rootfs /bin/sh -c 'echo PID: $$ && ls /'
 
-# Debug mode with full isolation
-sudo ./minicontainer --pid --rootfs ./rootfs --debug /bin/sh -c 'echo $$'
+# Debug mode with full isolation + overlay
+sudo ./minicontainer --debug --rootfs ./rootfs --overlay /bin/sh -c 'echo $$'
 
 # Get help
 ./minicontainer --help
@@ -91,7 +110,7 @@ sudo setcap cap_sys_admin+ep ./minicontainer
 ### Test
 
 ```bash
-# Run all tests (Phase 0 + Phase 1 + Phase 2)
+# Run all tests (Phase 0 + Phase 1 + Phase 2 + Phase 3)
 make test
 
 # Run example commands
@@ -108,18 +127,23 @@ make valgrind
 ```
 minicontainer/
 ├── include/
+│   ├── overlay.h            # Phase 3: OverlayFS, environment, fd cleanup API
 │   ├── mount.h              # Phase 2: Mount namespace & rootfs API
 │   ├── namespace.h          # Phase 1: PID namespace isolation API
 │   └── spawn.h              # Phase 0: Process spawning API
 ├── src/
 │   ├── main.c               # CLI entry point and argument parsing
-│   ├── mount.c              # Phase 2: Mount namespace, pivot_root, /proc
+│   ├── overlay.c            # Phase 3: OverlayFS, close_inherited_fds, clone/exec
+│   ├── mount.c              # Phase 2: setup_rootfs, mount_proc (used by overlay.c)
 │   ├── namespace.c          # Phase 1: clone() + PID namespace logic
 │   └── spawn.c              # Phase 0: fork/execve implementation
 ├── tests/
+│   ├── test_overlay.c       # Phase 3: Overlay/env/fd tests (requires root + rootfs)
 │   ├── test_mount.c         # Phase 2: Mount/rootfs tests (requires root + rootfs)
 │   ├── test_namespace.c     # Phase 1: Namespace tests (requires root)
 │   └── test_spawn.c         # Phase 0: Spawn tests
+├── scripts/
+│   └── build_rootfs.sh      # Builds minimal rootfs from host binaries
 ├── docs/
 │   └── decisions.md         # Design decisions and error log
 ├── Makefile                 # Build system
@@ -135,17 +159,19 @@ minicontainer/
 ```
 ┌─────────────────────────────────────────────────┐
 │              main.c (CLI Layer)                  │
-│  • Parses --pid, --rootfs, --debug flags         │
-│  • Auto-enables mount namespace when --rootfs    │
-│  • Calls mount_exec()                            │
+│  • Parses --pid, --rootfs, --overlay, --env, etc │
+│  • build_container_env() — clean environment     │
+│  • Misplaced flag detection                      │
+│  • Calls overlay_exec()                          │
 └─────────────────────┬───────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────┐
-│          mount.c (Isolation Layer)               │
+│        overlay.c (Orchestration Layer)           │
+│  • setup_overlay() → mount OverlayFS             │
 │  • clone() with CLONE_NEWPID | CLONE_NEWNS       │
-│  • Stack allocation/deallocation                 │
 │  • waitpid() and exit status parsing             │
+│  • teardown_overlay() → unmount and cleanup      │
 └─────────────────────┬───────────────────────────┘
                       │
                       ▼
@@ -153,34 +179,38 @@ minicontainer/
 │           Child Process (child_func)             │
 │  • setup_rootfs(): pivot_root to new rootfs      │
 │  • mount_proc(): mount /proc for PID namespace   │
-│  • execve() to replace with target program       │
+│  • close_inherited_fds(): close leaked parent fds│
+│  • execve() with clean container environment     │
 └─────────────────────────────────────────────────┘
 ```
 
-**Phase 1 → Phase 2 transition:**
-- `namespace.c` (`clone(CLONE_NEWPID)`) superseded by `mount.c` (`clone(CLONE_NEWPID | CLONE_NEWNS)`)
-- `mount_exec()` handles PID namespace, mount namespace, and rootfs pivot
-- `namespace.c`/`namespace.h` retained for Phase 1 tests
-- `spawn.c`/`spawn.h` retained for Phase 0 tests
+**Phase transitions:**
+- Phase 0: `spawn.c` (`fork/execve`)
+- Phase 1: `namespace.c` (`clone(CLONE_NEWPID)`)
+- Phase 2: `mount.c` (`clone(CLONE_NEWPID | CLONE_NEWNS)` + `pivot_root`)
+- Phase 3: `overlay.c` (OverlayFS + env isolation + fd cleanup), calls into `mount.c` for `setup_rootfs`/`mount_proc`
+- Earlier modules retained for their respective phase tests
 
 ### API Design
 
 **Configuration structure:**
 ```c
-mount_config_t config = {
+overlay_config_t config = {
     .program = "/bin/sh",
     .argv = argv,                     // NULL-terminated array
-    .envp = NULL,                     // NULL = inherit parent environment
+    .envp = env,                      // From build_container_env()
     .enable_debug = false,
     .enable_pid_namespace = true,     // Use CLONE_NEWPID
     .enable_mount_namespace = true,   // Use CLONE_NEWNS
-    .rootfs_path = "./rootfs"         // NULL = no rootfs change
+    .rootfs_path = "./rootfs",        // NULL = no rootfs change
+    .enable_overlay = true,           // Use OverlayFS on top of rootfs
+    .container_dir = NULL             // NULL = default "./containers"
 };
 ```
 
 **Result structure:**
 ```c
-mount_result_t result = mount_exec(&config);
+overlay_result_t result = overlay_exec(&config);
 
 if (result.exited_normally) {
     printf("Exit code: %d\n", result.exit_status);
@@ -188,41 +218,48 @@ if (result.exited_normally) {
     printf("Killed by signal %d\n", result.signal);
 }
 
-mount_cleanup(&result);  // Free clone stack
+overlay_cleanup(&result);  // Free clone stack
 ```
 
 ---
 
 ## How It Works
 
-### Mount Namespace & Filesystem Isolation (Phase 2)
+### OverlayFS Copy-on-Write (Phase 3)
 
 ```
-Host Filesystem                      Container Filesystem
-/                                    / (was ./rootfs on host)
-├── bin/                             ├── bin/
-├── etc/                             ├── etc/
-├── home/                            ├── proc/   ← private mount (PID ns only)
-├── proc/  ← host's full process     └── ...     ← only rootfs contents visible
-├── tmp/
-└── ...
+rootfs/ (lowerdir — read-only)         containers/<id>/upper/ (writable)
+├── bin/sh                             ├── tmp/newfile.txt  ← container created
+├── bin/ls                             └── bin/ls           ← copy-up (modified)
+├── etc/
+└── tmp/
+         ↓                                      ↓
+    ┌─────────────────────────────────────────────────┐
+    │        containers/<id>/merged/ (unified view)    │
+    │  Container sees: rootfs + writes merged together │
+    │  Reads: lowerdir first, then upperdir            │
+    │  Writes: always go to upperdir                   │
+    └─────────────────────────────────────────────────┘
 
-Host mount table is NOT visible inside the container.
-Old root is lazily unmounted via umount2(MNT_DETACH).
+On container exit: upper/, work/, merged/ are removed.
+rootfs/ is never modified.
 ```
 
-The `pivot_root()` syscall swaps the container's root to the provided rootfs directory. Combined with `CLONE_NEWNS`, mount events inside the container do not propagate to the host.
-
-### The clone/pivot_root/execve Pattern (Phase 2)
+### The overlay_exec Pattern (Phase 3)
 
 ```
 Parent Process                   Child Process (new PID + mount namespace)
      │
+     ├── setup_overlay()
+     │   ├── init_overlay_paths()
+     │   ├── create_overlay_dirs()
+     │   └── mount_overlay(MS_NODEV|MS_NOSUID)
+     │
      ├── clone(NEWPID|NEWNS) ───────► child_func() [PID 1 inside ns]
      │                                      │
-     │                                setup_rootfs()
+     │                                setup_rootfs(merged/)
      │                                  ├── mount(MS_PRIVATE /)
-     │                                  ├── bind mount rootfs
+     │                                  ├── bind mount merged/
      │                                  ├── pivot_root(".", "old_root")
      │                                  ├── chdir("/")
      │                                  └── umount2("/old_root", MNT_DETACH)
@@ -230,13 +267,20 @@ Parent Process                   Child Process (new PID + mount namespace)
      │                                mount_proc()
      │                                  └── mount("proc", "/proc", "proc")
      │                                      │
-     │                                execve("/bin/sh")
+     │                                close_inherited_fds()
+     │                                  └── close fds 3+ via /proc/self/fd
+     │                                      │
+     │                                execve("/bin/sh", envp=clean_env)
      │                                      │
      │                                 exit(status)
      │                                      │
      │◄──── waitpid() ──────────────── [Reaped]
      │
-     │ mount_cleanup()
+     ├── teardown_overlay()
+     │   ├── umount2(merged/, MNT_DETACH)
+     │   └── remove upper/, work/, merged/, container_base/
+     │
+     │ overlay_cleanup()
      │ (Frees clone stack)
      ▼
 ```
@@ -261,55 +305,75 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 
 | System Call | Purpose | Phase |
 |-------------|---------|-------|
+| `mount("overlay")` | Mounts OverlayFS with `MS_NODEV \| MS_NOSUID` | 3 |
+| `close()` | Closes inherited parent fds before `execve()` | 3 |
+| `getrlimit()` | Gets fd limit for brute-force fallback | 3 |
 | `pivot_root()` | Swaps root filesystem for the container | 2 |
 | `mount()` | Bind mounts rootfs, sets propagation, mounts `/proc` | 2 |
-| `umount2()` | Lazily unmounts old root (`MNT_DETACH`) | 2 |
-| `clone()` | Creates child with namespace flags (`CLONE_NEWPID`, `CLONE_NEWNS`) | 1, 2 |
+| `umount2()` | Lazily unmounts old root and overlay (`MNT_DETACH`) | 2, 3 |
+| `clone()` | Creates child with namespace flags (`CLONE_NEWPID`, `CLONE_NEWNS`) | 1, 2, 3 |
 | `fork()` | Creates a new process (duplicate of parent) | 0 |
-| `execve()` | Replaces process image with new program | 0, 1, 2 |
-| `waitpid()` | Waits for child to exit and reaps zombie | 0, 1, 2 |
+| `execve()` | Replaces process image with new program | 0, 1, 2, 3 |
+| `waitpid()` | Waits for child to exit and reaps zombie | 0, 1, 2, 3 |
 | `sigaction()` | Installs SIGCHLD handler to prevent zombies | 0 |
 
 ---
 
 ## Usage Examples
 
-### Example 1: Rootfs Isolation (Phase 2)
+### Example 1: OverlayFS — Base Image Untouched (Phase 3)
 
 ```bash
-# Container sees only the rootfs contents
-$ sudo ./minicontainer --rootfs ./rootfs /bin/ls /
-bin  etc  proc  usr
+# Create a marker in the base image
+$ echo "original" > rootfs/tmp/marker.txt
 
-# Host filesystem is not visible inside the container
-$ sudo ./minicontainer --rootfs ./rootfs /bin/sh -c 'ls /home'
-ls: /home: No such file or directory
+# Modify it inside the container (with overlay)
+$ sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh -c \
+    'echo "modified" > /tmp/marker.txt && cat /tmp/marker.txt'
+modified
+
+# Base image is untouched
+$ cat rootfs/tmp/marker.txt
+original
 ```
 
-### Example 2: Full Isolation with Debug (Phase 2)
+### Example 2: Clean Container Environment (Phase 3)
 
 ```bash
-$ sudo ./minicontainer --pid --rootfs ./rootfs --debug /bin/sh -c 'echo $$'
-[parent] Executing: /bin/sh -c echo $$
+# Container sees minimal environment, not host's 30+ variables
+$ sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh -c 'env'
+HOME=/root
+TERM=xterm
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PWD=/
+
+# Custom env variable with --env
+$ sudo ./minicontainer --rootfs ./rootfs --overlay \
+    --env MY_APP=production /bin/sh -c 'echo $MY_APP'
+production
+```
+
+### Example 3: Debug Mode with Overlay (Phase 3)
+
+```bash
+$ sudo ./minicontainer --debug --rootfs ./rootfs --overlay /bin/echo "Hello"
+[parent] Container environment:
+[parent]   PATH=/usr/local/sbin:...
+[parent]   HOME=/root
+[parent]   TERM=xterm
+[parent] Executing: /bin/echo Hello
 [parent] Rootfs: ./rootfs
-[parent] Creating mount namespace
-[parent] Child PID: 5678
+[parent] Overlay: enabled
+[overlay] Container ID: a1b2c3d4e5f6
+[overlay] Lower: .../rootfs
+[overlay] Upper: .../containers/a1b2c3d4e5f6/upper
+[overlay] Overlay mounted at .../containers/a1b2c3d4e5f6/merged
 [child] PID: 1
-[child] Setting up rootfs: ./rootfs
-[child] Bind mounted /home/user/minicontainer/rootfs
-[child] pivot_root successful
-[child] Unmounted old root
-[child] Mounted /proc
-1
+[child] Closing inherited fd 3
+Hello
 [parent] Child exited: 0
-```
-
-### Example 3: /proc Inside Container (Phase 2)
-
-```bash
-# ps only sees container processes, not host processes
-$ sudo ./minicontainer --pid --rootfs ./rootfs /bin/sh -c 'cat /proc/1/status | head -1'
-Name:   sh
+[overlay] Removing upper layer: ...
+[overlay] Cleanup complete
 ```
 
 ### Example 4: PID Namespace Isolation (Phase 1)
@@ -369,28 +433,38 @@ make test
 - ✓ Rootfs isolation (container sees only rootfs contents)
 - ✓ /proc mount (proc filesystem mounted inside container)
 
+**Phase 3 tests** (`test_overlay` - requires root + rootfs):
+- ✓ Base image untouched after container writes (overlay)
+- ✓ Overlay cleanup (directories removed on exit)
+- ✓ Backward compatibility (no overlay, Phase 2 behavior)
+
 ### Manual Testing
 
 ```bash
-# Rootfs isolation: should show only rootfs contents
-sudo ./minicontainer --rootfs ./rootfs /bin/ls /
+# Overlay: base image should be untouched after container modifies a file
+echo "original" > rootfs/tmp/marker.txt
+sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh -c \
+    'echo "modified" > /tmp/marker.txt'
+cat rootfs/tmp/marker.txt    # Should show "original"
 
-# Full isolation: PID 1 + rootfs
-sudo ./minicontainer --pid --rootfs ./rootfs /bin/sh -c 'echo $$ && ls /'
+# Environment: container should have minimal env
+sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh -c 'env'
+# Should show only PATH, HOME, TERM, PWD
+
+# File descriptors: container should have only fds 0, 1, 2
+sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh -c \
+    'ls -la /proc/self/fd'
+
+# Misplaced flag detection
+./minicontainer --rootfs ./rootfs /bin/sh --pid
+# Should print error about --pid after command
 
 # PID namespace: should print 1
 sudo ./minicontainer --pid /bin/sh -c 'echo $$'
 
-# Without namespace: should print real PID
-./minicontainer /bin/sh -c 'echo $$'
-
-# Exit codes work through namespace
+# Exit codes
 sudo ./minicontainer --pid /bin/sh -c 'exit 42'
 echo $?  # Should be 42
-
-# Missing command
-./minicontainer /nonexistent
-echo $?  # Should be 127
 ```
 
 ### Memory Leak Detection
@@ -420,30 +494,31 @@ Following shell/POSIX conventions:
 ## Design Decisions
 
 See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
-- Phase 1 → Phase 2 architecture transition (namespace → mount API)
+- Phase 2 → Phase 3 architecture transition (mount → overlay API)
+- OverlayFS layer management (split setup_overlay into init/create/mount)
+- Why `close_inherited_fds()` is needed despite `sudo` masking fd leaks
+- Mount hardening with `MS_NODEV | MS_NOSUID`
+- Environment isolation via `build_container_env()` vs inheriting host environ
 - Why pivot_root() instead of chroot()
 - Mount propagation (MS_PRIVATE | MS_REC) before pivot_root
-- Bind mount + pivot_root pattern for arbitrary rootfs paths
-- Lazy unmount (MNT_DETACH) for old root cleanup
-- Why clone() instead of fork() for namespace support
-- Stack allocation choices (malloc vs mmap)
-- Modular design (spawn.c/namespace.c/mount.c vs main.c separation)
-- Configuration and result structure patterns
-- Errors found and fixed during implementation
+- Lazy unmount (MNT_DETACH) for old root and overlay cleanup
+- Modular design (spawn.c/namespace.c/mount.c/overlay.c separation)
+- All errors found and fixed during implementation (Errors #1–#14)
 
 ---
 
 ## Known Limitations
 
 1. **No PATH search** — Must use absolute paths (`/bin/ls`, not `ls`)
-2. **No FD management** — Child inherits all open file descriptors from the parent. Any fd referencing the host filesystem survives `pivot_root` + `MNT_DETACH` and could be used to access host files from inside the container. This is the same class of vulnerability as CVE-2024-21626 (Leaky Vessels) and CVE-2016-9962. **Fixed in Phase 3** via `close_inherited_fds()`.
-3. **Environment variable leak** — After `pivot_root()`, the child still inherits the host's full `environ` (`PATH`, `HOME`, `SHELL`, etc.). These variables reference paths that do not exist inside the container rootfs. The `--env` flag from Phase 0 was also dropped in Phase 2. **Fixed in Phase 3** via `build_container_env()` and restored `--env` support.
-4. **No copy-on-write filesystem** — Container writes modify the base rootfs directly. Running `rm /bin/ls` in one container permanently deletes it for all future containers. **Fixed in Phase 3** via OverlayFS.
-5. **No mount hardening** — When Phase 3 adds the overlay mount, it must use `MS_NODEV | MS_NOSUID` to block device node access and SUID escalation inside the container. Without these flags, a root process in the container could create device nodes or exploit setuid binaries. **Addressed in Phase 3**.
+2. ~~**No FD management**~~ — **Fixed in Phase 3** via `close_inherited_fds()`
+3. ~~**Environment variable leak**~~ — **Fixed in Phase 3** via `build_container_env()` and `--env`
+4. ~~**No copy-on-write filesystem**~~ — **Fixed in Phase 3** via OverlayFS
+5. ~~**No mount hardening**~~ — **Fixed in Phase 3** via `MS_NODEV | MS_NOSUID`
 6. **Single command** — Runs one command then exits (no daemon mode)
-7. **Requires root for namespaces** — `CLONE_NEWPID`/`CLONE_NEWNS` need `CAP_SYS_ADMIN`
+7. **Requires root for namespaces** — `CLONE_NEWPID`/`CLONE_NEWNS`/overlay need `CAP_SYS_ADMIN`
 8. **Rootfs must be pre-built** — No image pull or layer support; rootfs directory must exist before running
 9. **No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
+10. **No hostname isolation** — Container sees the host's hostname (addressed in Phase 4)
 
 ---
 
@@ -463,26 +538,33 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] Namespace cleanup (stack deallocation)
 - [x] Unit tests (requires root)
 
-### ✅ Phase 2: Mount Namespace & Filesystem Isolation (Current)
+### ✅ Phase 2: Mount Namespace & Filesystem Isolation
 - [x] CLONE_NEWNS for mount isolation
 - [x] pivot_root() to custom rootfs
 - [x] Mount /proc inside container
 - [x] --rootfs flag
 - [x] Unit tests (requires root + rootfs)
 
-### 📋 Phase 3: OverlayFS & Security Corrections
-- [ ] OverlayFS copy-on-write filesystem (read-only base image + writable upper layer)
-- [ ] Per-container writable layers with automatic cleanup on exit
-- [ ] `--overlay` and `--container-dir` CLI flags
-- [ ] **Security fix:** `build_container_env()` — construct minimal container environment, restore `--env` flag (Known Limitation #3)
-- [ ] **Security fix:** `close_inherited_fds()` — close all inherited parent fds before `execve()` (Known Limitation #2, CVE-2024-21626, CVE-2016-9962)
-- [ ] **Security fix:** Mount overlay with `MS_NODEV | MS_NOSUID` (Known Limitation #5)
+### ✅ Phase 3: OverlayFS & Security Corrections (Current)
+- [x] OverlayFS copy-on-write filesystem (read-only base image + writable upper layer)
+- [x] Per-container writable layers with automatic cleanup on exit
+- [x] `--overlay` and `--container-dir` CLI flags
+- [x] `build_container_env()` — clean container environment with `--env` support
+- [x] `close_inherited_fds()` — close all inherited parent fds before `execve()`
+- [x] Mount overlay with `MS_NODEV | MS_NOSUID`
+- [x] Misplaced flag detection
+- [x] `--rootfs` auto-enables `--pid`
+- [x] Unit tests (requires root + rootfs)
 
-### 📋 Phase 4: Resource Limits (cgroups)
-- [ ] Memory limits
-- [ ] CPU shares
-- [ ] Process limits
-- [ ] cgroup v2 support
+### 📋 Phase 4: UTS Namespace (Hostname Isolation)
+- [ ] CLONE_NEWUTS for hostname isolation
+- [ ] `--hostname` flag
+- [ ] Container gets its own hostname
+
+### 📋 Phase 5: Network Isolation
+- [ ] CLONE_NEWNET for network namespace
+- [ ] veth pairs and bridges
+- [ ] Port forwarding
 
 ### 📋 Phase 5: Network Isolation
 - [ ] CLONE_NEWNET for network namespace
@@ -506,7 +588,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 
 ```bash
 make              # Build minicontainer
-make test         # Build and run all tests (Phase 0 + 1 + 2)
+make test         # Build and run all tests (Phase 0 + 1 + 2 + 3)
 make clean        # Remove build artifacts
 make debug        # Build with debug symbols (-g)
 make valgrind     # Run memory leak detection
@@ -538,9 +620,10 @@ make help         # Show all available targets
 
 ### Man Pages (Essential Reading)
 ```bash
+man 2 mount           # Mount filesystem — see overlay type and MS_NODEV/MS_NOSUID
+man 2 umount2         # Unmount filesystem with flags (MNT_DETACH)
+man 2 getrlimit       # Get fd limit for close_inherited_fds fallback (Phase 3)
 man 2 pivot_root      # Change the root filesystem (Phase 2)
-man 2 mount           # Mount filesystem (Phase 2)
-man 2 umount2         # Unmount filesystem with flags (Phase 2)
 man 7 mount_namespaces  # Mount namespace details (Phase 2)
 man 2 clone           # Process creation with namespaces
 man 2 fork            # Process creation (Phase 0)
@@ -563,6 +646,21 @@ man 7 pid_namespaces  # PID namespace details
 ---
 
 ## Troubleshooting
+
+### "mount(overlay): No such device"
+
+**Problem:** Overlay mount fails because the kernel module is not loaded.
+
+**Solution:**
+```bash
+# Check if overlay is supported
+cat /proc/filesystems | grep overlay
+
+# If not listed, load the module
+sudo modprobe overlay
+```
+
+---
 
 ### "pivot_root: Invalid argument"
 

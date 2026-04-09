@@ -8,7 +8,7 @@ rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"/{bin,lib,lib64,proc,tmp,etc}
 
 # Binaries to include
-BINS=(sh ls echo wc mount grep ps rm env cp chmod mknod cat mkdir)
+BINS=(sh ls echo wc mount grep ps rm env cp chmod mknod cat mkdir hostname id ipcs ipcmk ipcrm)
 
 for bin in "${BINS[@]}"; do
     cp "/bin/$bin" "$ROOTFS/bin/"
