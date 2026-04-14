@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include "overlay.h"
 #include "mount.h"    // setup_rootfs(), mount_proc()
 #include <stdio.h>
@@ -108,12 +107,29 @@ static int init_overlay_paths(overlay_context_t *ctx, const char *rootfs_path,
     }
 
     // Build paths for this container's overlay directories
-    snprintf(ctx->container_base, PATH_MAX, "%s/%s",
-             abs_container_dir, ctx->container_id);
+    // Each snprintf return value is checked against PATH_MAX to detect
+    // truncation — a silently truncated path would cause mkdir/mount to
+    // operate on the wrong location.
+    if (snprintf(ctx->container_base, PATH_MAX, "%s/%s",
+                 abs_container_dir, ctx->container_id) >= PATH_MAX) {
+        fprintf(stderr, "init_overlay_paths: container_base path truncated\n");
+        return -1;
+    }
 
-    snprintf(ctx->upper_path, PATH_MAX, "%s/upper", ctx->container_base);
-    snprintf(ctx->work_path, PATH_MAX, "%s/work", ctx->container_base);
-    snprintf(ctx->merged_path, PATH_MAX, "%s/merged", ctx->container_base);
+    if (snprintf(ctx->upper_path, PATH_MAX, "%s/upper", ctx->container_base) >= PATH_MAX) {
+        fprintf(stderr, "init_overlay_paths: upper_path truncated\n");
+        return -1;
+    }
+
+    if (snprintf(ctx->work_path, PATH_MAX, "%s/work", ctx->container_base) >= PATH_MAX) {
+        fprintf(stderr, "init_overlay_paths: work_path truncated\n");
+        return -1;
+    }
+
+    if (snprintf(ctx->merged_path, PATH_MAX, "%s/merged", ctx->container_base) >= PATH_MAX) {
+        fprintf(stderr, "init_overlay_paths: merged_path truncated\n");
+        return -1;
+    }
 
     if (enable_debug) {
         printf("[overlay] Container ID: %s\n", ctx->container_id);

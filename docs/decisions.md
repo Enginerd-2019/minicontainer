@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 3 - OverlayFS & Security Corrections
-**Last Updated:** 2026-03-13
+**Phase:** 4 - UTS & User Namespace Isolation
+**Last Updated:** 2026-04-13
 
 ---
 
@@ -323,6 +323,86 @@ int main() {
 - `child_pid = -1` indicates fork/wait failure
 - Exit status `127` indicates execve failure
 - Exit status `128 + N` indicates signal death
+
+### 13. Superseding mount.c with overlay.c (Phase 3)
+
+**Decision:** Replace `mount.c` (`clone(CLONE_NEWPID | CLONE_NEWNS)`) with `overlay.c` as the core execution module, continuing the superseding pattern from Phases 1 and 2.
+
+**Rationale:**
+- **New responsibilities:** Phase 3 adds OverlayFS setup/teardown, environment isolation, and inherited fd cleanup — filesystem-layer concerns that don't belong in `mount.c`
+- **Superset behavior:** `overlay_exec()` handles overlay, non-overlay, namespaced, and non-namespaced execution, fully replacing `mount_exec()`
+- **Function reuse:** `setup_rootfs()` and `mount_proc()` are imported from `mount.h` and called unchanged — the child receives `merged/` as its rootfs path instead of the raw rootfs, transparently
+- **Parent-managed lifecycle:** Overlay is created before `clone()` and torn down after `waitpid()`, because the child's mount namespace is isolated from the parent
+
+**What changed in main.c:**
+- `#include "mount.h"` → `#include "overlay.h"`
+- `mount_config_t` → `overlay_config_t` (adds `enable_overlay`, `container_dir`)
+- `mount_exec()` → `overlay_exec()`
+- `mount_cleanup()` → `overlay_cleanup()`
+- Added `--overlay` flag, `--env` support, misplaced-flag detection
+- Added `build_container_env()` to construct minimal container environment
+
+---
+
+### 14. OverlayFS over Alternatives (Phase 3)
+
+**Decision:** Use OverlayFS for copy-on-write filesystem isolation instead of full rootfs copies, read-only bind mounts, or tmpfs.
+
+**Rationale:**
+- **Full rootfs copies (rejected):** 50–200 MB per container; wasteful when most files are read-only
+- **Read-only bind mounts (rejected):** Prevents all writes, breaking temp files, logs, and config — containers need a writable view
+- **tmpfs for writable layer (rejected):** Memory-backed; large writes consume RAM with no disk backing
+- **OverlayFS:** Shares a read-only base image (lowerdir) across containers; each container gets its own writable upper layer on disk; writes are copy-on-write; changes are discarded on teardown
+
+**Security hardening:** Overlay is mounted with `MS_NODEV | MS_NOSUID` — `MS_NOSUID` prevents setuid escalation inside the container, `MS_NODEV` prevents device node creation. This matches Docker/Podman/runc defaults.
+
+---
+
+### 15. Environment Isolation and FD Cleanup (Phase 3)
+
+**Decision:** Construct a minimal container environment instead of inheriting the host's `environ`, and close all inherited file descriptors before `execve()`.
+
+**Environment rationale:**
+- Phases 0–2 inherited the full host environment (`PATH`, `HOME`, `SHELL`, etc.), which referenced host paths that don't exist inside the container rootfs
+- `build_container_env()` constructs a minimal baseline (`PATH=/usr/bin:/bin`, `HOME=/root`, `TERM`) — matches Docker's approach
+- User `--env` overrides replace on duplicate key rather than appending a second entry
+
+**FD cleanup rationale:**
+- After `clone()`, the child inherits every open fd from the parent. Any fd referencing the host filesystem survives `pivot_root()` + `MNT_DETACH` and enables container escape (CVE-2024-21626, CVE-2016-9962)
+- `close_inherited_fds()` iterates `/proc/self/fd` (O(open fds), not O(max fds)) and closes everything above `STDERR_FILENO`
+- Called after `mount_proc()` so `/proc/self/fd` is available, with a brute-force fallback if it isn't
+
+---
+
+### 16. Superseding overlay.c with uts.c (Phase 4)
+
+**Decision:** Replace `overlay.c` with `uts.c` as the core execution module, continuing the superseding pattern.
+
+**Rationale:**
+- **New responsibilities:** Phase 4 adds UTS namespace isolation (`CLONE_NEWUTS`) and hostname configuration — identity concerns that don't belong in `overlay.c`
+- **Superset behavior:** `uts_exec()` handles everything `overlay_exec()` did plus UTS namespace creation and hostname setting
+- **Function reuse:** `setup_overlay()`, `teardown_overlay()`, `setup_rootfs()`, and `mount_proc()` are all imported and called unchanged
+- **Acknowledged technical debt:** By Phase 4, the `*_exec()` functions are ~90% identical boilerplate — documented as a future refactoring trigger (Phase 7 CLI refactor)
+
+**What changed in main.c:**
+- `#include "overlay.h"` → `#include "uts.h"`
+- `overlay_config_t` → `uts_config_t` (adds `enable_uts_namespace`, `hostname`)
+- `overlay_exec()` → `uts_exec()`
+- `overlay_cleanup()` → `uts_cleanup()`
+- Added `--hostname <name>` flag (auto-enables UTS namespace)
+
+---
+
+### 17. sethostname() in Child After clone() (Phase 4)
+
+**Decision:** Call `sethostname()` inside the child process after `clone(CLONE_NEWUTS)`, not in the parent.
+
+**Rationale:**
+- **Namespace scoping:** `CLONE_NEWUTS` creates the new UTS namespace for the *child*. The parent remains in the host's UTS namespace. Calling `sethostname()` in the parent would change the host's hostname globally
+- **Minimal implementation:** One flag (`CLONE_NEWUTS`) added to the existing `clone()` call + one `sethostname()` call in the child — no /proc writes, no synchronization, no cleanup
+- **Timing:** `setup_uts()` is called early in the child, before `setup_rootfs()`, so the hostname is set before the container's filesystem is configured
+
+**Alternative considered:** `unshare(CLONE_NEWUTS)` — rejected because `clone()` is already used for PID/mount namespaces, and adding another flag to the same call is simpler and creates all namespaces atomically.
 
 ---
 
@@ -816,6 +896,97 @@ command line including `argv[0]`.
 `Removing container base`.
 
 **Fix Applied:** 2026-03-30
+
+---
+
+### Error #15: `-Wformat-truncation` Warnings in `init_overlay_paths()`
+
+**Date Found:** 2026-04-13
+
+**Problem:** GCC emitted four `-Wformat-truncation` warnings for the `snprintf`
+calls in `init_overlay_paths()`. The warnings indicated that the formatted
+output could exceed the `PATH_MAX` (4096) destination buffer when the combined
+container directory path and container ID (or subdirectory suffix) approached
+the limit.
+
+**Symptom:**
+```
+src/overlay.c:110:49: warning: '%s' directive output may be truncated
+  writing up to 12 bytes into a region of size between 0 and 4095
+src/overlay.c:113:44: warning: '/upper' directive output may be truncated
+  writing 6 bytes into a region of size between 1 and 4096
+src/overlay.c:114:43: warning: '/work' directive output may be truncated
+  writing 5 bytes into a region of size between 1 and 4096
+src/overlay.c:115:45: warning: '/merged' directive output may be truncated
+  writing 7 bytes into a region of size between 1 and 4096
+```
+
+**Root Cause:** The four `snprintf` calls wrote formatted paths into
+`PATH_MAX`-sized buffers but never checked the return value. `snprintf` returns
+the number of characters that *would have been written* if the buffer were large
+enough — when this value is ≥ `PATH_MAX`, the output is silently truncated.
+GCC's `-Wformat-truncation` (enabled by `-Wall`) flagged this because it could
+statically prove truncation was possible.
+
+**Impact:**
+- **Severity:** Medium — while truncation is unlikely with typical path lengths,
+  a silently truncated path passed to `mkdir` or `mount` would operate on the
+  wrong directory, potentially outside the intended container tree. In a
+  container runtime, this is a correctness and safety concern.
+
+**Fix:** Wrapped each `snprintf` call in a return-value check:
+```c
+if (snprintf(ctx->container_base, PATH_MAX, "%s/%s",
+             abs_container_dir, ctx->container_id) >= PATH_MAX) {
+    fprintf(stderr, "init_overlay_paths: container_base path truncated\n");
+    return -1;
+}
+```
+The same pattern was applied to `upper_path`, `work_path`, and `merged_path`.
+This converts silent truncation into a hard failure with a descriptive error
+message. Both code listings in the Phase 3 implementation guide (§7 and §8.2.1)
+were updated to match.
+
+**Fix Applied:** 2026-04-13
+
+---
+
+### Error #16: Missing `<stdlib.h>` and Wrong Pointer Type in test_uts.c
+
+**Date Found:** 2026-04-13
+
+**Problem:** `test_uts.c` had two issues:
+1. Missing `#include <stdlib.h>` — `calloc()` and `free()` were implicitly
+   declared, causing `-Wimplicit-function-declaration` and
+   `-Wbuiltin-declaration-mismatch` warnings
+2. `test_env` was declared as `char *` instead of `char **` —
+   `build_container_env()` returns `char **`, causing
+   `-Wincompatible-pointer-types` warnings when assigned and when passed to
+   `.envp` (which expects `char * const *`)
+
+**Symptom:**
+```
+tests/test_uts.c:15:18: warning: implicit declaration of function 'calloc'
+tests/test_uts.c:24:22: warning: initialization of 'char *' from incompatible
+  pointer type 'char **'
+tests/test_uts.c:46:5: warning: implicit declaration of function 'free'
+```
+
+**Root Cause:** Same class of error as Error #10 (missing `<stdlib.h>` in
+`test_overlay.c`). The pointer type mismatch was a separate typo — `char *`
+instead of `char **` — which compiled only because GCC's implicit conversion
+rules allowed it with a warning.
+
+**Impact:**
+- **Severity:** Medium — implicit `calloc` declaration assumes `int` return
+  type, which truncates the pointer on LP64 platforms. The wrong pointer type
+  for `envp` could cause the child process to receive a corrupted environment.
+
+**Fix:** Added `#include <stdlib.h>` and changed `char *test_env` to
+`char **test_env` in both test functions. The corresponding code listing in
+the Phase 4 implementation guide was updated to match.
+
+**Fix Applied:** 2026-04-13
 
 ---
 

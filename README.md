@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-3%20OverlayFS-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-4%20UTS%20Namespace-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,15 +12,21 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current Phase:** Phase 3 - OverlayFS & Security Corrections
+**Current Phase:** Phase 4 - UTS Namespace (Hostname Isolation)
 
-Building on Phase 2's mount namespace isolation, this phase introduces **copy-on-write filesystem isolation** using OverlayFS, a **clean container environment**, and **file descriptor cleanup** to prevent container escapes. The base rootfs image is never modified — all container writes go to a per-container upper layer that is discarded on exit.
+Building on Phase 3's OverlayFS and security corrections, this phase adds **UTS namespace isolation** so each container gets its own hostname via `CLONE_NEWUTS` and `sethostname()`. The host's hostname is never affected — each container's identity is fully scoped to its namespace.
 
 ---
 
 ## Features
 
-### Phase 3 (Current)
+### Phase 4 (Current)
+
+- ✅ **UTS Namespace Isolation** - Container gets its own hostname via `CLONE_NEWUTS`
+- ✅ **`--hostname <name>`** - Set a custom hostname; auto-enables UTS namespace
+- ✅ **Host Unchanged** - `sethostname()` in child only affects the container's namespace
+
+### Phase 3
 
 - ✅ **OverlayFS Copy-on-Write** - Base image stays read-only; writes go to per-container upper layer
 - ✅ **Automatic Cleanup** - Upper layer, work directory, and merged mount removed on container exit
@@ -73,6 +79,12 @@ This compiles the `minicontainer` executable in the current directory.
 # Basic usage (no namespace)
 ./minicontainer /bin/ls -la
 
+# Hostname isolation (container gets its own hostname)
+sudo ./minicontainer --rootfs ./rootfs --hostname mycontainer /bin/sh -c 'hostname'
+
+# Full isolation: overlay + hostname (independent flags, combine for full isolation)
+sudo ./minicontainer --rootfs ./rootfs --overlay --hostname mycontainer /bin/sh
+
 # Rootfs + overlay (copy-on-write, base image untouched)
 sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh
 
@@ -97,6 +109,13 @@ sudo ./minicontainer --debug --rootfs ./rootfs --overlay /bin/sh -c 'echo $$'
 ./minicontainer --help
 ```
 
+**Flag relationships:** `--rootfs` implies `--pid` (in `main.c`'s config setup),
+but `--hostname` does not imply `--overlay` and vice versa — they are
+independent isolation features. For full isolation, combine them explicitly.
+Note that this auto-enable behavior is a `main.c` design choice; the underlying
+library functions (`uts_exec`, `overlay_exec`, etc.) accept each flag
+independently, allowing other entry points to compose isolation differently.
+
 **Note:** Namespace features require root or `CAP_SYS_ADMIN`:
 ```bash
 # Option 1: Run with sudo
@@ -110,7 +129,7 @@ sudo setcap cap_sys_admin+ep ./minicontainer
 ### Test
 
 ```bash
-# Run all tests (Phase 0 + Phase 1 + Phase 2 + Phase 3)
+# Run all tests (Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4)
 make test
 
 # Run example commands
@@ -127,17 +146,20 @@ make valgrind
 ```
 minicontainer/
 ├── include/
+│   ├── uts.h                # Phase 4: UTS namespace & hostname isolation API
 │   ├── overlay.h            # Phase 3: OverlayFS, environment, fd cleanup API
 │   ├── mount.h              # Phase 2: Mount namespace & rootfs API
 │   ├── namespace.h          # Phase 1: PID namespace isolation API
 │   └── spawn.h              # Phase 0: Process spawning API
 ├── src/
 │   ├── main.c               # CLI entry point and argument parsing
-│   ├── overlay.c            # Phase 3: OverlayFS, close_inherited_fds, clone/exec
-│   ├── mount.c              # Phase 2: setup_rootfs, mount_proc (used by overlay.c)
+│   ├── uts.c                # Phase 4: UTS namespace, clone/exec (calls overlay.c, mount.c)
+│   ├── overlay.c            # Phase 3: OverlayFS, close_inherited_fds
+│   ├── mount.c              # Phase 2: setup_rootfs, mount_proc
 │   ├── namespace.c          # Phase 1: clone() + PID namespace logic
 │   └── spawn.c              # Phase 0: fork/execve implementation
 ├── tests/
+│   ├── test_uts.c           # Phase 4: UTS namespace tests (requires root + rootfs)
 │   ├── test_overlay.c       # Phase 3: Overlay/env/fd tests (requires root + rootfs)
 │   ├── test_mount.c         # Phase 2: Mount/rootfs tests (requires root + rootfs)
 │   ├── test_namespace.c     # Phase 1: Namespace tests (requires root)
@@ -157,31 +179,32 @@ minicontainer/
 ### Module Separation
 
 ```
-┌─────────────────────────────────────────────────┐
-│              main.c (CLI Layer)                  │
-│  • Parses --pid, --rootfs, --overlay, --env, etc │
-│  • build_container_env() — clean environment     │
-│  • Misplaced flag detection                      │
-│  • Calls overlay_exec()                          │
-└─────────────────────┬───────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                main.c (CLI Layer)                     │
+│  • Parses --pid, --rootfs, --overlay, --hostname, etc │
+│  • build_container_env() — clean environment          │
+│  • Misplaced flag detection                           │
+│  • Calls uts_exec()                                   │
+└─────────────────────┬────────────────────────────────┘
                       │
                       ▼
-┌─────────────────────────────────────────────────┐
-│        overlay.c (Orchestration Layer)           │
-│  • setup_overlay() → mount OverlayFS             │
-│  • clone() with CLONE_NEWPID | CLONE_NEWNS       │
-│  • waitpid() and exit status parsing             │
-│  • teardown_overlay() → unmount and cleanup      │
-└─────────────────────┬───────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│           uts.c (Orchestration Layer)                 │
+│  • setup_overlay() → mount OverlayFS (from overlay.c)│
+│  • clone() with NEWPID | NEWNS | NEWUTS              │
+│  • waitpid() and exit status parsing                 │
+│  • teardown_overlay() → unmount and cleanup          │
+└─────────────────────┬────────────────────────────────┘
                       │
                       ▼
-┌─────────────────────────────────────────────────┐
-│           Child Process (child_func)             │
-│  • setup_rootfs(): pivot_root to new rootfs      │
-│  • mount_proc(): mount /proc for PID namespace   │
-│  • close_inherited_fds(): close leaked parent fds│
-│  • execve() with clean container environment     │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│            Child Process (child_func)                 │
+│  • setup_uts(): sethostname() in new UTS namespace    │
+│  • setup_rootfs(): pivot_root to new rootfs           │
+│  • mount_proc(): mount /proc for PID namespace        │
+│  • close_inherited_fds(): close leaked parent fds     │
+│  • execve() with clean container environment          │
+└──────────────────────────────────────────────────────┘
 ```
 
 **Phase transitions:**
@@ -189,13 +212,16 @@ minicontainer/
 - Phase 1: `namespace.c` (`clone(CLONE_NEWPID)`)
 - Phase 2: `mount.c` (`clone(CLONE_NEWPID | CLONE_NEWNS)` + `pivot_root`)
 - Phase 3: `overlay.c` (OverlayFS + env isolation + fd cleanup), calls into `mount.c` for `setup_rootfs`/`mount_proc`
+- Phase 4: `uts.c` (`CLONE_NEWUTS` + `sethostname`), calls into `overlay.c` and `mount.c`
 - Earlier modules retained for their respective phase tests
+
+**Note on code duplication:** Each phase's `*_exec()` function (e.g., `overlay_exec`, `uts_exec`) shares ~90% of its structure with the previous phase — `clone()`, `waitpid()`, stack allocation, and exit status parsing are repeated each time. This is a deliberate pedagogical choice: each module is self-contained and readable without cross-referencing earlier phases. A production runtime would factor this into a shared execution core, and this refactoring is planned for Phase 7.
 
 ### API Design
 
 **Configuration structure:**
 ```c
-overlay_config_t config = {
+uts_config_t config = {
     .program = "/bin/sh",
     .argv = argv,                     // NULL-terminated array
     .envp = env,                      // From build_container_env()
@@ -204,13 +230,15 @@ overlay_config_t config = {
     .enable_mount_namespace = true,   // Use CLONE_NEWNS
     .rootfs_path = "./rootfs",        // NULL = no rootfs change
     .enable_overlay = true,           // Use OverlayFS on top of rootfs
-    .container_dir = NULL             // NULL = default "./containers"
+    .container_dir = NULL,            // NULL = default "./containers"
+    .enable_uts_namespace = true,     // Use CLONE_NEWUTS
+    .hostname = "mycontainer"         // NULL = no hostname change
 };
 ```
 
 **Result structure:**
 ```c
-overlay_result_t result = overlay_exec(&config);
+uts_result_t result = uts_exec(&config);
 
 if (result.exited_normally) {
     printf("Exit code: %d\n", result.exit_status);
@@ -218,7 +246,7 @@ if (result.exited_normally) {
     printf("Killed by signal %d\n", result.signal);
 }
 
-overlay_cleanup(&result);  // Free clone stack
+uts_cleanup(&result);  // Free clone stack
 ```
 
 ---
@@ -305,23 +333,48 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 
 | System Call | Purpose | Phase |
 |-------------|---------|-------|
+| `sethostname()` | Sets container hostname inside UTS namespace | 4 |
 | `mount("overlay")` | Mounts OverlayFS with `MS_NODEV \| MS_NOSUID` | 3 |
 | `close()` | Closes inherited parent fds before `execve()` | 3 |
 | `getrlimit()` | Gets fd limit for brute-force fallback | 3 |
 | `pivot_root()` | Swaps root filesystem for the container | 2 |
 | `mount()` | Bind mounts rootfs, sets propagation, mounts `/proc` | 2 |
 | `umount2()` | Lazily unmounts old root and overlay (`MNT_DETACH`) | 2, 3 |
-| `clone()` | Creates child with namespace flags (`CLONE_NEWPID`, `CLONE_NEWNS`) | 1, 2, 3 |
+| `clone()` | Creates child with namespace flags (`NEWPID`, `NEWNS`, `NEWUTS`) | 1–4 |
 | `fork()` | Creates a new process (duplicate of parent) | 0 |
-| `execve()` | Replaces process image with new program | 0, 1, 2, 3 |
-| `waitpid()` | Waits for child to exit and reaps zombie | 0, 1, 2, 3 |
+| `execve()` | Replaces process image with new program | 0–4 |
+| `waitpid()` | Waits for child to exit and reaps zombie | 0–4 |
 | `sigaction()` | Installs SIGCHLD handler to prevent zombies | 0 |
 
 ---
 
 ## Usage Examples
 
-### Example 1: OverlayFS — Base Image Untouched (Phase 3)
+### Example 1: Hostname Isolation (Phase 4)
+
+```bash
+# Host hostname is unchanged
+$ hostname
+tcrumb-desktop
+
+# Container gets its own hostname
+$ sudo ./minicontainer --rootfs ./rootfs --hostname mycontainer \
+    /bin/sh -c 'hostname'
+mycontainer
+
+# Host is still unchanged
+$ hostname
+tcrumb-desktop
+
+# Combine with --overlay for full filesystem + hostname isolation
+$ sudo ./minicontainer --rootfs ./rootfs --overlay --hostname mycontainer \
+    /bin/sh -c 'hostname && echo "hello" > /tmp/test && cat /tmp/test'
+mycontainer
+hello
+# rootfs is untouched, hostname was scoped to the container
+```
+
+### Example 2: OverlayFS — Base Image Untouched (Phase 3)
 
 ```bash
 # Create a marker in the base image
@@ -337,7 +390,7 @@ $ cat rootfs/tmp/marker.txt
 original
 ```
 
-### Example 2: Clean Container Environment (Phase 3)
+### Example 3: Clean Container Environment (Phase 3)
 
 ```bash
 # Container sees minimal environment, not host's 30+ variables
@@ -353,7 +406,7 @@ $ sudo ./minicontainer --rootfs ./rootfs --overlay \
 production
 ```
 
-### Example 3: Debug Mode with Overlay (Phase 3)
+### Example 4: Debug Mode with Overlay (Phase 3)
 
 ```bash
 $ sudo ./minicontainer --debug --rootfs ./rootfs --overlay /bin/echo "Hello"
@@ -376,7 +429,7 @@ Hello
 [overlay] Cleanup complete
 ```
 
-### Example 4: PID Namespace Isolation (Phase 1)
+### Example 5: PID Namespace Isolation (Phase 1)
 
 ```bash
 # Without --pid: shell reports its real PID
@@ -388,14 +441,14 @@ $ sudo ./minicontainer --pid /bin/sh -c 'echo $$'
 1
 ```
 
-### Example 5: Basic Command Execution
+### Example 6: Basic Command Execution
 
 ```bash
 $ ./minicontainer /bin/echo "Hello from minicontainer"
 Hello from minicontainer
 ```
 
-### Example 6: Exit Code Handling
+### Example 7: Exit Code Handling
 
 ```bash
 $ ./minicontainer /bin/false
@@ -438,9 +491,19 @@ make test
 - ✓ Overlay cleanup (directories removed on exit)
 - ✓ Backward compatibility (no overlay, Phase 2 behavior)
 
+**Phase 4 tests** (`test_uts` - requires root):
+- ✓ Hostname isolation (container gets custom hostname)
+- ✓ Backward compatibility (no UTS namespace, Phase 3 behavior)
+
 ### Manual Testing
 
 ```bash
+# Hostname: container should have custom hostname, host unchanged
+hostname                          # Note the host's hostname
+sudo ./minicontainer --pid --rootfs ./rootfs --hostname testbox \
+    /bin/sh -c 'hostname'         # Should show "testbox"
+hostname                          # Should still show original
+
 # Overlay: base image should be untouched after container modifies a file
 echo "original" > rootfs/tmp/marker.txt
 sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh -c \
@@ -494,7 +557,8 @@ Following shell/POSIX conventions:
 ## Design Decisions
 
 See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
-- Phase 2 → Phase 3 architecture transition (mount → overlay API)
+- Phase 3 → Phase 4 architecture transition (overlay → uts API)
+- UTS namespace isolation and why sethostname() must run in the child
 - OverlayFS layer management (split setup_overlay into init/create/mount)
 - Why `close_inherited_fds()` is needed despite `sudo` masking fd leaks
 - Mount hardening with `MS_NODEV | MS_NOSUID`
@@ -502,8 +566,8 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - Why pivot_root() instead of chroot()
 - Mount propagation (MS_PRIVATE | MS_REC) before pivot_root
 - Lazy unmount (MNT_DETACH) for old root and overlay cleanup
-- Modular design (spawn.c/namespace.c/mount.c/overlay.c separation)
-- All errors found and fixed during implementation (Errors #1–#14)
+- Modular design (spawn.c/namespace.c/mount.c/overlay.c/uts.c separation)
+- All errors found and fixed during implementation (Errors #1–#16)
 
 ---
 
@@ -515,10 +579,10 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 4. ~~**No copy-on-write filesystem**~~ — **Fixed in Phase 3** via OverlayFS
 5. ~~**No mount hardening**~~ — **Fixed in Phase 3** via `MS_NODEV | MS_NOSUID`
 6. **Single command** — Runs one command then exits (no daemon mode)
-7. **Requires root for namespaces** — `CLONE_NEWPID`/`CLONE_NEWNS`/overlay need `CAP_SYS_ADMIN`
+7. **Requires root for namespaces** — `CLONE_NEWPID`/`CLONE_NEWNS`/`CLONE_NEWUTS`/overlay need `CAP_SYS_ADMIN`
 8. **Rootfs must be pre-built** — No image pull or layer support; rootfs directory must exist before running
 9. **No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
-10. **No hostname isolation** — Container sees the host's hostname (addressed in Phase 4)
+10. ~~**No hostname isolation**~~ — **Fixed in Phase 4** via `CLONE_NEWUTS` and `--hostname`
 
 ---
 
@@ -545,7 +609,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] --rootfs flag
 - [x] Unit tests (requires root + rootfs)
 
-### ✅ Phase 3: OverlayFS & Security Corrections (Current)
+### ✅ Phase 3: OverlayFS & Security Corrections
 - [x] OverlayFS copy-on-write filesystem (read-only base image + writable upper layer)
 - [x] Per-container writable layers with automatic cleanup on exit
 - [x] `--overlay` and `--container-dir` CLI flags
@@ -556,15 +620,15 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] `--rootfs` auto-enables `--pid`
 - [x] Unit tests (requires root + rootfs)
 
-### 📋 Phase 4: UTS Namespace (Hostname Isolation)
-- [ ] CLONE_NEWUTS for hostname isolation
-- [ ] `--hostname` flag
-- [ ] Container gets its own hostname
+### ✅ Phase 4: UTS Namespace — Hostname Isolation (Current)
+- [x] `CLONE_NEWUTS` for hostname isolation
+- [x] `--hostname <name>` flag (auto-enables UTS namespace)
+- [x] `sethostname()` in child — host hostname unchanged
+- [x] Unit tests (requires root)
 
-### 📋 Phase 5: Network Isolation
-- [ ] CLONE_NEWNET for network namespace
-- [ ] veth pairs and bridges
-- [ ] Port forwarding
+### 📋 Phase 4b: User Namespace
+- [ ] `CLONE_NEWUSER` for unprivileged containers
+- [ ] UID/GID mapping
 
 ### 📋 Phase 5: Network Isolation
 - [ ] CLONE_NEWNET for network namespace
@@ -574,6 +638,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 ### 📋 Phase 6: CLI & Lifecycle
 - [ ] Container lifecycle management
 - [ ] Start/stop/exec commands
+- [ ] Refactor shared `*_exec()` boilerplate into common execution core
 
 ### 📋 Phase 7: Inspector Integration
 - [ ] OCI runtime spec compliance
@@ -588,7 +653,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 
 ```bash
 make              # Build minicontainer
-make test         # Build and run all tests (Phase 0 + 1 + 2 + 3)
+make test         # Build and run all tests (Phase 0 + 1 + 2 + 3 + 4)
 make clean        # Remove build artifacts
 make debug        # Build with debug symbols (-g)
 make valgrind     # Run memory leak detection
@@ -620,6 +685,8 @@ make help         # Show all available targets
 
 ### Man Pages (Essential Reading)
 ```bash
+man 2 sethostname     # Set hostname (Phase 4 — UTS namespace isolation)
+man 7 uts_namespaces  # UTS namespace details (Phase 4)
 man 2 mount           # Mount filesystem — see overlay type and MS_NODEV/MS_NOSUID
 man 2 umount2         # Unmount filesystem with flags (MNT_DETACH)
 man 2 getrlimit       # Get fd limit for close_inherited_fds fallback (Phase 3)
@@ -659,6 +726,16 @@ cat /proc/filesystems | grep overlay
 # If not listed, load the module
 sudo modprobe overlay
 ```
+
+---
+
+### "sethostname: Operation not permitted"
+
+**Problem:** `sethostname` fails because the child is not in a new UTS namespace.
+
+**Check:**
+1. Are you using `--hostname`? This flag auto-enables `CLONE_NEWUTS`
+2. Are you running with `sudo`? UTS namespace creation requires `CAP_SYS_ADMIN`
 
 ---
 
