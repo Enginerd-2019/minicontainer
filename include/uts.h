@@ -9,25 +9,37 @@
 /**
  * Configuration for container with UTS namespace support.
  * Supersedes overlay_config_t — includes all Phase 3 fields plus hostname.
+ * After phase 4b, it also includes fields that provide uid and gid mapping
+ * as well as a usernamspace enable flag
  */
 typedef struct {
+    // Base configuration (unchanged from Phase 4)
     const char *program;
     char *const *argv;
     char *const *envp;
     bool enable_debug;
 
-    // Namespace flags
+    // Namespace flags (enable_user_namespace is new)
     bool enable_pid_namespace;
     bool enable_mount_namespace;
     bool enable_uts_namespace;
+    bool enable_user_namespace;      // New in Phase 4b
 
-    // Filesystem
+    // Filesystem (unchanged)
     const char *rootfs_path;
     bool enable_overlay;
     const char *container_dir;
 
-    // UTS settings
-    const char *hostname;       // NULL = no hostname change
+    // UTS settings (unchanged)
+    const char *hostname;
+
+    // User namespace mapping (new in Phase 4b)
+    uid_t uid_map_inside;            // UID inside namespace (typically 0)
+    uid_t uid_map_outside;           // UID outside namespace (host UID)
+    size_t uid_map_range;            // Number of UIDs to map (typically 1)
+    gid_t gid_map_inside;            // GID inside namespace (typically 0)
+    gid_t gid_map_outside;           // GID outside namespace (host GID)
+    size_t gid_map_range;            // Number of GIDs to map (typically 1)
 } uts_config_t;
 
 /**
@@ -68,5 +80,15 @@ void uts_cleanup(uts_result_t *result);
  * @return             0 on success, -1 on failure
  */
 int setup_uts(const char *hostname, bool enable_debug);
+
+/**
+ * Setup UID/GID mapping for user namespace.
+ * Called by PARENT process after clone(), before signaling child.
+ *
+ * @param child_pid  PID of child process
+ * @param config     Configuration with mapping settings
+ * @return           0 on success, -1 on failure
+ */
+int setup_user_namespace_mapping(pid_t child_pid, const uts_config_t *config);
 
 #endif

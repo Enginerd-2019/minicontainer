@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 4 - UTS & User Namespace Isolation
-**Last Updated:** 2026-04-13
+**Phase:** 4b - User Namespace (Rootless Containers)
+**Last Updated:** 2026-04-15
 
 ---
 
@@ -403,6 +403,68 @@ int main() {
 - **Timing:** `setup_uts()` is called early in the child, before `setup_rootfs()`, so the hostname is set before the container's filesystem is configured
 
 **Alternative considered:** `unshare(CLONE_NEWUTS)` — rejected because `clone()` is already used for PID/mount namespaces, and adding another flag to the same call is simpler and creates all namespaces atomically.
+
+---
+
+### 18. Extending uts.c for User Namespace Instead of New Module (Phase 4b)
+
+**Decision:** Add `CLONE_NEWUSER`, sync pipe, and UID/GID mapping support directly to `uts.c` and `uts.h` rather than creating a new `user.c` module.
+
+**Rationale:**
+- **No new child-side logic:** Unlike UTS (which added `sethostname()`) or overlay (which added `setup_overlay()`/`teardown_overlay()`), user namespaces add no new function the child calls. The child just blocks on a pipe read — the real work is parent-side (`setup_user_namespace_mapping()`)
+- **Changes are to `uts_exec()`:** Add `CLONE_NEWUSER` flag, create pipe, write maps, signal child. These are additions to the existing orchestration function, not a new execution path
+- **Avoids compounding code smell:** Creating `user.c` would produce yet another near-identical `*_exec()` function (~90% duplicate), worsening the technical debt noted in Phase 4
+
+**What changed in uts.h:**
+- `uts_config_t` gains `enable_user_namespace` (bool) and 6 UID/GID mapping fields
+- New `setup_user_namespace_mapping()` function signature
+
+**What changed in uts.c:**
+- `child_args_t` gains `sync_fd` (pipe read end) and `user_namespace_active` (bool)
+- `child_func()` blocks on `read(sync_fd)` before doing privileged work
+- `uts_exec()` creates pipe, passes `CLONE_NEWUSER` to `clone()`, writes UID/GID maps via `/proc/<pid>/{setgroups,uid_map,gid_map}`, signals child
+- Error path closes pipe and kills child if mapping fails
+
+**What changed in main.c:**
+- Added `--user` flag and `enable_user_namespace` variable
+- Default mapping: container UID 0 → `getuid()`, container GID 0 → `getgid()`
+- Added `--user` to `known_flags[]` for misplaced-flag detection
+
+---
+
+### 19. Proc Mount Hardening with MS_NOSUID | MS_NODEV | MS_NOEXEC (Phase 4b)
+
+**Decision:** Mount `/proc` with `MS_NOSUID | MS_NODEV | MS_NOEXEC` flags instead of `0`.
+
+**Rationale:**
+- **User namespace requirement:** When mounting proc inside a user namespace, the kernel rejects mounts that are less restrictive than the existing proc mount. Most distributions mount `/proc` with `MS_NOSUID | MS_NODEV | MS_NOEXEC`. A proc mount with flags `0` (the Phase 2 default) is rejected with `EPERM`
+- **Good hardening regardless:** There is no legitimate reason to allow setuid binaries, device nodes, or direct execution from `/proc`. Docker, Podman, and runc all mount proc with these flags
+- **Backward compatible:** Adding restrictive flags to the mount call does not change behavior for privileged (non-`--user`) containers — it just makes them more secure by default
+
+**Change in mount.c:**
+```c
+// Before (Phase 2):
+mount("proc", "/proc", "proc", 0, NULL)
+
+// After (Phase 4b):
+mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL)
+```
+
+---
+
+### 20. Graceful /proc Degradation in User Namespace (Phase 4b)
+
+**Decision:** When running in a user namespace (`--user`), downgrade `/proc` mount failure to a warning instead of aborting the container.
+
+**Rationale:**
+- **Kernel/AppArmor restrictions:** Even with correct mount flags (Decision #19), the kernel or AppArmor (on Ubuntu 23.10+) may deny proc mounts from within unprivileged user namespaces. This is a platform restriction, not a minicontainer bug
+- **Most commands don't need /proc:** `ls`, `echo`, `hostname`, `id`, `sh` all function without a mounted `/proc`. Only `/proc`-dependent tools like `ps` are affected
+- **Existing fallback:** `close_inherited_fds()` (Phase 3 §3.5) already has a brute-force fallback that closes fds 3 through `RLIMIT_NOFILE` when `/proc/self/fd` is unavailable. This fallback activates automatically when proc is not mounted — there is no security gap
+- **Fatal without --user:** When running without `--user` (privileged mode), the proc mount failure remains fatal. In that context, a failed proc mount indicates a real configuration problem that should not be silently ignored
+
+**Implementation in uts.c:**
+- `child_args_t` gains `user_namespace_active` field, set from `config->enable_user_namespace`
+- `child_func()` checks `args->user_namespace_active` when `mount_proc()` fails: if true, prints warning and continues; if false, returns error (existing behavior)
 
 ---
 

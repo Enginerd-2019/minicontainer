@@ -8,6 +8,7 @@
 #include <sys/mount.h>
 #include <errno.h>
 #include <string.h>
+#include <fcntl.h>         // open(), O_WRONLY for /proc/<pid>/{uid_map,gid_map,setgroups}
 #include <dirent.h>        // opendir/readdir for fd cleanup (Phase 3 §3.5)
 #include <sys/resource.h>  // getrlimit for fd fallback range (Phase 3 §3.5)
 
@@ -16,14 +17,16 @@
 // Phase 3 correction carried forward: no extern char **environ.
 // Container environment is constructed by build_container_env() and
 // passed through config->envp → child_args.envp → execve().
-
+// hostname and and pipe syncronizer are also added in phase 4/4b
 typedef struct {
     const char *program;
     char *const *argv;
     char *const *envp;
     bool enable_debug;
-    const char *rootfs_path;  // merged/ (overlay) or raw rootfs
+    const char *rootfs_path;
     const char *hostname;
+    int sync_fd;                // New: read end of sync pipe (-1 if no user ns)
+    bool user_namespace_active; // True if CLONE_NEWUSER was used
 } child_args_t;
 
 /**
@@ -43,6 +46,83 @@ int setup_uts(const char *hostname, bool enable_debug) {
 
     return 0;
 }
+
+/**
+ * Setup UID/GID mapping for user namespace.
+ *
+ * Called from the PARENT process after clone(). Writes to
+ * /proc/<child_pid>/setgroups, uid_map, and gid_map.
+ */
+int setup_user_namespace_mapping(pid_t child_pid, const uts_config_t *config) {
+    char path[256];
+    char mapping[256];
+    int fd;
+
+    // Step 1: Disable setgroups (required before gid_map for unprivileged users)
+    snprintf(path, sizeof(path), "/proc/%d/setgroups", child_pid);
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        perror("open(setgroups)");
+        return -1;
+    }
+    if (write(fd, "deny", 4) < 0) {
+        perror("write(setgroups)");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (config->enable_debug) {
+        printf("[parent] Disabled setgroups for PID %d\n", child_pid);
+    }
+
+    // Step 2: Write UID map
+    snprintf(path, sizeof(path), "/proc/%d/uid_map", child_pid);
+    snprintf(mapping, sizeof(mapping), "%u %u %zu",
+             config->uid_map_inside, config->uid_map_outside,
+             config->uid_map_range);
+
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        perror("open(uid_map)");
+        return -1;
+    }
+    if (write(fd, mapping, strlen(mapping)) < 0) {
+        perror("write(uid_map)");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (config->enable_debug) {
+        printf("[parent] UID map: %s\n", mapping);
+    }
+
+    // Step 3: Write GID map
+    snprintf(path, sizeof(path), "/proc/%d/gid_map", child_pid);
+    snprintf(mapping, sizeof(mapping), "%u %u %zu",
+             config->gid_map_inside, config->gid_map_outside,
+             config->gid_map_range);
+
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        perror("open(gid_map)");
+        return -1;
+    }
+    if (write(fd, mapping, strlen(mapping)) < 0) {
+        perror("write(gid_map)");
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (config->enable_debug) {
+        printf("[parent] GID map: %s\n", mapping);
+    }
+
+    return 0;
+}
+
 
 /**
  * Close all file descriptors above STDERR_FILENO.
@@ -98,12 +178,37 @@ static void close_inherited_fds(bool enable_debug) {
 
 /**
  * Child function for containerized process.
+ *
+ * If a user namespace is active (sync_fd >= 0), the child blocks on the
+ * sync pipe until the parent has finished writing UID/GID maps.
  */
 static int child_func(void *arg) {
     child_args_t *args = (child_args_t *)arg;
 
+    // If user namespace is active, wait for parent to write UID/GID maps.
+    // The parent will write a single byte after maps are in place.
+    if (args->sync_fd >= 0) {
+        char buf;
+        if (args->enable_debug) {
+            printf("[child] Waiting for UID/GID mapping...\n");
+        }
+
+        ssize_t n = read(args->sync_fd, &buf, 1);
+        close(args->sync_fd);
+
+        if (n < 1) {
+            fprintf(stderr, "[child] Sync pipe read failed\n");
+            return 1;
+        }
+
+        if (args->enable_debug) {
+            printf("[child] UID/GID mapping complete, proceeding\n");
+        }
+    }
+
     if (args->enable_debug) {
-        printf("[child] PID: %d\n", getpid());
+        printf("[child] PID: %d, UID: %d, GID: %d\n",
+               getpid(), getuid(), getgid());
     }
 
     // Set hostname (must be in UTS namespace, before rootfs setup
@@ -124,10 +229,20 @@ static int child_func(void *arg) {
             return 1;
         }
 
-        // Mount /proc after pivot_root
+        // Mount /proc after pivot_root.
+        // In a user namespace, the kernel may deny proc mounts due to
+        // additional restrictions (AppArmor, locked superblock flags).
+        // Downgrade to a warning — the container can function without
+        // /proc, and close_inherited_fds() has a brute-force fallback.
         if (mount_proc(args->enable_debug) < 0) {
-            fprintf(stderr, "[child] Failed to mount /proc\n");
-            return 1;
+            if (args->user_namespace_active) {
+                fprintf(stderr,
+                    "[child] Warning: /proc mount denied (user namespace restriction) "
+                    "— continuing without /proc\n");
+            } else {
+                fprintf(stderr, "[child] Failed to mount /proc\n");
+                return 1;
+            }
         }
     }
 
@@ -151,6 +266,7 @@ uts_result_t uts_exec(const uts_config_t *config) {
     uts_result_t result = {0};
     overlay_context_t overlay_ctx = {0};
     bool overlay_active = false;
+    int sync_pipe[2] = {-1, -1};
 
     // Validate
     if (!config || !config->program || !config->argv) {
@@ -174,6 +290,16 @@ uts_result_t uts_exec(const uts_config_t *config) {
         }
     }
 
+    // Create sync pipe for user namespace (parent signals child after
+    // writing UID/GID maps)
+    if (config->enable_user_namespace) {
+        if (pipe(sync_pipe) < 0) {
+            perror("pipe");
+            result.child_pid = -1;
+            return result;
+        }
+    }
+
     // Determine the effective rootfs path
     const char *effective_rootfs = config->rootfs_path;
 
@@ -182,6 +308,7 @@ uts_result_t uts_exec(const uts_config_t *config) {
         if (setup_overlay(&overlay_ctx, config->rootfs_path,
                           config->container_dir, config->enable_debug) < 0) {
             fprintf(stderr, "[parent] Failed to setup overlay\n");
+            if (sync_pipe[0] >= 0) { close(sync_pipe[0]); close(sync_pipe[1]); }
             result.child_pid = -1;
             return result;
         }
@@ -200,6 +327,7 @@ uts_result_t uts_exec(const uts_config_t *config) {
         if (overlay_active) {
             teardown_overlay(&overlay_ctx, config->enable_debug);
         }
+        if (sync_pipe[0] >= 0) { close(sync_pipe[0]); close(sync_pipe[1]); }
         result.child_pid = -1;
         return result;
     }
@@ -212,11 +340,23 @@ uts_result_t uts_exec(const uts_config_t *config) {
         .envp = config->envp,
         .enable_debug = config->enable_debug,
         .rootfs_path = effective_rootfs,
-        .hostname = config->hostname
+        .hostname = config->hostname,
+        .sync_fd = sync_pipe[0],    // Child gets read end (-1 if no user ns)
+        .user_namespace_active = config->enable_user_namespace
     };
 
     // Build flags
     int flags = SIGCHLD;
+    if (config->enable_user_namespace) {
+        // CLONE_NEWUSER must be included in the same clone() call.
+        // The kernel creates the user namespace first, then uses its
+        // capabilities to create other namespaces.
+        flags |= CLONE_NEWUSER;
+
+        if (config->enable_debug) {
+            printf("[parent] Creating user namespace\n");
+        }
+    }
     if (config->enable_pid_namespace) {
         flags |= CLONE_NEWPID;
     }
@@ -245,6 +385,7 @@ uts_result_t uts_exec(const uts_config_t *config) {
         if (overlay_active) {
             teardown_overlay(&overlay_ctx, config->enable_debug);
         }
+        if (sync_pipe[0] >= 0) { close(sync_pipe[0]); close(sync_pipe[1]); }
         result.child_pid = -1;
         result.stack_ptr = NULL;
         return result;
@@ -254,6 +395,41 @@ uts_result_t uts_exec(const uts_config_t *config) {
 
     if (config->enable_debug) {
         printf("[parent] Child PID: %d\n", pid);
+    }
+
+    // Close read end in parent (child owns it now)
+    if (sync_pipe[0] >= 0) {
+        close(sync_pipe[0]);
+        sync_pipe[0] = -1;
+    }
+
+    // Setup user namespace mapping and signal child
+    if (config->enable_user_namespace) {
+        if (setup_user_namespace_mapping(pid, config) < 0) {
+            fprintf(stderr, "[parent] Failed to setup user namespace mapping\n");
+            // Signal child to exit (close pipe without writing)
+            close(sync_pipe[1]);
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            free(stack);
+            if (overlay_active) {
+                teardown_overlay(&overlay_ctx, config->enable_debug);
+            }
+            result.child_pid = -1;
+            result.stack_ptr = NULL;
+            return result;
+        }
+
+        // Signal child: mappings are ready, you can proceed
+        if (write(sync_pipe[1], "1", 1) < 0) {
+            perror("write(sync_pipe)");
+        }
+        close(sync_pipe[1]);
+        sync_pipe[1] = -1;
+
+        if (config->enable_debug) {
+            printf("[parent] Signaled child to proceed\n");
+        }
     }
 
     // Wait for child

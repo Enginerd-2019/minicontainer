@@ -11,7 +11,6 @@
 
 /**
  * Build container environment (Phase 3 correction, carried forward).
- * See Phase 3 §3.4 for motivation.
  */
 static char **build_container_env(char *const *custom_env, bool enable_debug) {
     char *defaults[] = {
@@ -89,6 +88,7 @@ static void usage(const char *progname) {
     fprintf(stderr, "  --overlay            Enable copy-on-write overlay\n");
     fprintf(stderr, "  --container-dir <p>  Directory for overlay data (default: ./containers)\n");
     fprintf(stderr, "  --hostname <name>  Set container hostname\n");
+    fprintf(stderr, "  --user             Enable user namespace (run without sudo)\n");
     fprintf(stderr, "  --env KEY=VALUE      Set environment variable (repeatable)\n");
     fprintf(stderr, "  --help               Show this help\n");
     fprintf(stderr, "\nExamples:\n");
@@ -102,9 +102,10 @@ int main(int argc, char *argv[]) {
     bool enable_debug = false;
     bool enable_pid_namespace = false;
     bool enable_overlay = false;
+    bool enable_user_namespace = false;
     char *rootfs_path = NULL;
     char *container_dir = NULL;
-    char *hostname = NULL; // New in phase 4
+    char *hostname = NULL;
 
     // Phase 3 correction §3.4: collect --env flags for build_container_env()
     char *custom_env[MAX_ENV_ENTRIES];
@@ -118,13 +119,14 @@ int main(int argc, char *argv[]) {
         {"overlay",       no_argument,       NULL, 'o'},
         {"container-dir", required_argument, NULL, 'c'},
         {"hostname",      required_argument, NULL, 'H'},
+        {"user",          no_argument,       NULL, 'u'},
         {"env",           required_argument, NULL, 'e'},
         {"help",          no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "+dpr:oc:e:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:ue:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'd':
                 enable_debug = true;
@@ -143,6 +145,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 'H':
                 hostname = optarg;
+                break;
+            case 'u':
+                enable_user_namespace = true;
                 break;
             case 'e':
                 if (env_count >= MAX_ENV_ENTRIES - 1) {
@@ -185,7 +190,8 @@ int main(int argc, char *argv[]) {
         // Keep known_flags in sync with long_options[].
         static const char *known_flags[] = {
             "--debug", "--pid", "--rootfs", "--overlay",
-            "--container-dir",  "--hostname", "--env", "--help", NULL
+            "--container-dir", "--hostname", "--user",
+            "--env", "--help", NULL
         };
 
         for (int i = optind + 1; i < argc; i++) {
@@ -204,7 +210,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Phase 3 correction §3.4: build container environment
+    // Build container environment (Phase 3 correction)
     char **container_env = build_container_env(
         env_count > 0 ? custom_env : NULL,
         enable_debug
@@ -222,10 +228,18 @@ int main(int argc, char *argv[]) {
         .enable_pid_namespace = enable_pid_namespace || (rootfs_path != NULL),
         .enable_mount_namespace = (rootfs_path != NULL),
         .enable_uts_namespace = (hostname != NULL),
+        .enable_user_namespace = enable_user_namespace,
         .rootfs_path = rootfs_path,
         .enable_overlay = enable_overlay,
         .container_dir = container_dir,
-        .hostname = hostname
+        .hostname = hostname,
+        // Default user mapping: container root → current host user
+        .uid_map_inside = 0,
+        .uid_map_outside = getuid(),
+        .uid_map_range = 1,
+        .gid_map_inside = 0,
+        .gid_map_outside = getgid(),
+        .gid_map_range = 1
     };
 
     // Execute
@@ -233,9 +247,8 @@ int main(int argc, char *argv[]) {
 
     // Cleanup
     uts_cleanup(&result);
-    free(container_env);  // Free the pointer array (not the strings)
+    free(container_env);
 
-    // Handle result
     if (result.child_pid < 0) {
         fprintf(stderr, "Failed to spawn process\n");
         return 1;

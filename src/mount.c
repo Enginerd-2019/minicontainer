@@ -122,7 +122,10 @@ int mount_proc(bool enable_debug){
         return 0;
     }
 
-    if(mount("proc", "/proc", "proc", 0 , NULL) < 0){
+    // MS_NOSUID | MS_NODEV | MS_NOEXEC: required for user namespace
+    // (kernel rejects proc mounts less restrictive than the existing one)
+    // and good hardening defaults regardless.
+    if(mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0){
         perror("mount(proc)");
         return -1;
     }

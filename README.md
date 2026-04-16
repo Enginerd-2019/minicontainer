@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-4%20UTS%20Namespace-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-4b%20User%20Namespace-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,15 +12,23 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current Phase:** Phase 4 - UTS Namespace (Hostname Isolation)
+**Current Phase:** Phase 4b - User Namespace (Rootless Containers)
 
-Building on Phase 3's OverlayFS and security corrections, this phase adds **UTS namespace isolation** so each container gets its own hostname via `CLONE_NEWUTS` and `sethostname()`. The host's hostname is never affected — each container's identity is fully scoped to its namespace.
+Building on Phase 4's UTS namespace isolation, this phase adds **user namespace support** via `CLONE_NEWUSER` so containers can run without `sudo`. The child process appears as root inside the namespace while remaining an unprivileged user on the host. UID/GID mappings are written by the parent via a synchronization pipe before the child proceeds.
 
 ---
 
 ## Features
 
-### Phase 4 (Current)
+### Phase 4b (Current)
+
+- ✅ **User Namespace Isolation** - `CLONE_NEWUSER` enables rootless containers (`--user`)
+- ✅ **UID/GID Mapping** - Container root (UID 0) maps to host user (e.g., UID 1000)
+- ✅ **Sync Pipe** - Parent-child coordination ensures UID/GID maps are written before child proceeds
+- ✅ **Graceful /proc Degradation** - `/proc` mount failure in user namespace downgrades to warning
+- ✅ **Proc Mount Hardening** - `/proc` mounted with `MS_NOSUID | MS_NODEV | MS_NOEXEC`
+
+### Phase 4
 
 - ✅ **UTS Namespace Isolation** - Container gets its own hostname via `CLONE_NEWUTS`
 - ✅ **`--hostname <name>`** - Set a custom hostname; auto-enables UTS namespace
@@ -79,6 +87,12 @@ This compiles the `minicontainer` executable in the current directory.
 # Basic usage (no namespace)
 ./minicontainer /bin/ls -la
 
+# Rootless container (no sudo — user namespace maps UID 0 to host user)
+./minicontainer --user --pid --hostname mycontainer /bin/sh -c 'id && hostname'
+
+# Rootless with rootfs (proc mount may warn — see Troubleshooting)
+./minicontainer --user --pid --rootfs ./rootfs --hostname web /bin/sh
+
 # Hostname isolation (container gets its own hostname)
 sudo ./minicontainer --rootfs ./rootfs --hostname mycontainer /bin/sh -c 'hostname'
 
@@ -110,13 +124,16 @@ sudo ./minicontainer --debug --rootfs ./rootfs --overlay /bin/sh -c 'echo $$'
 ```
 
 **Flag relationships:** `--rootfs` implies `--pid` (in `main.c`'s config setup),
-but `--hostname` does not imply `--overlay` and vice versa — they are
-independent isolation features. For full isolation, combine them explicitly.
+`--hostname` auto-enables `CLONE_NEWUTS`, and `--user` auto-enables
+`CLONE_NEWUSER`. These flags are otherwise independent — `--hostname` does not
+imply `--overlay` and vice versa. For full isolation, combine them explicitly.
 Note that this auto-enable behavior is a `main.c` design choice; the underlying
-library functions (`uts_exec`, `overlay_exec`, etc.) accept each flag
-independently, allowing other entry points to compose isolation differently.
+library functions accept each flag independently, allowing other entry points
+to compose isolation differently.
 
-**Note:** Namespace features require root or `CAP_SYS_ADMIN`:
+**Note:** Without `--user`, namespace features require root or `CAP_SYS_ADMIN`.
+With `--user`, `CLONE_NEWUSER` grants capabilities inside the namespace without
+host privileges:
 ```bash
 # Option 1: Run with sudo
 sudo ./minicontainer --pid --rootfs ./rootfs /bin/sh
@@ -146,14 +163,14 @@ make valgrind
 ```
 minicontainer/
 ├── include/
-│   ├── uts.h                # Phase 4: UTS namespace & hostname isolation API
+│   ├── uts.h                # Phase 4/4b: UTS + user namespace API
 │   ├── overlay.h            # Phase 3: OverlayFS, environment, fd cleanup API
 │   ├── mount.h              # Phase 2: Mount namespace & rootfs API
 │   ├── namespace.h          # Phase 1: PID namespace isolation API
 │   └── spawn.h              # Phase 0: Process spawning API
 ├── src/
 │   ├── main.c               # CLI entry point and argument parsing
-│   ├── uts.c                # Phase 4: UTS namespace, clone/exec (calls overlay.c, mount.c)
+│   ├── uts.c                # Phase 4/4b: UTS + user namespace, sync pipe, clone/exec
 │   ├── overlay.c            # Phase 3: OverlayFS, close_inherited_fds
 │   ├── mount.c              # Phase 2: setup_rootfs, mount_proc
 │   ├── namespace.c          # Phase 1: clone() + PID namespace logic
@@ -180,30 +197,32 @@ minicontainer/
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                main.c (CLI Layer)                     │
-│  • Parses --pid, --rootfs, --overlay, --hostname, etc │
-│  • build_container_env() — clean environment          │
-│  • Misplaced flag detection                           │
-│  • Calls uts_exec()                                   │
+│                main.c (CLI Layer)                    │
+│  • Parses --pid, --rootfs, --overlay, --hostname, etc│
+│  • build_container_env() — clean environment         │
+│  • Misplaced flag detection                          │
+│  • Calls uts_exec()                                  │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
 ┌──────────────────────────────────────────────────────┐
-│           uts.c (Orchestration Layer)                 │
+│           uts.c (Orchestration Layer)                │
 │  • setup_overlay() → mount OverlayFS (from overlay.c)│
-│  • clone() with NEWPID | NEWNS | NEWUTS              │
+│  • clone() with NEWPID | NEWNS | NEWUTS | NEWUSER    │
+│  • Sync pipe: write UID/GID maps, signal child       │
 │  • waitpid() and exit status parsing                 │
 │  • teardown_overlay() → unmount and cleanup          │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
 ┌──────────────────────────────────────────────────────┐
-│            Child Process (child_func)                 │
-│  • setup_uts(): sethostname() in new UTS namespace    │
-│  • setup_rootfs(): pivot_root to new rootfs           │
-│  • mount_proc(): mount /proc for PID namespace        │
-│  • close_inherited_fds(): close leaked parent fds     │
-│  • execve() with clean container environment          │
+│            Child Process (child_func)                │
+│  • Wait on sync pipe (if --user) for UID/GID maps    │
+│  • setup_uts(): sethostname() in new UTS namespace   │
+│  • setup_rootfs(): pivot_root to new rootfs          │
+│  • mount_proc(): mount /proc (warning if user ns)    │
+│  • close_inherited_fds(): close leaked parent fds    │
+│  • execve() with clean container environment         │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -213,6 +232,7 @@ minicontainer/
 - Phase 2: `mount.c` (`clone(CLONE_NEWPID | CLONE_NEWNS)` + `pivot_root`)
 - Phase 3: `overlay.c` (OverlayFS + env isolation + fd cleanup), calls into `mount.c` for `setup_rootfs`/`mount_proc`
 - Phase 4: `uts.c` (`CLONE_NEWUTS` + `sethostname`), calls into `overlay.c` and `mount.c`
+- Phase 4b: `uts.c` extended with `CLONE_NEWUSER`, sync pipe, UID/GID mapping (no new module — see code duplication note)
 - Earlier modules retained for their respective phase tests
 
 **Note on code duplication:** Each phase's `*_exec()` function (e.g., `overlay_exec`, `uts_exec`) shares ~90% of its structure with the previous phase — `clone()`, `waitpid()`, stack allocation, and exit status parsing are repeated each time. This is a deliberate pedagogical choice: each module is self-contained and readable without cross-referencing earlier phases. A production runtime would factor this into a shared execution core, and this refactoring is planned for Phase 7.
@@ -232,7 +252,14 @@ uts_config_t config = {
     .enable_overlay = true,           // Use OverlayFS on top of rootfs
     .container_dir = NULL,            // NULL = default "./containers"
     .enable_uts_namespace = true,     // Use CLONE_NEWUTS
-    .hostname = "mycontainer"         // NULL = no hostname change
+    .hostname = "mycontainer",        // NULL = no hostname change
+    .enable_user_namespace = true,    // Use CLONE_NEWUSER (rootless)
+    .uid_map_inside = 0,              // Container root...
+    .uid_map_outside = getuid(),      // ...maps to host user
+    .uid_map_range = 1,
+    .gid_map_inside = 0,
+    .gid_map_outside = getgid(),
+    .gid_map_range = 1
 };
 ```
 
@@ -263,10 +290,10 @@ rootfs/ (lowerdir — read-only)         containers/<id>/upper/ (writable)
 └── tmp/
          ↓                                      ↓
     ┌─────────────────────────────────────────────────┐
-    │        containers/<id>/merged/ (unified view)    │
-    │  Container sees: rootfs + writes merged together │
-    │  Reads: lowerdir first, then upperdir            │
-    │  Writes: always go to upperdir                   │
+    │        containers/<id>/merged/ (unified view)   │
+    │  Container sees: rootfs + writes merged together│
+    │  Reads: lowerdir first, then upperdir           │
+    │  Writes: always go to upperdir                  │
     └─────────────────────────────────────────────────┘
 
 On container exit: upper/, work/, merged/ are removed.
@@ -333,6 +360,8 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 
 | System Call | Purpose | Phase |
 |-------------|---------|-------|
+| `pipe()` | Creates sync pipe for parent-child UID/GID map coordination | 4b |
+| `open()`/`write()` | Writes `/proc/<pid>/setgroups`, `uid_map`, `gid_map` | 4b |
 | `sethostname()` | Sets container hostname inside UTS namespace | 4 |
 | `mount("overlay")` | Mounts OverlayFS with `MS_NODEV \| MS_NOSUID` | 3 |
 | `close()` | Closes inherited parent fds before `execve()` | 3 |
@@ -340,10 +369,10 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 | `pivot_root()` | Swaps root filesystem for the container | 2 |
 | `mount()` | Bind mounts rootfs, sets propagation, mounts `/proc` | 2 |
 | `umount2()` | Lazily unmounts old root and overlay (`MNT_DETACH`) | 2, 3 |
-| `clone()` | Creates child with namespace flags (`NEWPID`, `NEWNS`, `NEWUTS`) | 1–4 |
+| `clone()` | Creates child with namespace flags (`NEWPID`, `NEWNS`, `NEWUTS`, `NEWUSER`) | 1–4b |
 | `fork()` | Creates a new process (duplicate of parent) | 0 |
-| `execve()` | Replaces process image with new program | 0–4 |
-| `waitpid()` | Waits for child to exit and reaps zombie | 0–4 |
+| `execve()` | Replaces process image with new program | 0–4b |
+| `waitpid()` | Waits for child to exit and reaps zombie | 0–4b |
 | `sigaction()` | Installs SIGCHLD handler to prevent zombies | 0 |
 
 ---
@@ -557,6 +586,8 @@ Following shell/POSIX conventions:
 ## Design Decisions
 
 See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
+- User namespace support and why Phase 4b extends uts.c instead of creating a new module
+- Proc mount hardening (`MS_NOSUID | MS_NODEV | MS_NOEXEC`) and graceful degradation in user namespaces
 - Phase 3 → Phase 4 architecture transition (overlay → uts API)
 - UTS namespace isolation and why sethostname() must run in the child
 - OverlayFS layer management (split setup_overlay into init/create/mount)
@@ -579,7 +610,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 4. ~~**No copy-on-write filesystem**~~ — **Fixed in Phase 3** via OverlayFS
 5. ~~**No mount hardening**~~ — **Fixed in Phase 3** via `MS_NODEV | MS_NOSUID`
 6. **Single command** — Runs one command then exits (no daemon mode)
-7. **Requires root for namespaces** — `CLONE_NEWPID`/`CLONE_NEWNS`/`CLONE_NEWUTS`/overlay need `CAP_SYS_ADMIN`
+7. ~~**Requires root for namespaces**~~ — **Mitigated in Phase 4b** via `CLONE_NEWUSER` and `--user` flag (rootless containers). `/proc` mount may be restricted by AppArmor in user namespace mode
 8. **Rootfs must be pre-built** — No image pull or layer support; rootfs directory must exist before running
 9. **No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
 10. ~~**No hostname isolation**~~ — **Fixed in Phase 4** via `CLONE_NEWUTS` and `--hostname`
@@ -620,15 +651,21 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] `--rootfs` auto-enables `--pid`
 - [x] Unit tests (requires root + rootfs)
 
-### ✅ Phase 4: UTS Namespace — Hostname Isolation (Current)
+### ✅ Phase 4: UTS Namespace — Hostname Isolation
 - [x] `CLONE_NEWUTS` for hostname isolation
 - [x] `--hostname <name>` flag (auto-enables UTS namespace)
 - [x] `sethostname()` in child — host hostname unchanged
 - [x] Unit tests (requires root)
 
-### 📋 Phase 4b: User Namespace
-- [ ] `CLONE_NEWUSER` for unprivileged containers
-- [ ] UID/GID mapping
+### ✅ Phase 4b: User Namespace — Rootless Containers (Current)
+- [x] `CLONE_NEWUSER` for unprivileged containers
+- [x] UID/GID mapping via `/proc/<pid>/uid_map` and `gid_map`
+- [x] Parent-child synchronization pipe
+- [x] `setgroups deny` security requirement
+- [x] `--user` CLI flag (maps container root to host user)
+- [x] Proc mount hardening (`MS_NOSUID | MS_NODEV | MS_NOEXEC`)
+- [x] Graceful `/proc` mount degradation in user namespace
+- [x] `close_inherited_fds()` brute-force fallback when `/proc` unavailable
 
 ### 📋 Phase 5: Network Isolation
 - [ ] CLONE_NEWNET for network namespace
@@ -685,6 +722,7 @@ make help         # Show all available targets
 
 ### Man Pages (Essential Reading)
 ```bash
+man 7 user_namespaces # User namespace details — UID/GID mapping (Phase 4b)
 man 2 sethostname     # Set hostname (Phase 4 — UTS namespace isolation)
 man 7 uts_namespaces  # UTS namespace details (Phase 4)
 man 2 mount           # Mount filesystem — see overlay type and MS_NODEV/MS_NOSUID
@@ -726,6 +764,21 @@ cat /proc/filesystems | grep overlay
 # If not listed, load the module
 sudo modprobe overlay
 ```
+
+---
+
+### "/proc mount denied (user namespace restriction)"
+
+**Problem:** When using `--user --rootfs`, you see:
+```
+[child] Warning: /proc mount denied (user namespace restriction) — continuing without /proc
+```
+
+**This is expected.** The kernel (or AppArmor on Ubuntu) restricts proc mounts
+from within unprivileged user namespaces. The container continues without
+`/proc` — most commands work fine. Commands that read `/proc` (like `ps`) will
+not work. The `close_inherited_fds()` function falls back to brute-force fd
+closing (3 through `RLIMIT_NOFILE`) when `/proc/self/fd` is unavailable.
 
 ---
 
