@@ -1,6 +1,6 @@
 #include "uts.h"
-#include "overlay.h"  // setup_overlay(), teardown_overlay()
-#include "mount.h"    // setup_rootfs(), mount_proc()
+#include "overlay.h"  
+#include "mount.h"    
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -370,6 +370,15 @@ uts_result_t uts_exec(const uts_config_t *config) {
             printf("[parent] Creating UTS namespace\n");
         }
     }
+    // ---- Phase 4c addition: IPC namespace ----
+    if (config->enable_ipc_namespace) {
+        flags |= CLONE_NEWIPC;
+
+        if (config->enable_debug) {
+            printf("[parent] Creating IPC namespace\n");
+        }
+    }
+    // ---- End Phase 4c addition ----
 
     // Note: Phase 3 included a DEBUG TEST block here that opened simulated
     // leaked fds to verify close_inherited_fds(). That block has been removed

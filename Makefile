@@ -1,5 +1,5 @@
 # Makefile for minicontainer - Minimal Container Runtime
-# Phase 4: UTS & User Namespace Isolation
+# Phase 4c: IPC Namespace (builds on Phase 4b User Namespace, Phase 4 UTS)
 
 CC       = gcc
 CFLAGS   = -Wall -Wextra -std=c11 -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
@@ -69,7 +69,7 @@ $(TEST_OVERLAY): $(BUILD_DIR)/test_overlay.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_OVERLAY) successfully!"
 
-# Link test_uts (Phase 4)
+# Link test_uts (Phase 4: UTS hostname, Phase 4b: user namespace, Phase 4c: IPC)
 $(TEST_UTS): $(BUILD_DIR)/test_uts.o $(BUILD_DIR)/uts.o \
              $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
@@ -90,8 +90,13 @@ test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS)
 	@echo "=== Running Phase 3 overlay tests (requires root + rootfs) ==="
 	sudo ./$(TEST_OVERLAY)
 	@echo ""
-	@echo "=== Running Phase 4 UTS namespace tests (requires root + rootfs) ==="
+	@echo "=== Running Phase 4 UTS tests (hostname isolation, requires root) ==="
 	sudo ./$(TEST_UTS)
+	@echo ""
+	@echo "=== Running Phase 4b tests (user namespace, runs unprivileged subset too) ==="
+	./$(TEST_UTS)
+	@echo ""
+	@echo "=== Phase 4c IPC namespace tests are included in the test_uts suite above ==="
 
 # Build with debug symbols
 .PHONY: debug
@@ -144,15 +149,24 @@ examples: $(MINICONTAINER)
 	@echo ""
 	@echo "=== Example 10: Full isolation with hostname ==="
 	sudo ./$(MINICONTAINER) --pid --rootfs ./rootfs --overlay --hostname mycontainer /bin/sh -c 'hostname && echo PID: $$$$'
+	@echo ""
+	@echo "=== Example 11: Rootless container — no sudo (Phase 4b) ==="
+	./$(MINICONTAINER) --user --pid --hostname mycontainer /bin/sh -c 'id && hostname'
+	@echo ""
+	@echo "=== Example 12: IPC namespace isolation (Phase 4c, requires root) ==="
+	sudo ./$(MINICONTAINER) --pid --ipc /bin/sh -c 'ipcs'
+	@echo ""
+	@echo "=== Example 13: Rootless with IPC isolation (Phase 4b + 4c) ==="
+	./$(MINICONTAINER) --user --pid --ipc --hostname test /bin/sh -c 'ipcs; id'
 
 # Help target
 .PHONY: help
 help:
-	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 4)"
+	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 4c)"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  all        - Build minicontainer (default)"
-	@echo "  test       - Build and run all tests (Phase 0 + 1 + 2 + 3 + 4)"
+	@echo "  test       - Build and run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c)"
 	@echo "  debug      - Build with debug symbols (-g)"
 	@echo "  valgrind   - Run with valgrind memory checker"
 	@echo "  examples   - Run example commands"
@@ -166,6 +180,9 @@ help:
 	@echo "  sudo ./minicontainer --pid --rootfs ./rootfs /bin/sh"
 	@echo "  sudo ./minicontainer --rootfs ./rootfs --overlay /bin/sh"
 	@echo "  sudo ./minicontainer --pid --rootfs ./rootfs --hostname mycontainer /bin/sh"
+	@echo "  ./minicontainer --user --pid --hostname test /bin/sh                # Rootless"
+	@echo "  sudo ./minicontainer --pid --ipc /bin/sh -c 'ipcs'                  # IPC isolated"
+	@echo "  ./minicontainer --user --pid --ipc --hostname test /bin/sh          # Rootless + IPC"
 
 # Include auto-generated header dependencies
 -include $(DEPS)

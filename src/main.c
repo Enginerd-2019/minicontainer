@@ -87,15 +87,17 @@ static void usage(const char *progname) {
     fprintf(stderr, "  --rootfs <path>      Path to root filesystem\n");
     fprintf(stderr, "  --overlay            Enable copy-on-write overlay\n");
     fprintf(stderr, "  --container-dir <p>  Directory for overlay data (default: ./containers)\n");
-    fprintf(stderr, "  --hostname <name>  Set container hostname\n");
-    fprintf(stderr, "  --user             Enable user namespace (run without sudo)\n");
+    fprintf(stderr, "  --hostname <name>    Set container hostname\n");
+    fprintf(stderr, "  --user               Enable user namespace (run without sudo)\n");
+    fprintf(stderr, "  --ipc                Enable IPC namespace\n");
     fprintf(stderr, "  --env KEY=VALUE      Set environment variable (repeatable)\n");
     fprintf(stderr, "  --help               Show this help\n");
     fprintf(stderr, "\nExamples:\n");
-    fprintf(stderr, "  %s --pid --rootfs ./rootfs /bin/sh\n", progname);
-    fprintf(stderr, "  %s --pid --rootfs ./rootfs --overlay /bin/sh\n", progname);
-    fprintf(stderr, "  %s --pid --rootfs ./rootfs --env PATH=/custom --env FOO=bar /bin/sh\n", progname);
-    fprintf(stderr, "  sudo %s --pid --rootfs ./rootfs --hostname web /bin/sh\n", progname); // New in phase 4
+    fprintf(stderr, "  %s --rootfs ./rootfs /bin/sh\n", progname);
+    fprintf(stderr, "  %s --rootfs ./rootfs --overlay /bin/sh\n", progname);
+    fprintf(stderr, "  %s --rootfs ./rootfs --env PATH=/custom --env FOO=bar /bin/sh\n", progname);
+    fprintf(stderr, "  sudo %s --rootfs ./rootfs --hostname web /bin/sh\n", progname); // New in phase 4
+    fprintf(stderr, "  %s --user --pid --ipc --hostname test /bin/sh  # No sudo needed\n", progname);
 }
 
 int main(int argc, char *argv[]) {
@@ -103,6 +105,7 @@ int main(int argc, char *argv[]) {
     bool enable_pid_namespace = false;
     bool enable_overlay = false;
     bool enable_user_namespace = false;
+    bool enable_ipc_namespace = false;
     char *rootfs_path = NULL;
     char *container_dir = NULL;
     char *hostname = NULL;
@@ -120,13 +123,14 @@ int main(int argc, char *argv[]) {
         {"container-dir", required_argument, NULL, 'c'},
         {"hostname",      required_argument, NULL, 'H'},
         {"user",          no_argument,       NULL, 'u'},
+        {"ipc",           no_argument,       NULL, 'I'},
         {"env",           required_argument, NULL, 'e'},
         {"help",          no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:ue:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:uIe:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'd':
                 enable_debug = true;
@@ -148,6 +152,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 'u':
                 enable_user_namespace = true;
+                break;
+            case 'I':
+                enable_ipc_namespace = true;
                 break;
             case 'e':
                 if (env_count >= MAX_ENV_ENTRIES - 1) {
@@ -187,11 +194,12 @@ int main(int argc, char *argv[]) {
     }
 
     if (!explicit_separator) {
-        // Keep known_flags in sync with long_options[].
+        // Keep in sync with long_options[].
+        // Phase 4c: added "--ipc"
         static const char *known_flags[] = {
             "--debug", "--pid", "--rootfs", "--overlay",
             "--container-dir", "--hostname", "--user",
-            "--env", "--help", NULL
+            "--ipc", "--env", "--help", NULL
         };
 
         for (int i = optind + 1; i < argc; i++) {
@@ -229,6 +237,7 @@ int main(int argc, char *argv[]) {
         .enable_mount_namespace = (rootfs_path != NULL),
         .enable_uts_namespace = (hostname != NULL),
         .enable_user_namespace = enable_user_namespace,
+        .enable_ipc_namespace = enable_ipc_namespace,
         .rootfs_path = rootfs_path,
         .enable_overlay = enable_overlay,
         .container_dir = container_dir,

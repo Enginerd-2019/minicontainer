@@ -75,15 +75,187 @@ void test_no_uts_backward_compat() {
     printf("PASS: test_no_uts_backward_compat\n");
 }
 
+void test_user_namespace_unprivileged() {
+    char **env = build_container_env(NULL, false);
+    char *argv[] = {"/bin/sh", "-c", "id -u", NULL};
+    uts_config_t config = {
+        .program = "/bin/sh",
+        .argv = argv,
+        .envp = env,
+        .enable_debug = false,
+        .enable_pid_namespace = false,
+        .enable_mount_namespace = false,
+        .enable_uts_namespace = false,
+        .enable_user_namespace = true,
+        .rootfs_path = NULL,
+        .enable_overlay = false,
+        .container_dir = NULL,
+        .hostname = NULL,
+        .uid_map_inside = 0,
+        .uid_map_outside = getuid(),
+        .uid_map_range = 1,
+        .gid_map_inside = 0,
+        .gid_map_outside = getgid(),
+        .gid_map_range = 1
+    };
+
+    uts_result_t result = uts_exec(&config);
+    uts_cleanup(&result);
+    free(env);
+
+    assert(result.exited_normally);
+    assert(result.exit_status == 0);
+    printf("PASS: test_user_namespace_unprivileged\n");
+}
+
+void test_user_namespace_with_hostname() {
+    char **env = build_container_env(NULL, false);
+    char *argv[] = {"/bin/sh", "-c", "hostname && id -u", NULL};
+    uts_config_t config = {
+        .program = "/bin/sh",
+        .argv = argv,
+        .envp = env,
+        .enable_debug = false,
+        .enable_pid_namespace = true,
+        .enable_mount_namespace = false,
+        .enable_uts_namespace = true,
+        .enable_user_namespace = true,
+        .rootfs_path = NULL,
+        .enable_overlay = false,
+        .container_dir = NULL,
+        .hostname = "rootless-container",
+        .uid_map_inside = 0,
+        .uid_map_outside = getuid(),
+        .uid_map_range = 1,
+        .gid_map_inside = 0,
+        .gid_map_outside = getgid(),
+        .gid_map_range = 1
+    };
+
+    uts_result_t result = uts_exec(&config);
+    uts_cleanup(&result);
+    free(env);
+
+    assert(result.exited_normally);
+    assert(result.exit_status == 0);
+    printf("PASS: test_user_namespace_with_hostname\n");
+}
+
+void test_ipc_isolation() {
+    char **env = build_container_env(NULL, false);
+    // ipcs exits 0 regardless of whether objects exist.
+    // The key verification is that we can create the namespace without error.
+    char *argv[] = {"/bin/sh", "-c", "ipcs", NULL};
+    uts_config_t config = {
+        .program = "/bin/sh",
+        .argv = argv,
+        .envp = env,
+        .enable_debug = false,
+        .enable_pid_namespace = true,
+        .enable_mount_namespace = false,
+        .enable_uts_namespace = false,
+        .enable_user_namespace = false,
+        .enable_ipc_namespace = true,       // New
+        .rootfs_path = NULL,
+        .enable_overlay = false,
+        .hostname = NULL
+    };
+
+    uts_result_t result = uts_exec(&config);
+    uts_cleanup(&result);
+    free(env);
+
+    assert(result.exited_normally);
+    assert(result.exit_status == 0);
+    printf("PASS: test_ipc_isolation\n");
+}
+
+void test_ipc_with_user_namespace() {
+    char **env = build_container_env(NULL, false);
+    char *argv[] = {"/bin/sh", "-c", "ipcs && id -u", NULL};
+    uts_config_t config = {
+        .program = "/bin/sh",
+        .argv = argv,
+        .envp = env,
+        .enable_debug = false,
+        .enable_pid_namespace = true,
+        .enable_mount_namespace = false,
+        .enable_uts_namespace = false,
+        .enable_user_namespace = true,
+        .enable_ipc_namespace = true,
+        .rootfs_path = NULL,
+        .enable_overlay = false,
+        .hostname = NULL,
+        .uid_map_inside = 0,
+        .uid_map_outside = getuid(),
+        .uid_map_range = 1,
+        .gid_map_inside = 0,
+        .gid_map_outside = getgid(),
+        .gid_map_range = 1
+    };
+
+    uts_result_t result = uts_exec(&config);
+    uts_cleanup(&result);
+    free(env);
+
+    assert(result.exited_normally);
+    assert(result.exit_status == 0);
+    printf("PASS: test_ipc_with_user_namespace\n");
+}
+
+void test_no_ipc_backward_compat() {
+    // Verifies that removing --ipc doesn't break the rootless path.
+    // Uses CLONE_NEWUSER so it runs without sudo; the key assertion is
+    // that the container still executes when enable_ipc_namespace=false.
+    char **env = build_container_env(NULL, false);
+    char *argv[] = {"/bin/sh", "-c", "ipcs", NULL};
+    uts_config_t config = {
+        .program = "/bin/sh",
+        .argv = argv,
+        .envp = env,
+        .enable_debug = false,
+        .enable_pid_namespace = true,
+        .enable_mount_namespace = false,
+        .enable_uts_namespace = false,
+        .enable_user_namespace = true,
+        .enable_ipc_namespace = false,      // No IPC namespace
+        .rootfs_path = NULL,
+        .enable_overlay = false,
+        .container_dir = NULL,
+        .hostname = NULL,
+        .uid_map_inside = 0,
+        .uid_map_outside = getuid(),
+        .uid_map_range = 1,
+        .gid_map_inside = 0,
+        .gid_map_outside = getgid(),
+        .gid_map_range = 1
+    };
+
+    uts_result_t result = uts_exec(&config);
+    uts_cleanup(&result);
+    free(env);
+
+    assert(result.exited_normally);
+    assert(result.exit_status == 0);
+    printf("PASS: test_no_ipc_backward_compat\n");
+}
+
 int main() {
-    if (geteuid() != 0) {
-        fprintf(stderr, "Tests must run as root (sudo)\n");
-        return 1;
+    if (geteuid() == 0) {
+        test_hostname_isolation();
+        test_no_uts_backward_compat();
+        test_ipc_isolation();          // New — requires root without --user
+    } else {
+        printf("SKIP: test_hostname_isolation (requires root)\n");
+        printf("SKIP: test_no_uts_backward_compat (requires root)\n");
+        printf("SKIP: test_ipc_isolation (requires root)\n");
     }
 
-    test_hostname_isolation();
-    test_no_uts_backward_compat();
+    test_user_namespace_unprivileged();
+    test_user_namespace_with_hostname();
+    test_ipc_with_user_namespace();    // New — works without root
+    test_no_ipc_backward_compat();     // New — works with or without root
 
-    printf("\nAll UTS tests passed!\n");
+    printf("\nAll UTS/user/IPC namespace tests passed!\n");
     return 0;
 }

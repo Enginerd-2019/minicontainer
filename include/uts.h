@@ -13,17 +13,18 @@
  * as well as a usernamspace enable flag
  */
 typedef struct {
-    // Base configuration (unchanged from Phase 4)
+    // Base configuration (unchanged from Phase 4b)
     const char *program;
     char *const *argv;
     char *const *envp;
     bool enable_debug;
 
-    // Namespace flags (enable_user_namespace is new)
+    // Namespace flags (enable_ipc_namespace is new)
     bool enable_pid_namespace;
     bool enable_mount_namespace;
     bool enable_uts_namespace;
-    bool enable_user_namespace;      // New in Phase 4b
+    bool enable_user_namespace;
+    bool enable_ipc_namespace;       // New in Phase 4c
 
     // Filesystem (unchanged)
     const char *rootfs_path;
@@ -33,13 +34,13 @@ typedef struct {
     // UTS settings (unchanged)
     const char *hostname;
 
-    // User namespace mapping (new in Phase 4b)
-    uid_t uid_map_inside;            // UID inside namespace (typically 0)
-    uid_t uid_map_outside;           // UID outside namespace (host UID)
-    size_t uid_map_range;            // Number of UIDs to map (typically 1)
-    gid_t gid_map_inside;            // GID inside namespace (typically 0)
-    gid_t gid_map_outside;           // GID outside namespace (host GID)
-    size_t gid_map_range;            // Number of GIDs to map (typically 1)
+    // User namespace mapping (unchanged from Phase 4b)
+    uid_t uid_map_inside;
+    uid_t uid_map_outside;
+    size_t uid_map_range;
+    gid_t gid_map_inside;
+    gid_t gid_map_outside;
+    size_t gid_map_range;
 } uts_config_t;
 
 /**
