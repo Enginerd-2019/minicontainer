@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 4b - User Namespace (Rootless Containers)
-**Last Updated:** 2026-04-15
+**Phase:** 5 - cgroups v2 (Resource Limits)
+**Last Updated:** 2026-05-11
 
 ---
 
@@ -465,6 +465,132 @@ mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL)
 **Implementation in uts.c:**
 - `child_args_t` gains `user_namespace_active` field, set from `config->enable_user_namespace`
 - `child_func()` checks `args->user_namespace_active` when `mount_proc()` fails: if true, prints warning and continues; if false, returns error (existing behavior)
+
+---
+
+### 21. build_container_env() Refactored for Future Extraction (Phase 5)
+
+**Decision:** During Phase 5, refactor `build_container_env()` in `main.c` from
+an exact-size `malloc`-based implementation that trusts caller invariants into
+a fixed-ceiling `calloc`-based implementation with a bounds check at every
+append. The algorithm is unchanged; the safety properties are stronger.
+
+**Background — what was there:**
+
+The Phase 3/4/4b/4c version of `build_container_env()` looked like this in
+shape:
+
+```c
+int custom_count = 0;
+if (custom_env) while (custom_env[custom_count]) custom_count++;
+
+char **env = malloc((count + custom_count + 1) * sizeof(char *));
+// ... copy defaults, set NULL terminator ...
+
+for (int i = 0; i < custom_count; i++) {
+    // ... replace-or-append ...
+    if (!replaced) {
+        env[count] = custom_env[i];  /* No bounds check — sizing was exact. */
+        count++;
+        env[count] = NULL;
+    }
+}
+```
+
+This version is **correct for the current codebase**. `main.c` caps
+`custom_env` at `MAX_ENV_ENTRIES - 1` before calling, and `custom_env` is a
+stable single-threaded array, so the upfront `custom_count` is always
+accurate and the append never overflows.
+
+**The Phase 5 refactor:**
+
+```c
+int max_entries = count + MAX_ENV_ENTRIES + 1;
+char **env = calloc(max_entries, sizeof(char *));
+// ... copy defaults (no terminator needed — calloc handles it) ...
+
+if (custom_env) {
+    for (int i = 0; custom_env[i]; i++) {
+        // ... replace-or-append ...
+        if (!replaced && count < max_entries - 1) {
+            env[count++] = custom_env[i];
+        }
+    }
+}
+
+env[count] = NULL;  /* Explicit terminator at end (calloc placed one too). */
+```
+
+Three changes:
+1. **`calloc` instead of `malloc`** — every slot is zero-initialized (implicit
+   NULL terminator throughout the array).
+2. **Fixed compile-time ceiling instead of exact size** — `MAX_ENV_ENTRIES` is
+   a constant, so the size calculation cannot be wrong (no integer overflow,
+   no reliance on a caller-supplied count).
+3. **Bounds check at every append** — `if (!replaced && count < max_entries - 1)`.
+   Excess entries are silently dropped rather than written past the
+   allocation.
+
+**Rationale:**
+
+- **Phase 7 plans to extract `*_exec()` boilerplate into a shared execution
+  core.** `build_container_env()` will likely be pulled along with it into a
+  shared utility module (or `libprocfs`-style helper library) — at which point
+  it can be called from contexts that don't pre-validate input. Making the
+  function self-contained **now** means the Phase 7 extraction is mechanical
+  (move the file) rather than a correctness refactor.
+
+- **Defense-in-depth at the function level.** The architecture-level
+  defense-in-depth pattern (independent isolation layers — `pivot_root`,
+  `close_inherited_fds`, `MS_NODEV|MS_NOSUID`, etc.) is mirrored here at the
+  function level: `calloc` defends against reads from
+  between-write slots; the fixed ceiling defends against integer overflow and
+  caller-size lies; the bounds check defends against buffer overflow if
+  anything else fails. Each defense is redundant given the current `main.c`
+  caller, but each guards a different failure mode the function might face
+  after extraction.
+
+- **Spend complexity budget when extraction is foreseeable.** The Phase 4c
+  "minimal diff" pattern (Decision #16/#17) resisted abstraction until
+  repetition proved it. This decision is the inverse: invest preemptively
+  when the future use case is **known** (Phase 7 is scheduled, not
+  speculative). The distinction is certainty: structural abstraction is
+  speculative; a function known to be extracted has a foreseeable future
+  caller environment to defend against.
+
+- **No behavioral change for current users.** Both versions produce identical
+  output for valid input. The bounds check can never trigger via the
+  CLI-driven path because `main.c` caps `custom_env` at `MAX_ENV_ENTRIES - 1`.
+  The cost is ~5 lines of code and a slight constant overhead per call
+  (`calloc` zero-inits). Reverting if needed is trivial.
+
+**What the principle illustrates:**
+
+When code transitions from "tightly coupled internal helper" to "library
+function" — even within the same codebase — it has to stop trusting its
+caller. Long-lived software accumulates callers and use cases the original
+author didn't anticipate; a function that's safe *only because of caller
+invariants* is a latent bug waiting for the day those invariants stop
+holding. The refactor cost is small now and prevents a future correctness
+audit during the Phase 7 extraction.
+
+**Tension with Decision #16 (minimal diff resists abstraction):**
+
+This decision adds *local* complexity (a few defensive lines inside one
+function). Decision #16 resisted *structural* complexity (modules,
+interfaces, indirection). The reconciliation: structural abstraction is
+expensive to revert and obscures the data flow; local defensive code is
+cheap to revert and self-documenting. The project accepts the latter
+preemptively; the former waits for proof of necessity.
+
+**Files affected:**
+- `src/main.c` — `build_container_env()` rewritten in-place
+- `phase5_cgroups_implementation_guide.md` §3.7 — full rationale with worked
+  comparison
+- `SRE.md` §5.4 and §8.4 — SRE framing as "code that survives" and risk-budget
+  decision
+
+**Fix Applied:** 2026-05-11
 
 ---
 

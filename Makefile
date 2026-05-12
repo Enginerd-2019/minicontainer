@@ -1,5 +1,5 @@
 # Makefile for minicontainer - Minimal Container Runtime
-# Phase 4c: IPC Namespace (builds on Phase 4b User Namespace, Phase 4 UTS)
+# Phase 5: cgroups v2 Resource Limits (builds on Phase 4c IPC, 4b User, 4 UTS)
 
 CC       = gcc
 CFLAGS   = -Wall -Wextra -std=c11 -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
@@ -27,6 +27,7 @@ TEST_NAMESPACE = test_namespace
 TEST_MOUNT     = test_mount
 TEST_OVERLAY   = test_overlay
 TEST_UTS       = test_uts
+TEST_CGROUP    = test_cgroup
 
 # Default target
 .PHONY: all
@@ -43,8 +44,11 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
-# Link minicontainer (Phase 4: main + uts + overlay + mount)
-$(MINICONTAINER): $(BUILD_DIR)/main.o $(BUILD_DIR)/uts.o \
+# Link minicontainer (Phase 5: main + cgroup + uts + overlay + mount)
+# cgroup.c supersedes uts.c as the top-level exec module but imports
+# setup_uts, setup_user_namespace_mapping from uts.c, setup_overlay/
+# teardown_overlay from overlay.c, and setup_rootfs/mount_proc from mount.c.
+$(MINICONTAINER): $(BUILD_DIR)/main.o $(BUILD_DIR)/cgroup.o $(BUILD_DIR)/uts.o \
                   $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(MINICONTAINER) successfully!"
@@ -75,9 +79,16 @@ $(TEST_UTS): $(BUILD_DIR)/test_uts.o $(BUILD_DIR)/uts.o \
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_UTS) successfully!"
 
+# Link test_cgroup (Phase 5: cgroup creation, limits, lifecycle)
+# Same link set as $(MINICONTAINER) minus main.o, plus the test object.
+$(TEST_CGROUP): $(BUILD_DIR)/test_cgroup.o $(BUILD_DIR)/cgroup.o \
+                $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_CGROUP) successfully!"
+
 # Build and run all tests
 .PHONY: test
-test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS)
+test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP)
 	@echo "=== Running Phase 0 spawn tests ==="
 	./$(TEST_SPAWN)
 	@echo ""
@@ -97,6 +108,9 @@ test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS)
 	./$(TEST_UTS)
 	@echo ""
 	@echo "=== Phase 4c IPC namespace tests are included in the test_uts suite above ==="
+	@echo ""
+	@echo "=== Running Phase 5 cgroup tests (requires root) ==="
+	sudo ./$(TEST_CGROUP)
 
 # Build with debug symbols
 .PHONY: debug
@@ -114,7 +128,7 @@ valgrind: debug
 .PHONY: clean
 clean:
 	@rm -rf $(BUILD_DIR)
-	@rm -f $(MINICONTAINER) $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS)
+	@rm -f $(MINICONTAINER) $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP)
 	@echo "Cleaned build artifacts"
 
 # Run example commands
@@ -158,15 +172,25 @@ examples: $(MINICONTAINER)
 	@echo ""
 	@echo "=== Example 13: Rootless with IPC isolation (Phase 4b + 4c) ==="
 	./$(MINICONTAINER) --user --pid --ipc --hostname test /bin/sh -c 'ipcs; id'
+	@echo ""
+	@echo "=== Example 14: Memory limit (Phase 5, requires root) ==="
+	sudo ./$(MINICONTAINER) --pid --memory 100M /bin/sh -c 'head -c 50M /dev/zero | wc -c'
+	@echo ""
+	@echo "=== Example 15: CPU + PID limits (Phase 5, requires root) ==="
+	sudo ./$(MINICONTAINER) --pid --cpus 0.5 --pids 20 /bin/sh -c 'echo limited'
+	@echo ""
+	@echo "=== Example 16: Full isolation with cgroups ==="
+	sudo ./$(MINICONTAINER) --pid --rootfs ./rootfs --overlay --hostname web --ipc \
+	    --memory 100M --cpus 0.5 --pids 20 /bin/sh -c 'hostname && id'
 
 # Help target
 .PHONY: help
 help:
-	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 4c)"
+	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 5)"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  all        - Build minicontainer (default)"
-	@echo "  test       - Build and run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c)"
+	@echo "  test       - Build and run all tests (Phase 0 through Phase 5)"
 	@echo "  debug      - Build with debug symbols (-g)"
 	@echo "  valgrind   - Run with valgrind memory checker"
 	@echo "  examples   - Run example commands"
@@ -183,6 +207,7 @@ help:
 	@echo "  ./minicontainer --user --pid --hostname test /bin/sh                # Rootless"
 	@echo "  sudo ./minicontainer --pid --ipc /bin/sh -c 'ipcs'                  # IPC isolated"
 	@echo "  ./minicontainer --user --pid --ipc --hostname test /bin/sh          # Rootless + IPC"
+	@echo "  sudo ./minicontainer --pid --memory 100M --cpus 0.5 /bin/sh         # cgroup limits (Phase 5)"
 
 # Include auto-generated header dependencies
 -include $(DEPS)

@@ -1,13 +1,23 @@
 # Build artifacts
 build/
 *.o
+*.d              # Auto-generated header dependencies (-MMD -MP)
 minicontainer
 test_spawn
 test_namespace
 test_mount
+test_overlay     # Phase 3
+test_uts         # Phase 4/4b/4c
+test_cgroup      # Phase 5
+test_*           # Future-proof: test_net (Phase 6), test_cli (Phase 7), etc.
 
 # Generated rootfs (built from host binaries, not source)
 rootfs/
+
+# Runtime container state (created by --overlay; per-container subdirs of
+# upper/work/merged). Phase 3+ writes here. Default location set in main.c;
+# overridable via --container-dir.
+containers/
 
 # Editor files
 *.swp

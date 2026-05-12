@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-4c%20IPC%20Namespace-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-5%20cgroups%20v2-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,15 +12,25 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current Phase:** Phase 4c - IPC Namespace (System V IPC Isolation)
+**Current Phase:** Phase 5 - cgroups v2 (Resource Limits)
 
-Building on Phase 4b's rootless container support, this phase adds **IPC namespace isolation** via `CLONE_NEWIPC`. Containers get their own independent set of System V shared memory segments, semaphore arrays, message queues, and POSIX message queues — preventing data leakage, interference, and resource exhaustion across container boundaries.
+Building on Phase 4c's complete namespace isolation, this phase adds **resource control** via cgroups v2. Containers can now be limited in memory (`memory.max`), CPU bandwidth (`cpu.max`), and process count (`pids.max`) — defending the host from runaway containers, fork bombs, and OOM-killer chaos. Namespaces answer "what can the container see?"; cgroups answer "how much can it use?"
 
 ---
 
 ## Features
 
-### Phase 4c (Current)
+### Phase 5 (Current)
+
+- ✅ **cgroups v2 Resource Control** - Limit memory, CPU, and process count per container
+- ✅ **`--memory <limit>`** - Memory ceiling (e.g., `100M`, `1G`); OOM-killed if exceeded
+- ✅ **`--cpus <fraction>`** - CPU bandwidth limit (e.g., `0.5` = 50% of one core)
+- ✅ **`--pids <max>`** - Maximum process count; defends against fork bombs
+- ✅ **Three-Phase Lifecycle** - Create cgroup before clone, add PID after clone, remove after exit
+- ✅ **Auto-Enable Cgroup** - Any cgroup flag (`--memory`/`--cpus`/`--pids`) enables the cgroup subsystem
+- ✅ **`build_container_env()` Defensive Refactor** - `calloc` + bounds check, preparing for Phase 7 extraction (see decisions.md #21)
+
+### Phase 4c
 
 - ✅ **IPC Namespace Isolation** - `CLONE_NEWIPC` gives containers independent IPC tables
 - ✅ **`--ipc` Flag** - Explicit opt-in (unlike `--rootfs`, does not auto-enable)
@@ -106,6 +116,16 @@ sudo ./minicontainer --pid --ipc /bin/sh -c 'ipcs'
 # Rootless + IPC isolation (no sudo, full IPC isolation)
 ./minicontainer --user --pid --ipc --hostname test /bin/sh -c 'ipcs; id'
 
+# Memory limit — container OOM-killed if it exceeds 100MB (Phase 5)
+sudo ./minicontainer --pid --memory 100M /bin/sh -c 'head -c 50M /dev/zero | wc -c'
+
+# CPU + PID limits — 50% of one core, max 20 processes (fork bomb defense)
+sudo ./minicontainer --pid --cpus 0.5 --pids 20 /bin/sh
+
+# Full Phase 5: all namespaces + cgroup limits
+sudo ./minicontainer --pid --rootfs ./rootfs --overlay --hostname web --ipc \
+    --memory 100M --cpus 0.5 --pids 20 /bin/sh
+
 # Hostname isolation (container gets its own hostname)
 sudo ./minicontainer --rootfs ./rootfs --hostname mycontainer /bin/sh -c 'hostname'
 
@@ -141,7 +161,9 @@ sudo ./minicontainer --debug --rootfs ./rootfs --overlay /bin/sh -c 'echo $$'
 `CLONE_NEWUSER`. `--ipc` is explicit opt-in and does **not** auto-enable with
 any other flag (IPC isolation is only meaningful for workloads that use System V
 IPC or POSIX message queues, so auto-enabling would add overhead for the common
-case). These flags are otherwise independent — `--hostname` does not imply
+case). Any of `--memory`/`--cpus`/`--pids` auto-enables the cgroup subsystem
+(`enable_cgroup`); supplying none of them skips cgroup setup entirely.
+These flags are otherwise independent — `--hostname` does not imply
 `--overlay` and vice versa. For full isolation, combine them explicitly. Note
 that this auto-enable behavior is a `main.c` design choice; the underlying
 library functions accept each flag independently, allowing other entry points
@@ -149,7 +171,8 @@ to compose isolation differently.
 
 **Note:** Without `--user`, namespace features require root or `CAP_SYS_ADMIN`.
 With `--user`, `CLONE_NEWUSER` grants capabilities inside the namespace without
-host privileges:
+host privileges. **Cgroup operations (Phase 5) always require root** —
+`/sys/fs/cgroup/` is owned by root and `--user` does not delegate write access:
 ```bash
 # Option 1: Run with sudo
 sudo ./minicontainer --pid --rootfs ./rootfs /bin/sh
@@ -162,7 +185,7 @@ sudo setcap cap_sys_admin+ep ./minicontainer
 ### Test
 
 ```bash
-# Run all tests (Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + 4b + 4c)
+# Run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5)
 make test
 
 # Run example commands
@@ -179,6 +202,7 @@ make valgrind
 ```
 minicontainer/
 ├── include/
+│   ├── cgroup.h             # Phase 5: cgroups v2 resource limits API
 │   ├── uts.h                # Phase 4/4b/4c: UTS + user + IPC namespace API
 │   ├── overlay.h            # Phase 3: OverlayFS, environment, fd cleanup API
 │   ├── mount.h              # Phase 2: Mount namespace & rootfs API
@@ -186,12 +210,14 @@ minicontainer/
 │   └── spawn.h              # Phase 0: Process spawning API
 ├── src/
 │   ├── main.c               # CLI entry point and argument parsing
-│   ├── uts.c                # Phase 4/4b/4c: UTS + user + IPC namespace, sync pipe, clone/exec
+│   ├── cgroup.c             # Phase 5: cgroup setup/teardown, clone/exec (supersedes uts.c)
+│   ├── uts.c                # Phase 4/4b/4c: UTS + user + IPC namespace, sync pipe
 │   ├── overlay.c            # Phase 3: OverlayFS, close_inherited_fds
 │   ├── mount.c              # Phase 2: setup_rootfs, mount_proc
 │   ├── namespace.c          # Phase 1: clone() + PID namespace logic
 │   └── spawn.c              # Phase 0: fork/execve implementation
 ├── tests/
+│   ├── test_cgroup.c        # Phase 5: cgroup lifecycle, memory/CPU/PID limits (requires root)
 │   ├── test_uts.c           # Phase 4/4b/4c: UTS + user + IPC namespace tests
 │   ├── test_overlay.c       # Phase 3: Overlay/env/fd tests (requires root + rootfs)
 │   ├── test_mount.c         # Phase 2: Mount/rootfs tests (requires root + rootfs)
@@ -214,20 +240,25 @@ minicontainer/
 ```
 ┌──────────────────────────────────────────────────────┐
 │                main.c (CLI Layer)                    │
-│  • Parses --pid, --rootfs, --overlay, --hostname, etc│
+│  • Parses --pid, --rootfs, --overlay, --hostname,    │
+│    --memory, --cpus, --pids, etc.                    │
 │  • build_container_env() — clean environment         │
 │  • Misplaced flag detection                          │
-│  • Calls uts_exec()                                  │
+│  • Calls cgroup_exec()                               │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
 ┌──────────────────────────────────────────────────────┐
-│           uts.c (Orchestration Layer)                │
+│          cgroup.c (Orchestration Layer)              │
+│  • setup_cgroup() → mkdir /sys/fs/cgroup/...         │
+│    write memory.max, cpu.max, pids.max               │
 │  • setup_overlay() → mount OverlayFS (from overlay.c)│
 │  • clone() with NEWPID|NEWNS|NEWUTS|NEWUSER|NEWIPC   │
 │  • Sync pipe: write UID/GID maps, signal child       │
+│  • add_pid_to_cgroup() → write cgroup.procs          │
 │  • waitpid() and exit status parsing                 │
 │  • teardown_overlay() → unmount and cleanup          │
+│  • remove_cgroup() → rmdir /sys/fs/cgroup/...        │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
@@ -250,6 +281,7 @@ minicontainer/
 - Phase 4: `uts.c` (`CLONE_NEWUTS` + `sethostname`), calls into `overlay.c` and `mount.c`
 - Phase 4b: `uts.c` extended with `CLONE_NEWUSER`, sync pipe, UID/GID mapping (no new module — see code duplication note)
 - Phase 4c: `uts.c` extended with `CLONE_NEWIPC` (one flag, zero new child-side code)
+- Phase 5: `cgroup.c` (cgroups v2 resource limits), supersedes `uts.c` as exec module, imports `setup_uts`/`setup_user_namespace_mapping` from `uts.h` and overlay/mount helpers
 - Earlier modules retained for their respective phase tests
 
 **Note on code duplication:** Each phase's `*_exec()` function (e.g., `overlay_exec`, `uts_exec`) shares ~90% of its structure with the previous phase — `clone()`, `waitpid()`, stack allocation, and exit status parsing are repeated each time. This is a deliberate pedagogical choice: each module is self-contained and readable without cross-referencing earlier phases. A production runtime would factor this into a shared execution core, and this refactoring is planned for Phase 7 (CLI & Lifecycle).
@@ -258,7 +290,7 @@ minicontainer/
 
 **Configuration structure:**
 ```c
-uts_config_t config = {
+cgroup_config_t config = {
     .program = "/bin/sh",
     .argv = argv,                     // NULL-terminated array
     .envp = env,                      // From build_container_env()
@@ -277,21 +309,29 @@ uts_config_t config = {
     .uid_map_range = 1,
     .gid_map_inside = 0,
     .gid_map_outside = getgid(),
-    .gid_map_range = 1
+    .gid_map_range = 1,
+    // Phase 5: cgroup resource limits
+    .enable_cgroup = true,
+    .cgroup_limits = {
+        .memory_limit = 100 * 1024 * 1024,  // 100 MB
+        .cpu_quota = 50000,                  // 50% of one core
+        .cpu_period = 100000,                // (over 100ms period)
+        .pid_limit = 20                      // Max 20 processes
+    }
 };
 ```
 
 **Result structure:**
 ```c
-uts_result_t result = uts_exec(&config);
+cgroup_result_t result = cgroup_exec(&config);
 
 if (result.exited_normally) {
     printf("Exit code: %d\n", result.exit_status);
 } else {
-    printf("Killed by signal %d\n", result.signal);
+    printf("Killed by signal %d\n", result.signal);  // 137 = OOM-killed
 }
 
-uts_cleanup(&result);  // Free clone stack
+cgroup_cleanup(&result);  // Remove cgroup dir + free clone stack
 ```
 
 ---
@@ -378,6 +418,9 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 
 | System Call | Purpose | Phase |
 |-------------|---------|-------|
+| `mkdir()` / `rmdir()` | Create/destroy cgroup directory under `/sys/fs/cgroup/` | 5 |
+| `write()` (to cgroup files) | Set `memory.max`/`cpu.max`/`pids.max`; add PID to `cgroup.procs` | 5 |
+| `clock_gettime()` | Generate unique cgroup name from timestamp + nanoseconds | 5 |
 | `pipe()` | Creates sync pipe for parent-child UID/GID map coordination | 4b |
 | `open()`/`write()` | Writes `/proc/<pid>/setgroups`, `uid_map`, `gid_map` | 4b |
 | `sethostname()` | Sets container hostname inside UTS namespace | 4 |
@@ -397,7 +440,44 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 
 ## Usage Examples
 
-### Example 1: IPC Namespace Isolation (Phase 4c)
+### Example 1: cgroup Resource Limits (Phase 5)
+
+```bash
+# Memory limit: container OOM-killed when it exceeds 100MB
+$ sudo ./minicontainer --pid --memory 100M /bin/sh -c \
+    'head -c 200M /dev/zero | wc -c'
+# Killed
+$ echo $?
+137                          # 128 + SIGKILL(9) = OOM kill
+
+# CPU limit: 50% of one core
+$ sudo ./minicontainer --pid --cpus 0.5 /bin/sh -c 'while true; do :; done' &
+# Check with top — process shows ~50% CPU, not 100%
+$ kill %1
+
+# PID limit: fork bomb defense
+$ sudo ./minicontainer --pid --pids 5 /bin/sh -c \
+    'for i in $(seq 1 100); do sleep 1000 & done'
+# /bin/sh: Cannot fork  ← kernel returns EAGAIN after pids.max hit
+
+# Inspect cgroup directly while container runs
+$ sudo ./minicontainer --pid --memory 100M --cpus 0.5 --pids 20 \
+    /bin/sleep 60 &
+$ cat /sys/fs/cgroup/minicontainer_*/memory.max
+104857600
+$ cat /sys/fs/cgroup/minicontainer_*/cpu.max
+50000 100000
+$ cat /sys/fs/cgroup/minicontainer_*/pids.max
+20
+```
+
+**Three-phase lifecycle:** Before `clone()` the parent creates the cgroup
+and writes limits. After `clone()` (and after UID/GID maps if `--user`) the
+parent adds the child PID to `cgroup.procs`. After `waitpid()` returns, the
+cgroup directory is `rmdir()`'d. Missed cleanup is a resource leak — see
+Troubleshooting if `/sys/fs/cgroup/minicontainer_*` accumulates entries.
+
+### Example 2: IPC Namespace Isolation (Phase 4c)
 
 ```bash
 # Host: create a shared memory segment
@@ -426,7 +506,7 @@ namespace** (Phase 2 `/dev/shm`), not by `CLONE_NEWIPC`. The IPC namespace
 covers System V IPC and POSIX message queues only. See decisions.md for
 details.
 
-### Example 2: Hostname Isolation (Phase 4)
+### Example 3: Hostname Isolation (Phase 4)
 
 ```bash
 # Host hostname is unchanged
@@ -450,7 +530,7 @@ hello
 # rootfs is untouched, hostname was scoped to the container
 ```
 
-### Example 3: OverlayFS — Base Image Untouched (Phase 3)
+### Example 4: OverlayFS — Base Image Untouched (Phase 3)
 
 ```bash
 # Create a marker in the base image
@@ -466,7 +546,7 @@ $ cat rootfs/tmp/marker.txt
 original
 ```
 
-### Example 4: Clean Container Environment (Phase 3)
+### Example 5: Clean Container Environment (Phase 3)
 
 ```bash
 # Container sees minimal environment, not host's 30+ variables
@@ -482,7 +562,7 @@ $ sudo ./minicontainer --rootfs ./rootfs --overlay \
 production
 ```
 
-### Example 5: Debug Mode with Overlay (Phase 3)
+### Example 6: Debug Mode with Overlay (Phase 3)
 
 ```bash
 $ sudo ./minicontainer --debug --rootfs ./rootfs --overlay /bin/echo "Hello"
@@ -505,7 +585,7 @@ Hello
 [overlay] Cleanup complete
 ```
 
-### Example 6: PID Namespace Isolation (Phase 1)
+### Example 7: PID Namespace Isolation (Phase 1)
 
 ```bash
 # Without --pid: shell reports its real PID
@@ -517,14 +597,14 @@ $ sudo ./minicontainer --pid /bin/sh -c 'echo $$'
 1
 ```
 
-### Example 7: Basic Command Execution
+### Example 8: Basic Command Execution
 
 ```bash
 $ ./minicontainer /bin/echo "Hello from minicontainer"
 Hello from minicontainer
 ```
 
-### Example 8: Exit Code Handling
+### Example 9: Exit Code Handling
 
 ```bash
 $ ./minicontainer /bin/false
@@ -580,9 +660,23 @@ make test
 - ✓ IPC + user namespace (rootless with IPC isolation)
 - ✓ Backward compatibility (no IPC namespace, rootless Phase 4b behavior)
 
+**Phase 5 tests** (`test_cgroup` - requires root):
+- ✓ Cgroup creation and cleanup (mkdir/rmdir lifecycle)
+- ✓ Memory limit enforcement (process exits cleanly within budget)
+- ✓ PID limit (fork bomb defense — kernel returns EAGAIN at the cap)
+- ✓ Backward compatibility (no cgroup, Phase 4c behavior)
+- ✓ Cgroup combined with IPC namespace (all isolation layers active)
+
 ### Manual Testing
 
 ```bash
+# Cgroup limits (Phase 5)
+sudo ./minicontainer --pid --memory 100M /bin/sh -c 'head -c 200M /dev/zero | wc -c'
+echo $?                           # Should be 137 (OOM killed)
+sudo ./minicontainer --pid --pids 5 /bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9; do sleep 1 & done'
+                                  # Should print "Cannot fork" once limit hit
+ls /sys/fs/cgroup/minicontainer_* # After exit: should be empty (auto-cleanup)
+
 # IPC: container should see empty tables with --ipc
 ipcmk -M 1024                     # Create a host shared memory segment
 ipcs -m                           # Note the shmid
@@ -649,6 +743,9 @@ Following shell/POSIX conventions:
 ## Design Decisions
 
 See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
+- Why `cgroup.c` is a separate module (vs. extending `uts.c` like Phase 4b/4c)
+- `build_container_env()` defensive refactor for Phase 7 extraction (Decision #21)
+- Cgroup three-phase lifecycle (create before clone, add PID after, remove after exit)
 - IPC namespace isolation and why it's explicit opt-in (not auto-enabled)
 - Why IPC namespace ≠ all shared memory (POSIX `shm_open` is a mount namespace concern)
 - User namespace support and why Phase 4b extends uts.c instead of creating a new module
@@ -679,6 +776,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 8. **Rootfs must be pre-built** — No image pull or layer support; rootfs directory must exist before running
 9. **No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
 10. ~~**No hostname isolation**~~ — **Fixed in Phase 4** via `CLONE_NEWUTS` and `--hostname`
+11. ~~**No resource limits**~~ — **Fixed in Phase 5** via cgroups v2 (`--memory`, `--cpus`, `--pids`). Cgroup operations require root (`/sys/fs/cgroup/` is root-owned); `--user` does not grant write access there.
 
 ---
 
@@ -732,18 +830,22 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] Graceful `/proc` mount degradation in user namespace
 - [x] `close_inherited_fds()` brute-force fallback when `/proc` unavailable
 
-### ✅ Phase 4c: IPC Namespace — System V IPC Isolation (Current)
+### ✅ Phase 4c: IPC Namespace — System V IPC Isolation
 - [x] `CLONE_NEWIPC` for independent IPC tables
 - [x] `--ipc` CLI flag (explicit opt-in, not auto-enabled)
 - [x] System V shared memory / semaphores / message queues isolated
 - [x] POSIX message queues isolated (via `/dev/mqueue` in new namespace)
 - [x] Unit tests (`test_ipc_isolation` root; `test_ipc_with_user_namespace` rootless)
 
-### 📋 Phase 5: cgroups v2 — Resource Limits
-- [ ] Create cgroup under `/sys/fs/cgroup/`
-- [ ] Write container PID to `cgroup.procs`
-- [ ] Set `memory.max` and `cpu.max`
-- [ ] `--memory` and `--cpus` CLI flags
+### ✅ Phase 5: cgroups v2 — Resource Limits (Current)
+- [x] New `cgroup.c`/`cgroup.h` module supersedes `uts.c` as exec path
+- [x] Three-phase cgroup lifecycle: create → add PID → remove
+- [x] `memory.max` limit (`--memory <100M|1G>`); OOM kill at exit code 137
+- [x] `cpu.max` limit (`--cpus 0.5` = 50% of one core)
+- [x] `pids.max` limit (`--pids 20`) for fork bomb defense
+- [x] Auto-enable `enable_cgroup` when any limit flag is set
+- [x] `build_container_env()` defensive refactor (decisions.md #21)
+- [x] Unit tests (`test_cgroup` requires root)
 
 ### 📋 Phase 6: Network Isolation
 - [ ] CLONE_NEWNET for network namespace
@@ -768,7 +870,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 
 ```bash
 make              # Build minicontainer
-make test         # Build and run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c)
+make test         # Build and run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5)
 make clean        # Remove build artifacts
 make debug        # Build with debug symbols (-g)
 make valgrind     # Run memory leak detection
@@ -800,6 +902,8 @@ make help         # Show all available targets
 
 ### Man Pages (Essential Reading)
 ```bash
+man 7 cgroups         # cgroup overview, v1 vs v2, controllers (Phase 5)
+man 5 cgroup.controllers # File interface for memory.max/cpu.max/pids.max (Phase 5)
 man 7 ipc_namespaces  # IPC namespace details (Phase 4c)
 man 7 sysvipc         # System V IPC overview — shmget/semget/msgget (Phase 4c)
 man 7 user_namespaces # User namespace details — UID/GID mapping (Phase 4b)
@@ -843,6 +947,67 @@ cat /proc/filesystems | grep overlay
 
 # If not listed, load the module
 sudo modprobe overlay
+```
+
+---
+
+### "mkdir(cgroup): Permission denied" (Phase 5)
+
+**Problem:** Cgroup creation requires write access to `/sys/fs/cgroup/`,
+which is root-owned. `--user` does **not** delegate this.
+
+**Solution:** Always use `sudo` for cgroup operations:
+```bash
+sudo ./minicontainer --pid --memory 100M /bin/sh
+```
+
+This is a known limitation matching Docker/Podman's "cgroup manager"
+delegation problem. A production runtime would use systemd's `--scope`
+delegation; minicontainer keeps the mechanism direct for educational clarity.
+
+---
+
+### "rmdir(cgroup): Device or resource busy" (Phase 5)
+
+**Problem:** Cgroup cleanup fails because processes still exist in
+`cgroup.procs`.
+
+**Cause:** A subprocess outlived the container's primary process, or a
+zombie hasn't been reaped, or the test exited via signal.
+
+**Solution:**
+```bash
+# Find stale cgroup
+ls /sys/fs/cgroup/minicontainer_*
+
+# Check what's still there
+cat /sys/fs/cgroup/minicontainer_XXX/cgroup.procs
+
+# Kill remaining processes
+for pid in $(cat /sys/fs/cgroup/minicontainer_XXX/cgroup.procs); do
+    sudo kill -9 $pid
+done
+
+# Then remove
+sudo rmdir /sys/fs/cgroup/minicontainer_XXX
+```
+
+Phase 7 will add a `minicontainer cleanup` subcommand to handle this.
+
+---
+
+### Container exits with code 137 (Phase 5)
+
+**Problem:** Container terminated unexpectedly with exit code 137.
+
+**Cause:** Exit code 137 = 128 + signal 9 (SIGKILL). The OOM killer fired —
+the container exceeded `--memory` and the kernel killed it.
+
+**This is correct behavior.** It's how `--memory` enforcement works. Either
+raise the limit or check what the container is allocating:
+```bash
+# Inspect peak memory usage
+cat /sys/fs/cgroup/minicontainer_*/memory.peak  # If kernel ≥ 5.19
 ```
 
 ---
