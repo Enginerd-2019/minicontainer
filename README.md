@@ -149,6 +149,14 @@ sudo ./minicontainer --pid --rootfs ./rootfs --net \
 # Network namespace without iptables MASQUERADE (no outbound internet)
 sudo ./minicontainer --pid --rootfs ./rootfs --net --no-nat /bin/sh
 
+# HTTPS from inside the container — exercises veth + NAT + DNS + TLS
+sudo ./minicontainer --pid --rootfs ./rootfs --net /bin/sh -c \
+    'curl -sS --connect-timeout 5 --max-time 20 \
+        -o /tmp/curl_out -w "%{http_code}\n" https://example.com'
+# Expected: 200. If it hangs and times out instead, the host's iptables
+# FORWARD chain is dropping the container's packets — see Known
+# Limitation #8 in docs/decisions.md for the two ACCEPT rules to add.
+
 # Full stack: every isolation + cgroups + network
 sudo ./minicontainer --pid --rootfs ./rootfs --overlay --hostname web --ipc \
     --memory 100M --cpus 0.5 --pids 20 --net \
@@ -575,6 +583,108 @@ the names live in `child_args`; the parent's `setup_net()` moves
 `veth_c_<id>` into the child's netns and only then signals the sync pipe; the
 child runs `configure_container_net()` (lo up, IP add, default route) once
 unblocked. See "How It Works → Network Namespace + veth Pair" above.
+
+#### HTTPS from inside the container (curl)
+
+Phase 6's `scripts/build_rootfs.sh` installs `curl` plus the CA bundle,
+glibc NSS modules, and a systemd-resolved-aware `/etc/resolv.conf` so
+HTTPS clients work end-to-end from inside the container's netns
+(Decision #29). The simplest demonstration:
+
+```bash
+$ sudo ./minicontainer --pid --rootfs ./rootfs --net /bin/sh -c \
+    'curl -sS --connect-timeout 5 --max-time 20 \
+        -o /tmp/curl_out -w "%{http_code}\n" https://example.com'
+200
+
+# The downloaded body lives in the rootfs at rootfs/tmp/curl_out
+# (the container's /tmp is the host's rootfs/tmp directory):
+$ head -c 80 rootfs/tmp/curl_out
+<!doctype html><html lang="en"><head><title>Example Domain</title>
+```
+
+> **Iptables prerequisite.** On hosts with Docker, UFW, or firewalld
+> installed, the `filter/FORWARD` chain defaults to `DROP` and the
+> curl command above will hang until `--max-time 20` fires. Two
+> ACCEPT rules unblock the container subnet:
+>
+> ```bash
+> sudo iptables -I FORWARD 1 -s 10.0.0.0/24 -j ACCEPT
+> sudo iptables -I FORWARD 1 -d 10.0.0.0/24 -j ACCEPT
+> ```
+>
+> See Known Limitation #8 in `docs/decisions.md` for the full
+> diagnostic checklist, persistence guidance, and the rationale for
+> why minicontainer does not auto-install these rules.
+
+#### `--overlay`: the curl write does not persist in the rootfs
+
+The previous example left `rootfs/tmp/curl_out` sitting in the rootfs
+because `--overlay` was not passed — every write inside the container
+hit the rootfs directory directly. Adding `--overlay` changes that:
+
+```bash
+# Clean slate first, so the difference is unambiguous.
+$ rm -f rootfs/tmp/curl_out
+
+# Run the same curl with --overlay.
+$ sudo ./minicontainer --pid --rootfs ./rootfs --overlay --net /bin/sh -c \
+    'curl -sS --connect-timeout 5 --max-time 20 \
+        -o /tmp/curl_out -w "%{http_code}\n" https://example.com'
+200
+
+# The write went to the overlay's upperdir, which was discarded on
+# container exit. The rootfs is untouched:
+$ ls rootfs/tmp/curl_out
+ls: cannot access 'rootfs/tmp/curl_out': No such file or directory
+```
+
+This is the OverlayFS copy-on-write contract from Phase 3 applied to
+network writes: every modification the container makes — whether it's
+`echo > file`, `apt install`, or `curl -o`, lands in the upper layer
+and goes away when the container exits.
+
+#### Seeing the write while it exists: interactive shell + `--overlay`
+
+To watch the curl write actually exist inside the container before it
+gets discarded, drop into an interactive shell instead of running
+`-c '...'`. The shell stays in the foreground; you can run curl,
+inspect the result, and then exit:
+
+```bash
+$ sudo ./minicontainer --pid --rootfs ./rootfs --overlay --net /bin/sh
+
+# Inside the container (no PS1 prompt — Phase 7b adds proper PTY/TTY
+# allocation; today the shell runs in line-mode without job control):
+curl -sS --connect-timeout 5 --max-time 20 \
+    -o /tmp/curl_out -w "%{http_code}\n" https://example.com
+# 200
+
+ls -l /tmp/curl_out
+# -rw-r--r-- 1 root root 1256 Jan  1 00:00 /tmp/curl_out
+
+head -c 80 /tmp/curl_out
+# <!doctype html><html lang="en"><head><title>Example Domain</title>
+
+exit
+# Note: exiting the shell currently emits a benign error (Phase 7b
+# adds proper PTY teardown). The container has already exited cleanly
+# by the time you see it; minicontainer is just unwinding the parent
+# side without a TTY to release.
+
+# Back on the host. The overlay's upperdir has been torn down:
+$ ls rootfs/tmp/curl_out
+ls: cannot access 'rootfs/tmp/curl_out': No such file or directory
+```
+
+The interactive shell is the clearest way to see that **the file
+genuinely existed inside the container** — `ls` and `head` both see
+it through the overlay merge — and that **nothing of it survives**
+once the container exits and `teardown_overlay()` runs. Without the
+interactive step the lifecycle is invisible; the curl write happens
+and the overlay is torn down between `exec` and the next shell
+prompt, so a `-c '...'` invocation gives no opportunity to inspect
+the intermediate state.
 
 ### Example 2: cgroup Resource Limits (Phase 5)
 

@@ -845,6 +845,102 @@ no-op.
 
 ---
 
+### 29. `build_rootfs.sh` Adds curl, CA Bundle, NSS Modules, and resolv.conf (Phase 6)
+
+**Decision:** Following a user-requested verification capability —
+running `curl` against external HTTPS endpoints from inside the
+container's netns to confirm end-to-end Phase 6 networking —
+`scripts/build_rootfs.sh` is extended to copy four additional pieces
+into the rootfs so that HTTPS client tools function correctly:
+
+1. `curl` appended to the `BINS` array. The existing `ldd` resolver
+   discovers and copies `libcurl`, `libssl`, `libcrypto`,
+   `libnghttp2`, and the rest of curl's linked dependencies into
+   `rootfs/lib/` automatically.
+2. The host's CA certificate bundle copied to
+   `rootfs/etc/ssl/certs/ca-certificates.crt`. The script tries
+   `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu) first, then
+   `/etc/pki/tls/certs/ca-bundle.crt` (RHEL/Fedora); the first
+   readable path wins.
+3. The glibc NSS modules `libnss_dns.so.2`, `libnss_files.so.2`, and
+   `libresolv.so.2` copied to `rootfs/lib/` from
+   `/lib/x86_64-linux-gnu/` (Debian/Ubuntu) or `/usr/lib64/`
+   (RHEL/Fedora).
+4. `/etc/resolv.conf` copied from the host, with a fall-back that
+   writes `nameserver 1.1.1.1` + `nameserver 8.8.8.8` whenever the
+   host's `/etc/resolv.conf` references `127.0.0.53` (the
+   systemd-resolved stub, which is unreachable from a container
+   netns).
+
+**Rationale:**
+
+- **Curl alone is not enough.** Curl in the rootfs is dynamically
+  linked to libcurl/libssl/libcrypto, all of which `ldd` discovers and
+  the existing copy loop handles. But three additional dependencies
+  are NOT picked up by `ldd` and have to be addressed separately:
+  CA certificates (a data file, not a library), NSS modules
+  (`dlopen`'d by glibc at runtime, not linked), and `/etc/resolv.conf`
+  (a config file).
+- **NSS modules are the non-obvious one.** Without
+  `libnss_dns.so.2`/`libnss_files.so.2` in the rootfs,
+  `getaddrinfo()` returns `EAI_AGAIN`/`EAI_NONAME` and curl reports
+  `Could not resolve host` even when `/etc/resolv.conf` is valid. The
+  failure mode is silent at link time because the modules are loaded
+  by name at runtime.
+- **The systemd-resolved fall-back is essential.** On modern
+  Ubuntu/Debian desktops, `/etc/resolv.conf` is a symlink to a stub
+  containing `nameserver 127.0.0.53` — that loopback address is only
+  reachable on the host's `lo` interface, never from a container
+  netns. Copying it verbatim makes DNS appear to be configured while
+  actually being broken. The fall-back detects the `127.0.0.53`
+  pattern and substitutes public resolvers.
+- **CA-bundle path matches curl's compile-time default on
+  Debian/Ubuntu.** Curl is built with
+  `--with-ca-bundle=/etc/ssl/certs/ca-certificates.crt`, so placing
+  the bundle at exactly that path requires no `--cacert` or
+  `CURL_CA_BUNDLE` configuration inside the container.
+
+**Trade-offs:**
+
+- **Rootfs grows by ~5 MB.** Curl + the linked TLS libraries +
+  certificates + NSS modules. Acceptable — the goal is a runtime that
+  can usefully execute network programs, not the smallest possible
+  image.
+- **NSS-module path hardcoding** (`/lib/x86_64-linux-gnu/` and
+  `/usr/lib64/`) is Linux-distro-specific. The script tolerates
+  missing paths gracefully via `[ -r "$so" ] && cp ...`, so it
+  degrades to "curl works by IP but not by hostname" on unsupported
+  layouts.
+- **No `/dev/null` in the rootfs.** Curl's `-o /dev/null` therefore
+  fails with `curl: (23) Failure writing output to destination` even
+  though the HTTP exchange succeeds. Sample commands write to
+  `/tmp/curl_out` instead (the rootfs has `/tmp`). Adding `/dev/null`
+  would require `mknod c 1 3`, which needs root — the build script
+  intentionally does not require sudo. See also Known Limitation #5.
+
+**Operational prerequisite:** Curl traffic from inside the container
+also requires the host's iptables `FORWARD` chain to permit packets
+to and from `10.0.0.0/24`. The MASQUERADE rule that `net.c` installs
+operates on `nat/POSTROUTING` only; `filter/FORWARD` is host policy
+that minicontainer deliberately does not modify. See Known Limitation
+#8 for the symptoms, the diagnostic checklist, and the two iptables
+commands required.
+
+**Files affected:**
+
+- `scripts/build_rootfs.sh`:
+  - `BINS` array — `curl` appended.
+  - `mkdir -p` extended to include `etc/ssl/certs`.
+  - New copy loop for `libnss_dns.so.2` / `libnss_files.so.2` /
+    `libresolv.so.2` (paths tried for Debian/Ubuntu then RHEL/Fedora).
+  - New CA-bundle-path search loop, first-readable wins.
+  - New systemd-resolved-aware `/etc/resolv.conf` step (host copy with
+    fall-back).
+
+**Fix Applied:** 2026-05-13
+
+---
+
 ## Errors Found and Fixed
 
 ### Error #1: Typo in WEXITSTATUS Macro
@@ -1594,6 +1690,135 @@ state-file convention.
 
 ---
 
+### 8. Host iptables FORWARD Chain Must Permit the Container Subnet
+
+**Limitation:** Phase 6's `--net` flag enables IPv4 forwarding
+(`/proc/sys/net/ipv4/ip_forward = 1`) and installs a MASQUERADE rule in
+`nat/POSTROUTING` so the container's veth-routed traffic can reach
+external networks via the host's default route. It does **not** modify
+the host's `filter/FORWARD` chain. On any host where Docker, UFW, or
+firewalld is installed, the default `filter/FORWARD` policy is `DROP`
+and the standard rule list does not contain an ACCEPT for
+`10.0.0.0/24` (the default container subnet). Packets from the
+container's veth peer therefore reach the host kernel, traverse
+`nat/PREROUTING`/`POSTROUTING` correctly, but get silently dropped at
+the `filter/FORWARD` step.
+
+**Impact:**
+
+- TCP connections from inside the container hang indefinitely. With no
+  client-side timeout flag, the calling process appears frozen — curl
+  waits its default ~2-minute connect timeout, ping shows 100% loss,
+  and nothing in minicontainer's own debug output indicates the host
+  firewall is responsible.
+- DNS (UDP/53) from inside the container also fails for the same
+  reason; `getaddrinfo()` returns `EAI_AGAIN`.
+- ICMP echo to anything outside the `10.0.0.0/24` subnet returns 100%
+  loss.
+- All Phase 6 `--net` example commands (e.g. `curl https://...`,
+  `ping 8.8.8.8`) appear broken when the actual failure is on the
+  host side.
+
+**Diagnostic checklist** (run these on the host while the symptom is
+reproducing; when all four are true, the FORWARD chain is the cause):
+
+```bash
+# 1. Verify forwarding is enabled.
+cat /proc/sys/net/ipv4/ip_forward
+# Expected: 1
+
+# 2. Verify minicontainer's MASQUERADE rule is in place.
+sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE
+# Expected: a line referencing 10.0.0.0/24 (or your --net-* override).
+
+# 3. Verify the FORWARD chain's default policy.
+sudo iptables -L FORWARD -n -v | head -2
+# Looking for: "Chain FORWARD (policy DROP ...)"
+# Hosts without Docker/UFW/firewalld typically show "policy ACCEPT".
+
+# 4. Verify Docker / UFW presence on the host.
+ip link show | grep -E "^[0-9]+: (docker0|br-)" ; sudo ufw status 2>&1 | head -1
+# docker0 present OR ufw enabled → FORWARD DROP is highly likely.
+```
+
+**Workaround.** Insert two ACCEPT rules at the top of the FORWARD
+chain — one for traffic originating from the container subnet, one
+for traffic returning to it:
+
+```bash
+sudo iptables -I FORWARD 1 -s 10.0.0.0/24 -j ACCEPT
+sudo iptables -I FORWARD 1 -d 10.0.0.0/24 -j ACCEPT
+```
+
+Verify they landed:
+
+```bash
+sudo iptables -L FORWARD -n -v | head -4
+# Expected: two ACCEPT rules at positions 1 and 2, both for 10.0.0.0/24.
+```
+
+If the default subnet has been overridden via `--net-host-ip` /
+`--net-container-ip` / `--net-netmask`, substitute the actual subnet
+into both rules.
+
+After the rules are in place, re-run the failing command:
+
+```bash
+sudo ./minicontainer --pid --rootfs ./rootfs --net /bin/sh -c \
+    'curl -sS --connect-timeout 5 --max-time 20 \
+        -o /tmp/curl_out -w "%{http_code}\n" https://example.com'
+# Expected: 200
+```
+
+The short `--connect-timeout 5 --max-time 20` is important — without
+it, a still-broken FORWARD chain (or any other silent packet drop)
+will hang for ~2 minutes before curl's own default timeout fires,
+making the failure indistinguishable from a frozen process.
+
+**Persistence.** The two `iptables -I FORWARD` rules above do not
+survive a reboot or a manual `iptables -F`. Persistent installation is
+distribution-specific:
+
+- **Debian/Ubuntu:** `sudo apt install iptables-persistent` then
+  `sudo netfilter-persistent save`.
+- **RHEL/Fedora:** `sudo firewall-cmd --permanent --add-source=10.0.0.0/24`
+  + `sudo firewall-cmd --permanent --direct --add-rule ipv4 filter
+  FORWARD 0 -s 10.0.0.0/24 -j ACCEPT` then `sudo firewall-cmd
+  --reload`.
+
+minicontainer does not install or modify firewall persistence. By
+design, the runtime touches host firewall state only through its own
+MASQUERADE rule, which it creates on container start and removes on
+container exit.
+
+**Why minicontainer does not auto-install the FORWARD ACCEPT rules.**
+Inserting a wildcard `FORWARD ACCEPT` for `10.0.0.0/24` is a
+host-policy decision with broad blast radius:
+
+- Docker manages its own `DOCKER-USER` and `DOCKER-FORWARD` chains;
+  an unconditional ACCEPT at the top of FORWARD interacts with them
+  in ways the host operator may not want.
+- UFW and firewalld both treat their generated chains as the source
+  of truth; rules inserted directly via `iptables -I` are invisible to
+  their tooling and survive UFW/firewalld restarts in ways that
+  produce confusing state.
+- Reverting on container exit (the way the MASQUERADE rule is
+  reverted) is not safe: a long-running second container would lose
+  its FORWARD permission when an unrelated short-running container
+  cleaned up.
+
+The right place for a wildcard FORWARD policy decision is the host
+operator, not a short-lived container runtime. minicontainer's
+responsibility ends at the per-container NAT rule it owns.
+
+**Future:** A Phase 7+ `setup` or `doctor` subcommand could probe the
+FORWARD policy, warn loudly when DROP is in effect and no
+container-subnet ACCEPT exists, and offer to install the two rules
+above with explicit user confirmation. That is distinct from
+unconditional auto-insertion.
+
+---
+
 ## Future Considerations
 
 ### ✅ Phase 1: PID Namespace Isolation (Complete)
@@ -1701,8 +1926,14 @@ state-file convention.
   (Decision #26)
 - `cleanup_net()` stores `nat_source_cidr` in context for self-contained
   teardown (Decision #27)
-- `scripts/build_rootfs.sh`: `BINS` array extended to include `ip`
+- `scripts/build_rootfs.sh`: `BINS` array extended to include `ip`,
+  plus curl + CA bundle + NSS modules + resolv.conf for HTTPS client
+  testing from inside the container netns (Decision #29)
 - Unit tests (`test_net`) require root + iproute2
+- Operational prerequisite for `--net` curl/DNS traffic on hosts with
+  Docker, UFW, or firewalld installed: two `iptables -I FORWARD 1 ...
+  ACCEPT` rules permitting the container subnet — see Known Limitation
+  #8 for the diagnostic checklist and commands
 
 ---
 
