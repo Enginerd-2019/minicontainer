@@ -1,6 +1,6 @@
 // Note: _GNU_SOURCE is provided by the Makefile via -D_GNU_SOURCE.
 // Do NOT redefine it here (Error #8 from decisions.md).
-#include "cgroup.h"
+#include "net.h"        // Phase 6: was "cgroup.h" in Phase 5
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
@@ -28,7 +28,7 @@
  * function does not duplicate the string contents — they point into
  * defaults[] (static storage) or custom_env[] (caller's storage).
  *
- * @param custom_env  NULL-terminated array of "KEY=VALUE" strings, or NULL.
+ * @param custom_env    NULL-terminated array of "KEY=VALUE" strings, or NULL.
  * @param enable_debug  Print the final environment for inspection.
  * @return  Heap-allocated, NULL-terminated env array; NULL on allocation failure.
  */
@@ -101,9 +101,9 @@ static char **build_container_env(char *const *custom_env, bool enable_debug) {
         }
     }
 
-    /* Final NULL terminator. Strictly speaking calloc already placed one
-     * here, but explicit termination makes the contract clear and survives
-     * any future refactoring that might change the allocator. */
+    /* Final NULL terminator. calloc already placed one, but explicit
+     * termination makes the contract clear and survives any future
+     * refactoring. */
     env[count] = NULL;
 
     if (enable_debug) {
@@ -145,23 +145,31 @@ static long parse_cpu_limit(const char *str) {
 static void usage(const char *progname) {
     fprintf(stderr, "Usage: %s [OPTIONS] <command> [args...]\n", progname);
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  --debug              Enable debug output\n");
-    fprintf(stderr, "  --pid                Enable PID namespace\n");
-    fprintf(stderr, "  --rootfs <path>      Path to root filesystem\n");
-    fprintf(stderr, "  --overlay            Enable copy-on-write overlay\n");
-    fprintf(stderr, "  --container-dir <p>  Directory for overlay data (default: ./containers)\n");
-    fprintf(stderr, "  --hostname <name>    Set container hostname\n");
-    fprintf(stderr, "  --user               Enable user namespace (run without sudo)\n");
-    fprintf(stderr, "  --ipc                Enable IPC namespace\n");
-    fprintf(stderr, "  --memory <limit>   Memory limit (e.g., 100M, 1G)\n");
-    fprintf(stderr, "  --cpus <fraction>  CPU limit (e.g., 0.5 = 50%%)\n");
-    fprintf(stderr, "  --pids <max>       Max number of processes\n");
-    fprintf(stderr, "  --env KEY=VALUE      Set environment variable (repeatable)\n");
-    fprintf(stderr, "  --help               Show this help\n");
+    fprintf(stderr, "  --debug                  Enable debug output\n");
+    fprintf(stderr, "  --pid                    Enable PID namespace\n");
+    fprintf(stderr, "  --rootfs <path>          Path to root filesystem\n");
+    fprintf(stderr, "  --overlay                Enable copy-on-write overlay\n");
+    fprintf(stderr, "  --container-dir <p>      Directory for overlay data (default: ./containers)\n");
+    fprintf(stderr, "  --hostname <name>        Set container hostname\n");
+    fprintf(stderr, "  --user                   Enable user namespace (run without sudo)\n");
+    fprintf(stderr, "  --ipc                    Enable IPC namespace\n");
+    fprintf(stderr, "  --memory <limit>         Memory limit (e.g., 100M, 1G)\n");
+    fprintf(stderr, "  --cpus <fraction>        CPU limit (e.g., 0.5 = 50%%)\n");
+    fprintf(stderr, "  --pids <max>             Max number of processes\n");
+    /* Phase 6: new flags */
+    fprintf(stderr, "  --net                    Enable network namespace + veth pair\n");
+    fprintf(stderr, "  --net-host-ip <addr>     Host-side veth IP (default 10.0.0.1)\n");
+    fprintf(stderr, "  --net-container-ip <a>   Container-side veth IP (default 10.0.0.2)\n");
+    fprintf(stderr, "  --net-netmask <cidr>     CIDR suffix (default 24)\n");
+    fprintf(stderr, "  --no-nat                 Disable iptables MASQUERADE\n");
+    fprintf(stderr, "  --env KEY=VALUE          Set environment variable (repeatable)\n");
+    fprintf(stderr, "  --help                   Show this help\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  sudo %s --pid --rootfs ./rootfs --hostname web /bin/sh\n", progname);
     fprintf(stderr, "  %s --user --pid --ipc --hostname test /bin/sh  # No sudo needed\n", progname);
     fprintf(stderr, "  sudo %s --pid --memory 100M --cpus 0.5 --pids 20 /bin/sh\n", progname);
+    /* Phase 6: new example */
+    fprintf(stderr, "  sudo %s --pid --rootfs ./rootfs --net /bin/sh  # With network\n", progname);
 }
 
 int main(int argc, char *argv[]) {
@@ -177,30 +185,45 @@ int main(int argc, char *argv[]) {
     cgroup_limits_t limits = {0};
     bool enable_cgroup = false;
 
+    /* Phase 6: network namespace + veth locals */
+    bool enable_network = false;
+    char *net_host_ip = NULL;
+    char *net_container_ip = NULL;
+    char *net_netmask = NULL;
+    bool no_nat = false;
+
     // Phase 3 correction: collect --env flags
     char *custom_env[MAX_ENV_ENTRIES];
     int env_count = 0;
     memset(custom_env, 0, sizeof(custom_env));
 
     static struct option long_options[] = {
-        {"debug",         no_argument,       NULL, 'd'},
-        {"pid",           no_argument,       NULL, 'p'},
-        {"rootfs",        required_argument, NULL, 'r'},
-        {"overlay",       no_argument,       NULL, 'o'},
-        {"container-dir", required_argument, NULL, 'c'},
-        {"hostname",      required_argument, NULL, 'H'},
-        {"user",          no_argument,       NULL, 'u'},
-        {"ipc",           no_argument,       NULL, 'I'},
-        {"memory",        required_argument, NULL, 'm'},
-        {"cpus",          required_argument, NULL, 'C'},
-        {"pids",          required_argument, NULL, 'P'},
-        {"env",           required_argument, NULL, 'e'},
-        {"help",          no_argument,       NULL, 'h'},
+        {"debug",            no_argument,       NULL, 'd'},
+        {"pid",              no_argument,       NULL, 'p'},
+        {"rootfs",           required_argument, NULL, 'r'},
+        {"overlay",          no_argument,       NULL, 'o'},
+        {"container-dir",    required_argument, NULL, 'c'},
+        {"hostname",         required_argument, NULL, 'H'},
+        {"user",             no_argument,       NULL, 'u'},
+        {"ipc",              no_argument,       NULL, 'I'},
+        {"memory",           required_argument, NULL, 'm'},
+        {"cpus",             required_argument, NULL, 'C'},
+        {"pids",             required_argument, NULL, 'P'},
+        /* Phase 6: new flags. Numeric short-codes >= 1 follow the
+         * getopt_long(3) convention for long-only options. */
+        {"net",              no_argument,       NULL, 'N'},
+        {"net-host-ip",      required_argument, NULL,  1 },
+        {"net-container-ip", required_argument, NULL,  2 },
+        {"net-netmask",      required_argument, NULL,  3 },
+        {"no-nat",           no_argument,       NULL,  4 },
+        {"env",              required_argument, NULL, 'e'},
+        {"help",             no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:uIm:C:P:e:h",
+    /* Phase 6: added 'N' to the short-option string for --net */
+    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:uIm:C:P:Ne:h",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd':
@@ -240,6 +263,22 @@ int main(int argc, char *argv[]) {
                 limits.pid_limit = atoi(optarg);
                 enable_cgroup = true;
                 break;
+            /* Phase 6: new cases */
+            case 'N':
+                enable_network = true;
+                break;
+            case 1:
+                net_host_ip = optarg;
+                break;
+            case 2:
+                net_container_ip = optarg;
+                break;
+            case 3:
+                net_netmask = optarg;
+                break;
+            case 4:
+                no_nat = true;
+                break;
             case 'e':
                 if (env_count >= MAX_ENV_ENTRIES - 1) {
                     fprintf(stderr, "Too many --env entries\n");
@@ -272,6 +311,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Phase 6 invariant: --net sub-flags require --net. Without this check
+     * the IPs/netmask/no-nat would be silently ignored if --net is missing,
+     * which is confusing. Fail loudly instead. */
+    if ((net_host_ip || net_container_ip || net_netmask || no_nat)
+        && !enable_network) {
+        fprintf(stderr, "Error: --net-host-ip / --net-container-ip / "
+                        "--net-netmask / --no-nat require --net\n");
+        return 1;
+    }
+
     // Phase 3 correction §3.7: detect minicontainer flags that landed
     // after the command due to POSIX-strict (+) getopt stopping at the
     // first non-option argument. The '--' separator suppresses this check
@@ -284,10 +333,14 @@ int main(int argc, char *argv[]) {
     if (!explicit_separator) {
         // Keep in sync with long_options[].
         // Phase 5: added "--memory", "--cpus", "--pids"
+        // Phase 6: added "--net", "--net-host-ip", "--net-container-ip",
+        //                "--net-netmask", "--no-nat"
         static const char *known_flags[] = {
             "--debug", "--pid", "--rootfs", "--overlay",
             "--container-dir", "--hostname", "--user",
             "--ipc", "--memory", "--cpus", "--pids",
+            "--net", "--net-host-ip", "--net-container-ip",
+            "--net-netmask", "--no-nat",
             "--env", "--help", NULL
         };
 
@@ -317,7 +370,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Configure
-    cgroup_config_t config = {
+    net_config_t config = {
         .program = argv[optind],
         .argv = &argv[optind],
         .envp = container_env,
@@ -328,6 +381,7 @@ int main(int argc, char *argv[]) {
         .enable_uts_namespace = (hostname != NULL),
         .enable_user_namespace = enable_user_namespace,
         .enable_ipc_namespace = enable_ipc_namespace,
+        .enable_network = enable_network,             // Phase 6
         .rootfs_path = rootfs_path,
         .enable_overlay = enable_overlay,
         .container_dir = container_dir,
@@ -341,14 +395,37 @@ int main(int argc, char *argv[]) {
         .gid_map_range = 1,
         // Cgroup
         .cgroup_limits = limits,
-        .enable_cgroup = enable_cgroup
+        .enable_cgroup = enable_cgroup,
+        /* Phase 6: veth zero-initialized when --net is off.
+         * enable_nat defaults to true unless --no-nat was passed. */
+        .veth = {
+            .host_ip      = "",
+            .container_ip = "",
+            .netmask      = "",
+            .enable_nat   = !no_nat,
+        }
     };
 
-    // Execute
-    cgroup_result_t result = cgroup_exec(&config);
+    /* Phase 6: fill veth address fields only when --net is enabled.
+     * strncpy + the inline-zeroed buffers above keep the string
+     * NUL-terminated even at the buffer's maximum length. */
+    if (enable_network) {
+        strncpy(config.veth.host_ip,
+                net_host_ip ? net_host_ip : "10.0.0.1",
+                sizeof(config.veth.host_ip) - 1);
+        strncpy(config.veth.container_ip,
+                net_container_ip ? net_container_ip : "10.0.0.2",
+                sizeof(config.veth.container_ip) - 1);
+        strncpy(config.veth.netmask,
+                net_netmask ? net_netmask : "24",
+                sizeof(config.veth.netmask) - 1);
+    }
 
-    // Cleanup
-    cgroup_cleanup(&result);
+    // Execute (Phase 6: was cgroup_exec in Phase 5)
+    net_result_t result = net_exec(&config);
+
+    // Cleanup (Phase 6: was cgroup_cleanup in Phase 5)
+    net_cleanup(&result);
     free(container_env);
 
     // Handle result

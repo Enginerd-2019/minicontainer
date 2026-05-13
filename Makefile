@@ -1,5 +1,5 @@
 # Makefile for minicontainer - Minimal Container Runtime
-# Phase 5: cgroups v2 Resource Limits (builds on Phase 4c IPC, 4b User, 4 UTS)
+# Phase 6: Network Namespace (builds on Phase 5 cgroups, 4c IPC, 4b User, 4 UTS)
 
 CC       = gcc
 CFLAGS   = -Wall -Wextra -std=c11 -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
@@ -28,6 +28,7 @@ TEST_MOUNT     = test_mount
 TEST_OVERLAY   = test_overlay
 TEST_UTS       = test_uts
 TEST_CGROUP    = test_cgroup
+TEST_NET       = test_net
 
 # Default target
 .PHONY: all
@@ -44,12 +45,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
-# Link minicontainer (Phase 5: main + cgroup + uts + overlay + mount)
-# cgroup.c supersedes uts.c as the top-level exec module but imports
-# setup_uts, setup_user_namespace_mapping from uts.c, setup_overlay/
-# teardown_overlay from overlay.c, and setup_rootfs/mount_proc from mount.c.
-$(MINICONTAINER): $(BUILD_DIR)/main.o $(BUILD_DIR)/cgroup.o $(BUILD_DIR)/uts.o \
-                  $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
+# Phase 6: link net.o + cgroup.o + uts.o + overlay.o + mount.o
+$(MINICONTAINER): $(BUILD_DIR)/main.o $(BUILD_DIR)/net.o $(BUILD_DIR)/cgroup.o \
+                  $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(MINICONTAINER) successfully!"
 
@@ -86,9 +84,15 @@ $(TEST_CGROUP): $(BUILD_DIR)/test_cgroup.o $(BUILD_DIR)/cgroup.o \
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_CGROUP) successfully!"
 
+# Link test_net (Phase 6: network isolation)
+$(TEST_NET): $(BUILD_DIR)/test_net.o $(BUILD_DIR)/net.o $(BUILD_DIR)/cgroup.o \
+             $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_NET) successfully!"
+
 # Build and run all tests
 .PHONY: test
-test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP)
+test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET)
 	@echo "=== Running Phase 0 spawn tests ==="
 	./$(TEST_SPAWN)
 	@echo ""
@@ -111,6 +115,9 @@ test: $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) 
 	@echo ""
 	@echo "=== Running Phase 5 cgroup tests (requires root) ==="
 	sudo ./$(TEST_CGROUP)
+	@echo ""
+	@echo "=== Running Phase 6 network tests (requires root + iproute2) ==="
+	sudo ./$(TEST_NET)
 
 # Build with debug symbols
 .PHONY: debug
@@ -128,7 +135,7 @@ valgrind: debug
 .PHONY: clean
 clean:
 	@rm -rf $(BUILD_DIR)
-	@rm -f $(MINICONTAINER) $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP)
+	@rm -f $(MINICONTAINER) $(TEST_SPAWN) $(TEST_NAMESPACE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET)
 	@echo "Cleaned build artifacts"
 
 # Run example commands
@@ -182,15 +189,32 @@ examples: $(MINICONTAINER)
 	@echo "=== Example 16: Full isolation with cgroups ==="
 	sudo ./$(MINICONTAINER) --pid --rootfs ./rootfs --overlay --hostname web --ipc \
 	    --memory 100M --cpus 0.5 --pids 20 /bin/sh -c 'hostname && id'
+	@echo ""
+	@echo "=== Example 17: Network namespace (Phase 6, requires root) ==="
+	sudo ./$(MINICONTAINER) --pid --rootfs ./rootfs --net /bin/sh -c 'ip addr show'
+	@echo ""
+	@echo "=== Example 18: Network with custom subnet (Phase 6) ==="
+	sudo ./$(MINICONTAINER) --pid --rootfs ./rootfs --net \
+	    --net-host-ip 10.42.0.1 --net-container-ip 10.42.0.2 --net-netmask 30 \
+	    /bin/sh -c 'ip addr show && ip route'
+	@echo ""
+	@echo "=== Example 19: Network without NAT (Phase 6) ==="
+	sudo ./$(MINICONTAINER) --pid --rootfs ./rootfs --net --no-nat \
+	    /bin/sh -c 'ping -c 1 10.0.0.1'
+	@echo ""
+	@echo "=== Example 20: Full stack — every isolation + network ==="
+	sudo ./$(MINICONTAINER) --pid --rootfs ./rootfs --overlay --hostname web --ipc \
+	    --memory 100M --cpus 0.5 --pids 20 --net \
+	    /bin/sh -c 'hostname && id && ip addr show && ipcs'
 
 # Help target
 .PHONY: help
 help:
-	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 5)"
+	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 6)"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  all        - Build minicontainer (default)"
-	@echo "  test       - Build and run all tests (Phase 0 through Phase 5)"
+	@echo "  test       - Build and run all tests (Phase 0 through Phase 6)"
 	@echo "  debug      - Build with debug symbols (-g)"
 	@echo "  valgrind   - Run with valgrind memory checker"
 	@echo "  examples   - Run example commands"
@@ -208,6 +232,7 @@ help:
 	@echo "  sudo ./minicontainer --pid --ipc /bin/sh -c 'ipcs'                  # IPC isolated"
 	@echo "  ./minicontainer --user --pid --ipc --hostname test /bin/sh          # Rootless + IPC"
 	@echo "  sudo ./minicontainer --pid --memory 100M --cpus 0.5 /bin/sh         # cgroup limits (Phase 5)"
+	@echo "  sudo ./minicontainer --pid --rootfs ./rootfs --net /bin/sh          # Network namespace (Phase 6)"
 
 # Include auto-generated header dependencies
 -include $(DEPS)
