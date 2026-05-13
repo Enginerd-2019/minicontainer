@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-5%20cgroups%20v2-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-6%20network-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,15 +12,27 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current Phase:** Phase 5 - cgroups v2 (Resource Limits)
+**Current Phase:** Phase 6 - Network Namespace (veth pair + optional NAT)
 
-Building on Phase 4c's complete namespace isolation, this phase adds **resource control** via cgroups v2. Containers can now be limited in memory (`memory.max`), CPU bandwidth (`cpu.max`), and process count (`pids.max`) — defending the host from runaway containers, fork bombs, and OOM-killer chaos. Namespaces answer "what can the container see?"; cgroups answer "how much can it use?"
+Building on Phase 5's resource limits, this phase adds **network isolation** via `CLONE_NEWNET` plus a veth pair that bridges the host's network stack to the container. Each container gets its own loopback, routing table, and interface set; the host-side end of the veth pair stays in the root namespace with an IP on the same /24 (by default), and optional `iptables` MASQUERADE provides outbound internet access. Namespaces answer "what can the container see?"; cgroups answer "how much can it use?"; the network namespace answers "what can it talk to?"
 
 ---
 
 ## Features
 
-### Phase 5 (Current)
+### Phase 6 (Current)
+
+- ✅ **Network Namespace Isolation** - `CLONE_NEWNET` gives the container its own loopback, routing table, and interfaces
+- ✅ **`--net` Flag** - Enables `CLONE_NEWNET` and provisions a veth pair connecting the container to the host
+- ✅ **Veth Pair Networking** - Host end stays in root netns, container end is moved into the child via `ip link set ... netns <pid>`
+- ✅ **Default Subnet** - Host `10.0.0.1`, container `10.0.0.2`, `/24`; override with `--net-host-ip`, `--net-container-ip`, `--net-netmask`
+- ✅ **`--no-nat`** - Skip the `iptables` MASQUERADE rule (default-enabled) when outbound internet is not wanted
+- ✅ **`ip(8)` Driver** - Network setup uses `fork+exec` of the `ip` binary rather than netlink — pedagogical clarity over performance
+- ✅ **Three-Path `find_ip_binary()`** - Searches `/sbin/ip` → `/usr/sbin/ip` → `/bin/ip`, so the same helper works against the host (pre-clone) and the rootfs (post-pivot_root); requires `ip` in `BINS` of `build_rootfs.sh`
+- ✅ **`generate_veth_names()` Before clone()** - Names are baked into `child_args` before clone(), because clone() without `CLONE_VM` copies the parent's address space; post-clone parent writes are invisible to the child
+- ✅ **Widened Sync Pipe** - Created when `enable_user_namespace OR enable_network`, so veth move/configuration finishes before the child runs
+
+### Phase 5
 
 - ✅ **cgroups v2 Resource Control** - Limit memory, CPU, and process count per container
 - ✅ **`--memory <limit>`** - Memory ceiling (e.g., `100M`, `1G`); OOM-killed if exceeded
@@ -126,6 +138,22 @@ sudo ./minicontainer --pid --cpus 0.5 --pids 20 /bin/sh
 sudo ./minicontainer --pid --rootfs ./rootfs --overlay --hostname web --ipc \
     --memory 100M --cpus 0.5 --pids 20 /bin/sh
 
+# Network namespace (Phase 6) — default subnet 10.0.0.0/24, NAT on
+sudo ./minicontainer --pid --rootfs ./rootfs --net /bin/sh -c 'ip addr show'
+
+# Custom subnet for the veth pair
+sudo ./minicontainer --pid --rootfs ./rootfs --net \
+    --net-host-ip 10.42.0.1 --net-container-ip 10.42.0.2 --net-netmask 30 \
+    /bin/sh -c 'ip addr show && ip route'
+
+# Network namespace without iptables MASQUERADE (no outbound internet)
+sudo ./minicontainer --pid --rootfs ./rootfs --net --no-nat /bin/sh
+
+# Full stack: every isolation + cgroups + network
+sudo ./minicontainer --pid --rootfs ./rootfs --overlay --hostname web --ipc \
+    --memory 100M --cpus 0.5 --pids 20 --net \
+    /bin/sh -c 'hostname && id && ip addr show && ipcs'
+
 # Hostname isolation (container gets its own hostname)
 sudo ./minicontainer --rootfs ./rootfs --hostname mycontainer /bin/sh -c 'hostname'
 
@@ -163,6 +191,9 @@ any other flag (IPC isolation is only meaningful for workloads that use System V
 IPC or POSIX message queues, so auto-enabling would add overhead for the common
 case). Any of `--memory`/`--cpus`/`--pids` auto-enables the cgroup subsystem
 (`enable_cgroup`); supplying none of them skips cgroup setup entirely.
+`--net` is explicit opt-in (Phase 6) and the `--net-host-ip` /
+`--net-container-ip` / `--net-netmask` / `--no-nat` sub-flags **require** `--net`
+— passing them without `--net` is a hard error rather than a silent no-op.
 These flags are otherwise independent — `--hostname` does not imply
 `--overlay` and vice versa. For full isolation, combine them explicitly. Note
 that this auto-enable behavior is a `main.c` design choice; the underlying
@@ -185,7 +216,7 @@ sudo setcap cap_sys_admin+ep ./minicontainer
 ### Test
 
 ```bash
-# Run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5)
+# Run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5 + 6)
 make test
 
 # Run example commands
@@ -202,6 +233,7 @@ make valgrind
 ```
 minicontainer/
 ├── include/
+│   ├── net.h                # Phase 6: Network namespace, veth pair, NAT API
 │   ├── cgroup.h             # Phase 5: cgroups v2 resource limits API
 │   ├── uts.h                # Phase 4/4b/4c: UTS + user + IPC namespace API
 │   ├── overlay.h            # Phase 3: OverlayFS, environment, fd cleanup API
@@ -210,6 +242,7 @@ minicontainer/
 │   └── spawn.h              # Phase 0: Process spawning API
 ├── src/
 │   ├── main.c               # CLI entry point and argument parsing
+│   ├── net.c                # Phase 6: net namespace, veth setup, ip(8) driver (supersedes cgroup.c)
 │   ├── cgroup.c             # Phase 5: cgroup setup/teardown, clone/exec (supersedes uts.c)
 │   ├── uts.c                # Phase 4/4b/4c: UTS + user + IPC namespace, sync pipe
 │   ├── overlay.c            # Phase 3: OverlayFS, close_inherited_fds
@@ -217,6 +250,7 @@ minicontainer/
 │   ├── namespace.c          # Phase 1: clone() + PID namespace logic
 │   └── spawn.c              # Phase 0: fork/execve implementation
 ├── tests/
+│   ├── test_net.c           # Phase 6: namespace creation, backward compat, net + cgroup (requires root)
 │   ├── test_cgroup.c        # Phase 5: cgroup lifecycle, memory/CPU/PID limits (requires root)
 │   ├── test_uts.c           # Phase 4/4b/4c: UTS + user + IPC namespace tests
 │   ├── test_overlay.c       # Phase 3: Overlay/env/fd tests (requires root + rootfs)
@@ -224,7 +258,7 @@ minicontainer/
 │   ├── test_namespace.c     # Phase 1: Namespace tests (requires root)
 │   └── test_spawn.c         # Phase 0: Spawn tests
 ├── scripts/
-│   └── build_rootfs.sh      # Builds minimal rootfs from host binaries
+│   └── build_rootfs.sh      # Builds minimal rootfs from host binaries (BINS includes `ip` for Phase 6)
 ├── docs/
 │   └── decisions.md         # Design decisions and error log
 ├── Makefile                 # Build system
@@ -241,33 +275,42 @@ minicontainer/
 ┌──────────────────────────────────────────────────────┐
 │                main.c (CLI Layer)                    │
 │  • Parses --pid, --rootfs, --overlay, --hostname,    │
-│    --memory, --cpus, --pids, etc.                    │
+│    --memory, --cpus, --pids, --net, --net-host-ip,   │
+│    --net-container-ip, --net-netmask, --no-nat, etc. │
 │  • build_container_env() — clean environment         │
 │  • Misplaced flag detection                          │
-│  • Calls cgroup_exec()                               │
+│  • Calls net_exec()                                  │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
 ┌──────────────────────────────────────────────────────┐
-│          cgroup.c (Orchestration Layer)              │
+│            net.c (Orchestration Layer)               │
+│  • generate_veth_names() BEFORE clone()              │
 │  • setup_cgroup() → mkdir /sys/fs/cgroup/...         │
 │    write memory.max, cpu.max, pids.max               │
 │  • setup_overlay() → mount OverlayFS (from overlay.c)│
 │  • clone() with NEWPID|NEWNS|NEWUTS|NEWUSER|NEWIPC   │
-│  • Sync pipe: write UID/GID maps, signal child       │
+│    |NEWNET                                           │
+│  • setup_net() → ip link add veth pair, move         │
+│    container end into child netns, host IP + NAT     │
+│  • Sync pipe: UID/GID maps + signal once netns is    │
+│    fully provisioned (widened to OR --net)           │
 │  • add_pid_to_cgroup() → write cgroup.procs          │
 │  • waitpid() and exit status parsing                 │
 │  • teardown_overlay() → unmount and cleanup          │
+│  • cleanup_net() → delete host veth + iptables rule  │
 │  • remove_cgroup() → rmdir /sys/fs/cgroup/...        │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
 ┌──────────────────────────────────────────────────────┐
 │            Child Process (child_func)                │
-│  • Wait on sync pipe (if --user) for UID/GID maps    │
+│  • Wait on sync pipe (if --user OR --net)            │
 │  • setup_uts(): sethostname() in new UTS namespace   │
 │  • setup_rootfs(): pivot_root to new rootfs          │
 │  • mount_proc(): mount /proc (warning if user ns)    │
+│  • configure_container_net(): lo up, IP add to       │
+│    veth_c, default route via host_ip                 │
 │  • close_inherited_fds(): close leaked parent fds    │
 │  • execve() with clean container environment         │
 └──────────────────────────────────────────────────────┘
@@ -282,6 +325,7 @@ minicontainer/
 - Phase 4b: `uts.c` extended with `CLONE_NEWUSER`, sync pipe, UID/GID mapping (no new module — see code duplication note)
 - Phase 4c: `uts.c` extended with `CLONE_NEWIPC` (one flag, zero new child-side code)
 - Phase 5: `cgroup.c` (cgroups v2 resource limits), supersedes `uts.c` as exec module, imports `setup_uts`/`setup_user_namespace_mapping` from `uts.h` and overlay/mount helpers
+- Phase 6: `net.c` (`CLONE_NEWNET` + veth pair + optional MASQUERADE), supersedes `cgroup.c` as exec module, imports `setup_cgroup`/`add_pid_to_cgroup`/`remove_cgroup` from `cgroup.h` and the rest of the chain
 - Earlier modules retained for their respective phase tests
 
 **Note on code duplication:** Each phase's `*_exec()` function (e.g., `overlay_exec`, `uts_exec`) shares ~90% of its structure with the previous phase — `clone()`, `waitpid()`, stack allocation, and exit status parsing are repeated each time. This is a deliberate pedagogical choice: each module is self-contained and readable without cross-referencing earlier phases. A production runtime would factor this into a shared execution core, and this refactoring is planned for Phase 7 (CLI & Lifecycle).
@@ -290,7 +334,7 @@ minicontainer/
 
 **Configuration structure:**
 ```c
-cgroup_config_t config = {
+net_config_t config = {
     .program = "/bin/sh",
     .argv = argv,                     // NULL-terminated array
     .envp = env,                      // From build_container_env()
@@ -317,13 +361,21 @@ cgroup_config_t config = {
         .cpu_quota = 50000,                  // 50% of one core
         .cpu_period = 100000,                // (over 100ms period)
         .pid_limit = 20                      // Max 20 processes
+    },
+    // Phase 6: network namespace + veth pair
+    .enable_network = true,           // Use CLONE_NEWNET
+    .veth = {
+        .host_ip      = "10.0.0.1",
+        .container_ip = "10.0.0.2",
+        .netmask      = "24",
+        .enable_nat   = true              // iptables MASQUERADE for outbound
     }
 };
 ```
 
 **Result structure:**
 ```c
-cgroup_result_t result = cgroup_exec(&config);
+net_result_t result = net_exec(&config);
 
 if (result.exited_normally) {
     printf("Exit code: %d\n", result.exit_status);
@@ -331,12 +383,54 @@ if (result.exited_normally) {
     printf("Killed by signal %d\n", result.signal);  // 137 = OOM-killed
 }
 
-cgroup_cleanup(&result);  // Remove cgroup dir + free clone stack
+net_cleanup(&result);  // Tear down veth + NAT, remove cgroup, free stack
 ```
 
 ---
 
 ## How It Works
+
+### Network Namespace + veth Pair (Phase 6)
+
+```
+Host Network Namespace (root netns)              Container Network Namespace
+┌──────────────────────────────────────┐         ┌──────────────────────────────┐
+│  eth0  (real NIC, 192.168.x.x)       │         │  lo                          │
+│                                      │         │                              │
+│  veth_h_<id>  10.0.0.1/24            │◄═══════►│  veth_c_<id>  10.0.0.2/24    │
+│       │                              │  veth   │       │                      │
+│       │                              │  pair   │       │ default route via    │
+│       ▼                              │         │       │ 10.0.0.1             │
+│  iptables -t nat -A POSTROUTING      │         │       ▼                      │
+│  -s 10.0.0.0/24 -j MASQUERADE        │         │  10.0.0.0/24 dev veth_c_<id> │
+│  (skipped under --no-nat)            │         │                              │
+└──────────────────────────────────────┘         └──────────────────────────────┘
+```
+
+**Setup ordering (parent side):**
+
+1. `generate_veth_names(&ctx)` — BEFORE `clone()`. Names like `veth_h_a1b2` and
+   `veth_c_a1b2` get baked into `child_args`. Clone without `CLONE_VM` copies
+   the parent's address space; anything the parent writes to `child_args`
+   AFTER clone is invisible to the child.
+2. `clone(CLONE_NEWNET | …)` — child is born in a fresh, empty netns.
+3. `setup_net()` — parent runs `ip link add` to create the pair, then
+   `ip link set veth_c_<id> netns <child_pid>` to move the container end into
+   the child's netns; assigns `host_ip` to `veth_h_<id>`, brings it up;
+   optionally appends the `MASQUERADE` rule.
+4. Sync pipe write — child unblocks only after the veth has been moved.
+5. Child runs `configure_container_net()`: `lo` up, IP add to `veth_c_<id>`,
+   default route via `host_ip`.
+
+**Teardown (`cleanup_net()`):** delete `veth_h_<id>` (the kernel removes the
+container end automatically when the netns is destroyed at child exit), delete
+the iptables NAT rule using the CIDR stored in `ctx->nat_source_cidr` (so
+cleanup is self-contained and doesn't need the original `veth_config_t`).
+
+**`find_ip_binary()`** searches `/sbin/ip` → `/usr/sbin/ip` → `/bin/ip` so the
+same helper resolves both pre-clone (against the host filesystem) and
+post-pivot_root (against the rootfs — `build_rootfs.sh` puts `ip` at
+`/bin/ip`).
 
 ### OverlayFS Copy-on-Write (Phase 3)
 
@@ -418,6 +512,9 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 
 | System Call | Purpose | Phase |
 |-------------|---------|-------|
+| `clone(CLONE_NEWNET)` | New network namespace — empty interface and routing tables | 6 |
+| `fork()` + `execve("ip")` | Drive veth creation, address assignment, route install, namespace move | 6 |
+| `fork()` + `execve("iptables")` | Append/delete `MASQUERADE` rule for outbound NAT (optional) | 6 |
 | `mkdir()` / `rmdir()` | Create/destroy cgroup directory under `/sys/fs/cgroup/` | 5 |
 | `write()` (to cgroup files) | Set `memory.max`/`cpu.max`/`pids.max`; add PID to `cgroup.procs` | 5 |
 | `clock_gettime()` | Generate unique cgroup name from timestamp + nanoseconds | 5 |
@@ -430,7 +527,7 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 | `pivot_root()` | Swaps root filesystem for the container | 2 |
 | `mount()` | Bind mounts rootfs, sets propagation, mounts `/proc` | 2 |
 | `umount2()` | Lazily unmounts old root and overlay (`MNT_DETACH`) | 2, 3 |
-| `clone()` | Creates child with namespace flags (`NEWPID`, `NEWNS`, `NEWUTS`, `NEWUSER`, `NEWIPC`) | 1–4c |
+| `clone()` | Creates child with namespace flags (`NEWPID`, `NEWNS`, `NEWUTS`, `NEWUSER`, `NEWIPC`, `NEWNET`) | 1–6 |
 | `fork()` | Creates a new process (duplicate of parent) | 0 |
 | `execve()` | Replaces process image with new program | 0–4c |
 | `waitpid()` | Waits for child to exit and reaps zombie | 0–4c |
@@ -440,7 +537,46 @@ The same process has **two PIDs**: one in the host namespace (real) and one in t
 
 ## Usage Examples
 
-### Example 1: cgroup Resource Limits (Phase 5)
+### Example 1: Network Namespace (Phase 6)
+
+```bash
+# Default subnet 10.0.0.0/24, host 10.0.0.1, container 10.0.0.2, NAT on
+$ sudo ./minicontainer --pid --rootfs ./rootfs --net /bin/sh -c 'ip addr show'
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 ...
+    inet 127.0.0.1/8 scope host lo
+2: veth_c_a1b2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 ...
+    inet 10.0.0.2/24 scope global veth_c_a1b2
+
+# Host side after exit: veth_h_<id> is gone, NAT rule is gone
+$ ip link show | grep veth_h_  # (no output)
+$ sudo iptables -t nat -S POSTROUTING | grep 10.0.0  # (no output)
+
+# Custom subnet — useful when 10.0.0.0/24 conflicts with another network
+$ sudo ./minicontainer --pid --rootfs ./rootfs --net \
+    --net-host-ip 10.42.0.1 --net-container-ip 10.42.0.2 --net-netmask 30 \
+    /bin/sh -c 'ip route'
+default via 10.42.0.1 dev veth_c_a1b2
+10.42.0.0/30 dev veth_c_a1b2 scope link
+
+# --no-nat: container can reach the host's veth_h_<id> end but has no
+# outbound internet (no MASQUERADE rule appended)
+$ sudo ./minicontainer --pid --rootfs ./rootfs --net --no-nat \
+    /bin/sh -c 'ping -c 1 10.0.0.1'   # works
+$ sudo ./minicontainer --pid --rootfs ./rootfs --net --no-nat \
+    /bin/sh -c 'ping -c 1 8.8.8.8'    # times out
+
+# Sub-flag validation — passing --net-host-ip without --net is a hard error
+$ sudo ./minicontainer --pid --net-host-ip 10.42.0.1 /bin/sh
+Error: --net-host-ip / --net-container-ip / --net-netmask / --no-nat require --net
+```
+
+**Setup ordering matters:** `generate_veth_names()` runs *before* `clone()` so
+the names live in `child_args`; the parent's `setup_net()` moves
+`veth_c_<id>` into the child's netns and only then signals the sync pipe; the
+child runs `configure_container_net()` (lo up, IP add, default route) once
+unblocked. See "How It Works → Network Namespace + veth Pair" above.
+
+### Example 2: cgroup Resource Limits (Phase 5)
 
 ```bash
 # Memory limit: container OOM-killed when it exceeds 100MB
@@ -477,7 +613,7 @@ parent adds the child PID to `cgroup.procs`. After `waitpid()` returns, the
 cgroup directory is `rmdir()`'d. Missed cleanup is a resource leak — see
 Troubleshooting if `/sys/fs/cgroup/minicontainer_*` accumulates entries.
 
-### Example 2: IPC Namespace Isolation (Phase 4c)
+### Example 3: IPC Namespace Isolation (Phase 4c)
 
 ```bash
 # Host: create a shared memory segment
@@ -506,7 +642,7 @@ namespace** (Phase 2 `/dev/shm`), not by `CLONE_NEWIPC`. The IPC namespace
 covers System V IPC and POSIX message queues only. See decisions.md for
 details.
 
-### Example 3: Hostname Isolation (Phase 4)
+### Example 4: Hostname Isolation (Phase 4)
 
 ```bash
 # Host hostname is unchanged
@@ -530,7 +666,7 @@ hello
 # rootfs is untouched, hostname was scoped to the container
 ```
 
-### Example 4: OverlayFS — Base Image Untouched (Phase 3)
+### Example 5: OverlayFS — Base Image Untouched (Phase 3)
 
 ```bash
 # Create a marker in the base image
@@ -546,7 +682,7 @@ $ cat rootfs/tmp/marker.txt
 original
 ```
 
-### Example 5: Clean Container Environment (Phase 3)
+### Example 6: Clean Container Environment (Phase 3)
 
 ```bash
 # Container sees minimal environment, not host's 30+ variables
@@ -562,7 +698,7 @@ $ sudo ./minicontainer --rootfs ./rootfs --overlay \
 production
 ```
 
-### Example 6: Debug Mode with Overlay (Phase 3)
+### Example 7: Debug Mode with Overlay (Phase 3)
 
 ```bash
 $ sudo ./minicontainer --debug --rootfs ./rootfs --overlay /bin/echo "Hello"
@@ -585,7 +721,7 @@ Hello
 [overlay] Cleanup complete
 ```
 
-### Example 7: PID Namespace Isolation (Phase 1)
+### Example 8: PID Namespace Isolation (Phase 1)
 
 ```bash
 # Without --pid: shell reports its real PID
@@ -597,14 +733,14 @@ $ sudo ./minicontainer --pid /bin/sh -c 'echo $$'
 1
 ```
 
-### Example 8: Basic Command Execution
+### Example 9: Basic Command Execution
 
 ```bash
 $ ./minicontainer /bin/echo "Hello from minicontainer"
 Hello from minicontainer
 ```
 
-### Example 9: Exit Code Handling
+### Example 10: Exit Code Handling
 
 ```bash
 $ ./minicontainer /bin/false
@@ -666,6 +802,11 @@ make test
 - ✓ PID limit (fork bomb defense — kernel returns EAGAIN at the cap)
 - ✓ Backward compatibility (no cgroup, Phase 4c behavior)
 - ✓ Cgroup combined with IPC namespace (all isolation layers active)
+
+**Phase 6 tests** (`test_net` - requires root + iproute2):
+- ✓ Network namespace creation (`CLONE_NEWNET` + veth pair, container sees `veth_c_<id>`)
+- ✓ Backward compatibility (no `--net`, Phase 5 behavior preserved)
+- ✓ Network namespace combined with cgroup (veth + memory/cpu/pids active simultaneously)
 
 ### Manual Testing
 
@@ -743,6 +884,12 @@ Following shell/POSIX conventions:
 ## Design Decisions
 
 See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
+- Why `net.c` is a separate module (supersedes `cgroup.c`, imports its API)
+- Why network setup uses `fork+exec` of `ip(8)` instead of raw netlink (pedagogical clarity > performance)
+- Three-path `find_ip_binary()` search — same helper used pre-clone (host) and post-pivot_root (rootfs)
+- Why `generate_veth_names()` runs BEFORE `clone()` (clone copies the parent's address space)
+- Why the sync pipe is widened to fire on `enable_user_namespace OR enable_network` (veth move must finish before the child runs)
+- Why `cleanup_net()` stores `nat_source_cidr` in the context (so cleanup doesn't need the original config)
 - Why `cgroup.c` is a separate module (vs. extending `uts.c` like Phase 4b/4c)
 - `build_container_env()` defensive refactor for Phase 7 extraction (Decision #21)
 - Cgroup three-phase lifecycle (create before clone, add PID after, remove after exit)
@@ -777,6 +924,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 9. **No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
 10. ~~**No hostname isolation**~~ — **Fixed in Phase 4** via `CLONE_NEWUTS` and `--hostname`
 11. ~~**No resource limits**~~ — **Fixed in Phase 5** via cgroups v2 (`--memory`, `--cpus`, `--pids`). Cgroup operations require root (`/sys/fs/cgroup/` is root-owned); `--user` does not grant write access there.
+12. ~~**No network isolation**~~ — **Fixed in Phase 6** via `CLONE_NEWNET` + veth pair (`--net`). Network setup uses `fork+exec` of `ip(8)` (and optionally `iptables`), so the host must have `iproute2` installed; the rootfs must include `/bin/ip` (handled by `BINS` in `build_rootfs.sh`). `--net` requires root because veth creation, namespace move, and iptables manipulation all need `CAP_NET_ADMIN` in the root user namespace.
 
 ---
 
@@ -837,7 +985,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] POSIX message queues isolated (via `/dev/mqueue` in new namespace)
 - [x] Unit tests (`test_ipc_isolation` root; `test_ipc_with_user_namespace` rootless)
 
-### ✅ Phase 5: cgroups v2 — Resource Limits (Current)
+### ✅ Phase 5: cgroups v2 — Resource Limits
 - [x] New `cgroup.c`/`cgroup.h` module supersedes `uts.c` as exec path
 - [x] Three-phase cgroup lifecycle: create → add PID → remove
 - [x] `memory.max` limit (`--memory <100M|1G>`); OOM kill at exit code 137
@@ -847,10 +995,18 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] `build_container_env()` defensive refactor (decisions.md #21)
 - [x] Unit tests (`test_cgroup` requires root)
 
-### 📋 Phase 6: Network Isolation
-- [ ] CLONE_NEWNET for network namespace
-- [ ] veth pairs and bridges
-- [ ] Port forwarding
+### ✅ Phase 6: Network Namespace (Current)
+- [x] New `net.c`/`net.h` module supersedes `cgroup.c` as exec path
+- [x] `CLONE_NEWNET` — container gets its own loopback, routing table, interfaces
+- [x] veth pair created via `ip link add`; container end moved with `ip link set ... netns <pid>`
+- [x] `--net` flag plus `--net-host-ip` / `--net-container-ip` / `--net-netmask` / `--no-nat`
+- [x] Default subnet `10.0.0.0/24` (host `10.0.0.1`, container `10.0.0.2`)
+- [x] Optional `iptables -t nat -A POSTROUTING -j MASQUERADE` for outbound internet
+- [x] `find_ip_binary()` three-path search (`/sbin/ip` → `/usr/sbin/ip` → `/bin/ip`)
+- [x] `generate_veth_names()` runs **before** `clone()` (clone copies address space)
+- [x] Sync pipe widened to fire on `enable_user_namespace OR enable_network`
+- [x] `cleanup_net()` deletes host veth + iptables rule (kernel handles container end at netns destruction)
+- [x] Unit tests (`test_net` requires root + iproute2)
 
 ### 📋 Phase 7: CLI & Lifecycle
 - [ ] Container lifecycle management
@@ -870,7 +1026,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 
 ```bash
 make              # Build minicontainer
-make test         # Build and run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5)
+make test         # Build and run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5 + 6)
 make clean        # Remove build artifacts
 make debug        # Build with debug symbols (-g)
 make valgrind     # Run memory leak detection
@@ -902,6 +1058,10 @@ make help         # Show all available targets
 
 ### Man Pages (Essential Reading)
 ```bash
+man 7 network_namespaces # Network namespace details (Phase 6)
+man 8 ip                 # iproute2 — link/addr/route/netns subcommands (Phase 6)
+man 8 iptables           # NAT (MASQUERADE), filter rules (Phase 6 outbound)
+man 8 iptables-extensions # nat table specifics (Phase 6)
 man 7 cgroups         # cgroup overview, v1 vs v2, controllers (Phase 5)
 man 5 cgroup.controllers # File interface for memory.max/cpu.max/pids.max (Phase 5)
 man 7 ipc_namespaces  # IPC namespace details (Phase 4c)
@@ -935,6 +1095,112 @@ man 7 pid_namespaces  # PID namespace details
 ---
 
 ## Troubleshooting
+
+### "find_ip_binary: not found" (Phase 6)
+
+**Problem:** `net.c` cannot locate the `ip` binary at any of `/sbin/ip`,
+`/usr/sbin/ip`, or `/bin/ip`.
+
+**Cause:** Either iproute2 is missing on the host, or the rootfs is missing
+`/bin/ip` (which is where `scripts/build_rootfs.sh` places it). The same
+helper is called twice: once parent-side against the host, once child-side
+against the rootfs (post-pivot_root), so a failure on either side trips the
+same error.
+
+**Solution:**
+```bash
+# Host
+sudo apt-get install iproute2
+
+# Rootfs: rebuild so `ip` ends up in /bin/ip
+./scripts/build_rootfs.sh
+ls rootfs/bin/ip   # should exist
+```
+
+`BINS=(... ip ...)` in `build_rootfs.sh` is the canonical place for this;
+removing `ip` from `BINS` will break Phase 6.
+
+---
+
+### "RTNETLINK answers: File exists" when creating veth (Phase 6)
+
+**Problem:** `ip link add` fails because a veth with the chosen name already
+exists. minicontainer generates names like `veth_h_<6 hex>` from
+`/dev/urandom`, so collisions are astronomically unlikely; if you see this,
+something else is wrong.
+
+**Causes:**
+1. A previous container crashed mid-setup and left a stale `veth_h_<id>`.
+2. Another process is holding the name.
+
+**Solution:**
+```bash
+# Find and remove stale veths
+ip link show | grep veth_h_
+sudo ip link delete veth_h_a1b2  # by name
+
+# As a nuclear option, remove every minicontainer veth
+for v in $(ip -o link show | awk -F: '/veth_h_/ {print $2}'); do
+    sudo ip link delete $v
+done
+```
+
+A `minicontainer cleanup` subcommand (Phase 7) will handle this automatically.
+
+---
+
+### `--net` works but container has no internet (Phase 6)
+
+**Problem:** Container can ping `10.0.0.1` (the host end of the veth) but
+external IPs (e.g., `8.8.8.8`) time out.
+
+**Causes:**
+1. `--no-nat` was passed — by design no `MASQUERADE` rule is added.
+2. Host's `net.ipv4.ip_forward` is 0 (kernel won't forward across interfaces).
+3. A host firewall (`ufw`, `firewalld`, custom `iptables`) is dropping
+   forwarded traffic.
+
+**Solution:**
+```bash
+# Enable IP forwarding (transient)
+sudo sysctl -w net.ipv4.ip_forward=1
+
+# Or persistently: /etc/sysctl.d/10-ip-forward.conf
+echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/10-ip-forward.conf
+
+# Inspect firewall
+sudo iptables -L FORWARD -v
+sudo iptables -t nat -L POSTROUTING -v
+```
+
+---
+
+### "Error: --net-host-ip ... require --net" (Phase 6)
+
+**Problem:** You passed `--net-host-ip` / `--net-container-ip` /
+`--net-netmask` / `--no-nat` without `--net`.
+
+**This is intentional.** Silently ignoring sub-flags would mask typos. Either
+add `--net`, or drop the sub-flags.
+
+---
+
+### IP-pair conflicts with an existing network
+
+**Problem:** Default `10.0.0.0/24` overlaps a VPN, Docker bridge, or LAN.
+
+**Solution:** Pick a different subnet:
+```bash
+sudo ./minicontainer --pid --rootfs ./rootfs --net \
+    --net-host-ip 172.30.0.1 --net-container-ip 172.30.0.2 \
+    --net-netmask 30 /bin/sh
+```
+
+A `/30` is the smallest useful pair (network/broadcast eat two addresses,
+leaving exactly two host addresses — one for the host end, one for the
+container end).
+
+---
 
 ### "mount(overlay): No such device"
 

@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 5 - cgroups v2 (Resource Limits)
-**Last Updated:** 2026-05-11
+**Phase:** 6 - Network Namespace (veth pair + optional NAT)
+**Last Updated:** 2026-05-13
 
 ---
 
@@ -585,12 +585,263 @@ preemptively; the former waits for proof of necessity.
 
 **Files affected:**
 - `src/main.c` — `build_container_env()` rewritten in-place
-- `phase5_cgroups_implementation_guide.md` §3.7 — full rationale with worked
-  comparison
-- `SRE.md` §5.4 and §8.4 — SRE framing as "code that survives" and risk-budget
-  decision
 
 **Fix Applied:** 2026-05-11
+
+---
+
+### 22. Superseding cgroup.c with net.c (Phase 6)
+
+**Decision:** Phase 6 follows the same supersede pattern established in
+Decisions #7, #9, #13, #16, #21: create a new `net.c`/`net.h` module that
+becomes the top-level `*_exec()` entry point, with `cgroup.c` (Phase 5)
+retained and imported for its lifecycle helpers (`setup_cgroup`,
+`add_pid_to_cgroup`, `remove_cgroup`).
+
+**Rationale:**
+- **Reader continuity:** A reader who learned `cgroup.c`'s structure should
+  recognize `net.c` as "Phase 5 plus network." The duplication (its own
+  `child_args_t`, `child_func()`, `close_inherited_fds()`, ~90% of
+  `*_exec()` boilerplate) is deliberate and matches Decisions #7/#9/#13/#16.
+- **Phase 5's `cgroup_exec()` stays valid.** `test_cgroup` and any future
+  consumer of the Phase 5 API still compile and link unchanged.
+- **No premature consolidation.** The repeated boilerplate is the explicit
+  motivation for Phase 7's planned execution-core refactor (`core.c`).
+  Phase 6 does NOT attempt that consolidation — adding a refactor on top
+  of a new feature in the same phase would obscure both.
+
+**Trade-offs:**
+- Five copies of `child_func()` now exist (`namespace.c`, `mount.c`,
+  `overlay.c`, `uts.c`, `cgroup.c`, `net.c`). Phase 7a will collapse them
+  to one. Until then, the symmetry is the documentation.
+
+**Files affected:**
+- `src/net.c`, `include/net.h` — new
+- `src/main.c` — top-level config/result/exec/cleanup switched from `cgroup_*`
+  to `net_*`
+- `tests/test_net.c` — new
+
+**Fix Applied:** 2026-05-12
+
+---
+
+### 23. fork+exec ip(8) Instead of Raw Netlink (Phase 6)
+
+**Decision:** Drive veth pair creation, IP assignment, route install, and
+netns move via `fork+exec` of the `ip` binary (and `iptables` for NAT)
+rather than emitting netlink messages directly with `AF_NETLINK` /
+`NETLINK_ROUTE` sockets.
+
+**Rationale:**
+- **Pedagogy over performance.** Each `ip` invocation maps to a single,
+  greppable line that a learner can run from a shell. A learner can stop
+  minicontainer mid-setup and re-run any step manually — netlink has no
+  such inspect-and-replay surface.
+- **Correctness via the canonical tool.** `iproute2` already encodes the
+  kernel's preferred syscall sequence (RTM_NEWLINK with IFLA_LINKINFO
+  attributes, RTM_SETLINK with IFLA_NET_NS_PID, RTM_NEWADDR with
+  IFA_LOCAL/IFA_ADDRESS, etc.). Re-implementing it is non-trivial and
+  every bug is a CVE.
+- **`fork+exec` is the cost we already pay.** `clone()` is the project's
+  central abstraction; an additional 5–6 `fork+execve` pairs during setup
+  is rounding error relative to the work each container does.
+
+**Trade-offs:**
+- **Latency:** ~50ms per `ip` invocation × ~5 calls = ~250ms of setup
+  overhead per container. Acceptable for educational use; would matter for
+  a production runtime spawning thousands of containers/sec.
+- **Dependency:** the host needs `iproute2` installed, and the rootfs needs
+  `/bin/ip` (see §0 Prerequisites and Decision #24).
+- **Error handling:** parsing `ip`'s exit status is coarse-grained
+  compared to netlink's per-message ACK/NACK semantics. We accept this.
+
+**Files affected:**
+- `src/net.c` — `run_ip_command()`, `run_iptables_command()` helpers wrap
+  `fork+execve`
+
+**Fix Applied:** 2026-05-12
+
+---
+
+### 24. Three-Path `find_ip_binary()` Search (Phase 6)
+
+**Decision:** `find_ip_binary()` searches for the `ip` binary in three
+locations, in order: `/sbin/ip` → `/usr/sbin/ip` → `/bin/ip`. The same
+function is called from BOTH sides of `clone()`: parent-side BEFORE
+`clone()` (against the host filesystem) and child-side AFTER `pivot_root`
+(against the rootfs).
+
+**Rationale:**
+- **Two filesystems, one helper.** Pre-clone, the host is the filesystem
+  in scope — and on Ubuntu/Debian/RHEL, `ip` lives at `/sbin/ip` or
+  `/usr/sbin/ip`. Post-`pivot_root`, the rootfs is the filesystem in
+  scope — and `scripts/build_rootfs.sh` puts every entry in `BINS` at
+  `/bin/<name>`, so the container's `ip` is at `/bin/ip`.
+- **One helper, not two.** Having a single function with a multi-path
+  search keeps the parent and child code identical at the call site
+  (`const char *ip = find_ip_binary(); if (!ip) return -1;`) and means
+  there's no risk of the parent and child accidentally diverging on
+  which paths they consider valid.
+
+**Trade-offs:**
+- **Implicit ordering:** if both `/sbin/ip` and `/bin/ip` exist
+  simultaneously, the host's wins. This is the right call (the host's
+  `iproute2` is what was tested against), but worth noting.
+
+**Files affected:**
+- `src/net.c` — `find_ip_binary()` (static)
+- `scripts/build_rootfs.sh` — `BINS` array includes `ip`
+
+**Related:** This was caught and corrected in Error #17. The initial draft
+of `find_ip_binary()` only checked `/sbin/ip` and `/usr/sbin/ip`, which
+broke the child-side lookup inside the rootfs.
+
+**Fix Applied:** 2026-05-12
+
+---
+
+### 25. `generate_veth_names()` Runs BEFORE `clone()` (Phase 6)
+
+**Decision:** Veth interface names (`veth_h_<6 hex>` for the host end,
+`veth_c_<6 hex>` for the container end) are generated by the parent
+BEFORE calling `clone()`, written into `child_args.net_ctx`, and read
+unchanged by the child after the sync pipe unblocks.
+
+**Rationale (the bug this prevents):**
+
+`clone()` without `CLONE_VM` gives the child a COPY of the parent's
+address space, not a shared view. Anything the parent writes to
+`child_args` (or any other pointer-reachable object) AFTER `clone()`
+returns is INVISIBLE to the child. A natural-looking refactor —
+"generate the names inside `setup_net()`, which the parent calls after
+`clone()`" — would silently break: the parent would configure veths
+named `veth_h_abc123` while the child would see whatever `child_args`
+contained at clone-time (uninitialized memory, or a stale value).
+
+By generating the names BEFORE `clone()`, both copies of `child_args`
+see the same names; the parent's later mutation of `ctx->veth_created`,
+`ctx->nat_added`, etc. doesn't matter because the child never reads
+those fields — it only reads `ctx->veth_host` and `ctx->veth_container`,
+both populated pre-clone.
+
+**Trade-offs:**
+- **Slightly less locality:** the name generation is split from the rest
+  of the setup. The header comment on `generate_veth_names()` explicitly
+  flags this. `setup_net()` also defensively re-validates that names are
+  populated.
+
+**Files affected:**
+- `include/net.h` — `generate_veth_names()` declaration with address-space note
+- `src/net.c` — call site is `net_exec()` BEFORE `clone()`
+
+**Fix Applied:** 2026-05-12
+
+---
+
+### 26. Sync Pipe Widened to `enable_user_namespace OR enable_network` (Phase 6)
+
+**Decision:** The sync pipe introduced in Phase 4b (Decision #18 / #20) for
+UID/GID-mapping coordination is now created whenever the user namespace
+OR the network namespace is enabled. The child blocks on the pipe in
+both cases; the parent writes to it after both UID/GID maps (if any) AND
+the veth move (if any) are complete.
+
+**Rationale:**
+- **The veth move has the same ordering constraint as UID/GID maps.** The
+  parent must call `ip link set veth_c_<id> netns <pid>` AFTER `clone()`
+  (it needs the child's PID) but BEFORE the child tries to use the
+  network. Reusing the existing sync pipe is mechanically identical and
+  avoids inventing a second synchronization channel.
+- **Single point of "child unblocks."** Whether the parent gates on
+  UID/GID maps, veth move, both, or neither, the child's wait pattern
+  is the same: if `sync_fd >= 0`, read one byte and proceed. This keeps
+  `child_func()` simple.
+
+**Trade-offs:**
+- **One byte of cross-namespace IPC for the common case.** When `--net`
+  is set without `--user`, the cost of the sync pipe is one `pipe()`
+  syscall plus one `read()` plus one `write()`. Negligible.
+- **The condition is "OR", not "AND".** Either feature individually
+  needs the sync; both together still need exactly one.
+
+**Files affected:**
+- `src/net.c` — `net_exec()`: `bool need_sync = config->enable_user_namespace || config->enable_network;`
+- `src/net.c` — `child_func()`: existing "if `sync_fd >= 0` then read" logic
+  unchanged
+
+**Fix Applied:** 2026-05-12
+
+---
+
+### 27. `cleanup_net()` Stores `nat_source_cidr` in the Context (Phase 6)
+
+**Decision:** When `setup_net()` appends the `iptables -t nat -A
+POSTROUTING -s <CIDR> -j MASQUERADE` rule, it stores the exact CIDR string
+it used into `ctx->nat_source_cidr`. `cleanup_net()` reads this back and
+issues the matching `-D` (delete) command. Cleanup never re-references the
+original `veth_config_t`.
+
+**Rationale:**
+- **Self-contained teardown.** The Phase 5 cleanup contract is "given the
+  result struct, you can clean up." `cleanup_net()` honoring that contract
+  means callers (and Phase 7a's planned consolidation) can free the
+  config immediately after `*_exec()` returns without keeping it alive
+  for cleanup.
+- **Avoids "construct the CIDR twice" drift.** If setup formats the CIDR
+  as `"10.0.0.0/24"` and cleanup re-derives it from `host_ip + netmask`,
+  any change to the formatting (e.g., normalizing to network address vs.
+  host address) silently breaks cleanup, leaving a stale iptables rule.
+  Storing the exact string ensures append and delete always match.
+
+**Trade-offs:**
+- **Larger `net_context_t`:** adds `char nat_source_cidr[INET_ADDRSTRLEN + 8]`.
+  ~22 bytes; trivial.
+- **The CIDR is also a soft secret of cleanup state.** If `ctx` is
+  corrupted between setup and cleanup, the rule leaks. This is no worse
+  than any other cleanup-via-context pattern in the codebase.
+
+**Files affected:**
+- `include/net.h` — `nat_source_cidr` field
+- `src/net.c` — `setup_net()` writes it, `cleanup_net()` reads it
+
+**Fix Applied:** 2026-05-12
+
+---
+
+### 28. `--net` Sub-Flag Validation (Hard Error, Not Silent Ignore) (Phase 6)
+
+**Decision:** `--net-host-ip`, `--net-container-ip`, `--net-netmask`, and
+`--no-nat` all require `--net`. Passing any of them without `--net` is a
+hard error in `main.c` (prints a diagnostic, exits 1) — not a silent
+no-op.
+
+**Rationale:**
+- **Surfaces typos early.** A user who writes `--net-host-ip 10.42.0.1`
+  without `--net` either forgot `--net` or has a typo. In either case,
+  silently ignoring the IP and running without network isolation
+  produces a subtle, hard-to-debug failure (the container has no
+  network, but the user thought they configured one).
+- **Same precedent as Error #7's misplaced-flag detection.** That
+  error introduced `known_flags[]` to convert silent failure into a loud
+  warning. This is the same philosophy applied to sub-flag dependencies.
+
+**Trade-offs:**
+- **Slightly more rigid CLI.** A user who passes the sub-flags habitually
+  has to remember `--net`. Acceptable — the alternative is silent data
+  loss.
+
+**Files affected:**
+- `src/main.c` — validation block after `getopt_long` loop:
+  ```c
+  if ((net_host_ip || net_container_ip || net_netmask || no_nat)
+      && !enable_network) {
+      fprintf(stderr, "Error: --net-host-ip / --net-container-ip / "
+                      "--net-netmask / --no-nat require --net\n");
+      return 1;
+  }
+  ```
+
+**Fix Applied:** 2026-05-12
 
 ---
 
@@ -613,7 +864,7 @@ result.exit_status = WEXITSTATUS(status);
 **Impact:**
 - **Severity:** Critical - compilation failure
 - **Symptom:** Compiler error: `implicit declaration of function 'WEXITESTATUS'`
-- **Root Cause:** Typo when transcribing from implementation guide
+- **Root Cause:** Typo in macro name (extra `E`)
 
 **Fix Applied:** 2026-02-10
 
@@ -727,7 +978,7 @@ When transitioning `main.c` from Phase 0 (spawn API) to Phase 1 (namespace API),
 
 **Impact:**
 - **Severity:** Critical - build failure, no binary produced
-- **Phase transition note:** When moving between phases, the Makefile must be updated alongside source changes. The guide's compilation instructions (Phase 1, Section 10.1) show the correct gcc invocation but don't provide an updated Makefile.
+- **Phase transition note:** When moving between phases, the Makefile must be updated alongside source changes. New `.c` files in `src/` need a matching object in the link rule for the top-level binary.
 
 **Fix Applied:** 2026-02-15
 
@@ -955,8 +1206,7 @@ if the compiler doesn't recognize the builtin.
   that could cause runtime failures on some platforms
 - **Symptom:** Warnings during build; potential pointer truncation on LP64
 
-**Fix:** Added `#include <stdlib.h>` to `test_overlay.c` and to the
-corresponding code listing in the Phase 3 implementation guide.
+**Fix:** Added `#include <stdlib.h>` to `test_overlay.c`.
 
 **Fix Applied:** 2026-03-30
 
@@ -1132,8 +1382,7 @@ if (snprintf(ctx->container_base, PATH_MAX, "%s/%s",
 ```
 The same pattern was applied to `upper_path`, `work_path`, and `merged_path`.
 This converts silent truncation into a hard failure with a descriptive error
-message. Both code listings in the Phase 3 implementation guide (§7 and §8.2.1)
-were updated to match.
+message.
 
 **Fix Applied:** 2026-04-13
 
@@ -1171,10 +1420,80 @@ rules allowed it with a warning.
   for `envp` could cause the child process to receive a corrupted environment.
 
 **Fix:** Added `#include <stdlib.h>` and changed `char *test_env` to
-`char **test_env` in both test functions. The corresponding code listing in
-the Phase 4 implementation guide was updated to match.
+`char **test_env` in both test functions.
 
 **Fix Applied:** 2026-04-13
+
+---
+
+### Error #17: `find_ip_binary()` Missed `/bin/ip` Inside the Rootfs (Phase 6)
+
+**Date Found:** 2026-05-12
+
+**Problem:** The initial Phase 6 implementation of `find_ip_binary()`
+checked only `/sbin/ip` and `/usr/sbin/ip` — the canonical host install
+locations on Ubuntu/Debian/RHEL. The parent-side call (before `clone()`,
+against the host filesystem) worked correctly. The child-side call (after
+`pivot_root` into the rootfs, immediately before
+`configure_container_net()`) failed because `scripts/build_rootfs.sh`
+places every binary in `BINS` at `/bin/<name>`, so the rootfs contains
+`/bin/ip` — not `/sbin/ip` or `/usr/sbin/ip`.
+
+**Symptom (first Phase 6 smoke test):**
+```
+$ sudo ./minicontainer --pid --rootfs ./rootfs --net /bin/sh -c 'ip addr show'
+[network] veth pair created: veth_h_a1b2 / veth_c_a1b2
+[network] Moving veth_c_a1b2 into child netns (pid 12345)
+[network] Host side configured: 10.0.0.1/24
+[child] Sync complete, proceeding
+[child] Error: ip binary not found at /sbin/ip, /usr/sbin/ip
+[child] Failed to configure container network
+```
+
+The container's veth was successfully moved into its netns by the parent,
+but the child couldn't run `ip addr add ... dev veth_c_<id>` because it
+couldn't find the `ip` binary at any of the paths the function checked.
+
+**Root Cause:** A pedagogical-vs-reality mismatch in the original
+`find_ip_binary()`. The function was designed against the host's
+typical install paths; the author didn't think through the fact that
+the same function would be called from inside the rootfs after
+`pivot_root`, where the path layout is governed by
+`build_rootfs.sh`'s `BINS` array convention (everything under `/bin/`).
+
+**Impact:**
+- **Severity:** High for Phase 6 smoke test — every `--net` container
+  failed during child-side network configuration. The veth was created
+  (resource leak risk) but the container never came up.
+- **Cleanup behavior was correct:** `cleanup_net()` still ran on
+  parent-side after `waitpid()`, so the host veth and iptables rule
+  were torn down. No persistent state was leaked.
+
+**Fix:** Added `/bin/ip` as a third path in `find_ip_binary()`:
+
+```c
+#define IP_BIN_SBIN     "/sbin/ip"
+#define IP_BIN_USR_SBIN "/usr/sbin/ip"
+#define IP_BIN_BIN      "/bin/ip"
+
+static const char *find_ip_binary(void) {
+    if (access(IP_BIN_SBIN,     X_OK) == 0) return IP_BIN_SBIN;
+    if (access(IP_BIN_USR_SBIN, X_OK) == 0) return IP_BIN_USR_SBIN;
+    if (access(IP_BIN_BIN,      X_OK) == 0) return IP_BIN_BIN;
+    return NULL;
+}
+```
+
+Architecture Decision #24 captures the design rationale (host paths
+first, rootfs path last).
+
+**Lesson:** When the same helper is called from two different
+filesystem contexts (parent against host, child against rootfs), the
+search paths have to cover BOTH contexts. The structural prevention is
+that callers must update `BINS` in `build_rootfs.sh` before the
+phase's examples will work.
+
+**Fix Applied:** 2026-05-12
 
 ---
 
@@ -1210,7 +1529,7 @@ spawns a new process that does not inherit the calling shell's fds. The Phase 2
 parent was also simple enough to not open any extra fds itself. This was
 accidental protection — see Error #12 for full analysis.
 
-**Phase 3 fix:** `close_inherited_fds()` iterates `/proc/self/fd` after `mount_proc()` and closes every fd above `STDERR_FILENO` before `execve()`. This handles both inherited fds and fds opened by the parent itself (overlay bookkeeping, config files, etc.). See Phase 3 guide §3.5 and Error #11 for a typo that initially prevented the `/proc/self/fd` path from working.
+**Phase 3 fix:** `close_inherited_fds()` iterates `/proc/self/fd` after `mount_proc()` and closes every fd above `STDERR_FILENO` before `execve()`. This handles both inherited fds and fds opened by the parent itself (overlay bookkeeping, config files, etc.). See Error #11 for a typo that initially prevented the `/proc/self/fd` path from working.
 
 ---
 
@@ -1218,9 +1537,13 @@ accidental protection — see Error #12 for full analysis.
 
 **Limitation:** Can only run one command, then exits.
 
-**Rationale:** Deliberately simple — lifecycle management comes in Phase 6.
+**Rationale:** Deliberately simple — lifecycle management comes in Phase 7
+(split into 7a: execution-core refactor, and 7b: CLI / `start` / `stop` /
+`exec` / `inspect` / bind mounts / PTY).
 
-**Future:** Phase 6 will add start/stop/exec container lifecycle management.
+**Future:** Phase 7b will add start/stop/exec container lifecycle
+management via subcommand dispatch and a `/run/minicontainer/<id>/`
+state-file convention.
 
 ---
 
@@ -1254,7 +1577,7 @@ accidental protection — see Error #12 for full analysis.
 - Basic commands work by accident because `/usr/bin` and `/bin` happen to appear in the host's `PATH`, and the rootfs has binaries there — but this is fundamentally broken
 - The `--env KEY=VALUE` flag from Phase 0 was dropped in Phase 2's `main.c` (no `case 'e':` in the getopt switch)
 
-**Phase 3 fix:** `build_container_env()` constructs a minimal container-appropriate environment (`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root`, `TERM=xterm`). The `--env` flag is restored with proper key-replacement semantics. See Phase 3 guide §3.4.
+**Phase 3 fix:** `build_container_env()` constructs a minimal container-appropriate environment (`PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root`, `TERM=xterm`). The `--env` flag is restored with proper key-replacement semantics.
 
 ---
 
@@ -1267,7 +1590,7 @@ accidental protection — see Error #12 for full analysis.
 - No way to share a single base image across multiple concurrent containers
 - No clean-slate guarantee between container runs
 
-**Phase 3 fix:** OverlayFS layers a writable `upperdir` on top of a read-only `lowerdir` (the rootfs). The container sees a merged view; writes go to the upper layer only. On container exit, the upper layer is discarded and the base image is untouched. See Phase 3 guide §1.3.
+**Phase 3 fix:** OverlayFS layers a writable `upperdir` on top of a read-only `lowerdir` (the rootfs). The container sees a merged view; writes go to the upper layer only. On container exit, the upper layer is discarded and the base image is untouched.
 
 ---
 
@@ -1343,22 +1666,90 @@ accidental protection — see Error #12 for full analysis.
 
 ---
 
-### Phase 5: Resource Limits (cgroups)
+### ✅ Phase 5: Resource Limits (cgroups) (Complete)
 
-**Changes needed:**
-- Add cgroup configuration to config
-- Create/configure cgroup before clone
-- Move child into cgroup
-- Cleanup cgroup on exit
+**What was done:**
+- New `cgroup.c`/`cgroup.h` module superseding `uts.c` (Decision #21 context;
+  decision body lives at #21 for `build_container_env` defensive refactor)
+- Three-phase lifecycle: `setup_cgroup()` before `clone()`, `add_pid_to_cgroup()`
+  after sync, `remove_cgroup()` after `waitpid()`
+- `memory.max` (`--memory`), `cpu.max` (`--cpus`), `pids.max` (`--pids`)
+  written to `/sys/fs/cgroup/minicontainer_<id>/`
+- Auto-enable: any of `--memory`/`--cpus`/`--pids` sets `enable_cgroup`
+- OOM kill at exit code 137 when `memory.max` exceeded
+- `build_container_env()` defensively refactored (`calloc` + bounds check) —
+  see Decision #21
 
 ---
 
-### Phase 6: Network Isolation
+### ✅ Phase 6: Network Namespace (Complete)
 
-**Changes needed:**
-- Add `CLONE_NEWNET` to clone flags
-- Set up veth pairs
-- Configure network namespace
+**What was done:**
+- New `net.c`/`net.h` module superseding `cgroup.c` (Decision #22)
+- `CLONE_NEWNET` for the container's own loopback, interfaces, routing table
+- veth pair created with `ip link add`, container end moved via
+  `ip link set <name> netns <pid>` (Decisions #23, #24)
+- `--net` flag plus `--net-host-ip` / `--net-container-ip` /
+  `--net-netmask` / `--no-nat` sub-flags (Decision #28)
+- Default subnet `10.0.0.0/24` (host `10.0.0.1`, container `10.0.0.2`)
+- Optional `iptables -t nat -A POSTROUTING -j MASQUERADE` for outbound
+  internet; default ON, disabled by `--no-nat`
+- `find_ip_binary()` three-path search: `/sbin/ip` → `/usr/sbin/ip` →
+  `/bin/ip` (Decision #24, Error #17)
+- `generate_veth_names()` runs BEFORE `clone()` (Decision #25)
+- Sync pipe widened to `enable_user_namespace OR enable_network`
+  (Decision #26)
+- `cleanup_net()` stores `nat_source_cidr` in context for self-contained
+  teardown (Decision #27)
+- `scripts/build_rootfs.sh`: `BINS` array extended to include `ip`
+- Unit tests (`test_net`) require root + iproute2
+
+---
+
+### Phase 7: CLI & Lifecycle (Split into 7a + 7b — Designed, Not Yet Implemented)
+
+**Phase 7a — Execution-Core Consolidation (refactor, no new features):**
+- New `core.c`/`core.h` with unified `container_exec()` collapsing five
+  duplicate `child_args_t` / `child_func()` / `close_inherited_fds()`
+  copies into one
+- New `env.c`/`env.h` extracting `build_container_env()` (Decision #21
+  was designed for this extraction)
+- Unified `container_config_t` and `container_context_t`
+- New `user_ns_mapping_t` in `uts.h` replaces the synthetic-`uts_config_t`
+  workaround introduced for Phase 5's `cgroup_exec`
+- `spawn.c`, `namespace.c` and their tests deleted; coverage replaced by
+  `test_core.c`
+- Success criterion: every Phase 0-6 test still passes byte-identical
+
+**Phase 7b — CLI / Lifecycle / Bind Mounts / PTY:**
+- Subcommand dispatch: `run` / `start` / `stop` / `exec` / `inspect` /
+  `list` / `cleanup`
+- `container_exec()` splits into `container_start()` + `container_wait()`
+  so the CLI can write the state file BETWEEN the two halves
+- State at `/run/minicontainer/<id>/state.json` (rootless under
+  `$XDG_RUNTIME_DIR`)
+- 12-hex container IDs from `/dev/urandom` (not timestamp-based)
+- Bind mounts (`--volume host:container[:ro]`) — note the `MS_RDONLY`
+  remount quirk: first `mount(MS_BIND)` silently ignores `MS_RDONLY`,
+  a second `mount(MS_BIND|MS_REMOUNT|MS_RDONLY)` is required
+- PTY allocation (`--interactive`) via `posix_openpt` → `grantpt` →
+  `unlockpt` → `ptsname`
+- `cmd_exec` uses `setns(2)` then `clone()` WITHOUT `CLONE_NEW*` flags
+  (joining existing namespaces vs. creating fresh ones)
+- `cmd_start` runs `container_start()` and exits — child orphaned to init,
+  `cleanup` reaps stale state files
+
+---
+
+### Phase 8: OCI / Inspector (Designed, Not Yet Implemented — Split into 8a/8b/8c)
+
+- **8a:** `libprocfs` extracted into a sibling shared library — read-side
+  of cgroups (`memory.current`, `cpu.stat`, `pids.current`) and
+  `/proc/<pid>/...` parsing. `minicontainer inspect <id>` consumes it.
+- **8b:** Hardening — capability set (`capset`), seccomp BPF filter,
+  no-new-privileges.
+- **8c:** OCI runtime spec compliance (`config.json`, bundle format),
+  minimal image extraction from tarballs.
 
 ---
 
@@ -1381,6 +1772,37 @@ accidental protection — see Error #12 for full analysis.
 
 - ✓ Rootfs isolation (container sees only rootfs contents)
 - ✓ /proc mount (proc filesystem mounted and accessible inside container)
+
+### Phase 3 Unit Tests (tests/test_overlay.c — requires root + rootfs)
+
+- ✓ Base image untouched after container writes
+- ✓ Overlay cleanup (upper / work / merged removed on exit)
+- ✓ Backward compatibility (no overlay — Phase 2 behavior preserved)
+
+### Phase 4 / 4b / 4c Unit Tests (tests/test_uts.c — mixed privileges)
+
+- ✓ Hostname isolation (`sethostname` in new UTS namespace)
+- ✓ Backward compatibility (no UTS — Phase 3 behavior preserved)
+- ✓ User namespace unprivileged (container root maps to host user)
+- ✓ User namespace + hostname (rootless with UTS)
+- ✓ IPC isolation (System V IPC tables empty in new IPC namespace)
+- ✓ IPC + user namespace (rootless with IPC)
+
+### Phase 5 Unit Tests (tests/test_cgroup.c — requires root)
+
+- ✓ Cgroup creation and cleanup lifecycle (mkdir/rmdir)
+- ✓ Memory limit enforcement (process exits within budget)
+- ✓ PID limit (fork-bomb defense: kernel returns EAGAIN at cap)
+- ✓ Backward compatibility (no cgroup — Phase 4c behavior preserved)
+- ✓ Cgroup + IPC namespace (all isolation layers active together)
+
+### Phase 6 Unit Tests (tests/test_net.c — requires root + iproute2)
+
+- ✓ Network namespace creation (`CLONE_NEWNET` + veth pair, container
+  sees `veth_c_<id>`)
+- ✓ Backward compatibility (no `--net` — Phase 5 behavior preserved)
+- ✓ Network namespace combined with cgroup (veth + memory/cpu/pids
+  active simultaneously)
 
 ### Integration Tests (Makefile: make examples)
 
@@ -1413,8 +1835,13 @@ accidental protection — see Error #12 for full analysis.
 - namespaces(7): Overview of Linux namespaces
 - pid_namespaces(7): PID namespace details
 - signal-safety(7): Async-signal-safe functions
+- network_namespaces(7): Network namespace semantics (Phase 6)
+- ip(8): iproute2 driver — link/addr/route/netns subcommands (Phase 6)
+- iptables(8) / iptables-extensions(8): NAT (MASQUERADE) and filter rules (Phase 6)
+- veth(4): Virtual Ethernet pair device (Phase 6)
 - [LWN: Namespaces in operation](https://lwn.net/Articles/531114/)
 - [LWN: Mount namespaces and shared subtrees](https://lwn.net/Articles/689856/)
+- [LWN: Network namespaces](https://lwn.net/Articles/580893/)
 - [Linux System Programming by Robert Love](https://www.oreilly.com/library/view/linux-system-programming/9781449341527/)
 
 ---
