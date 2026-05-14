@@ -941,6 +941,583 @@ commands required.
 
 ---
 
+### 30. Execution-Core Consolidation: Five `*_exec()` Functions Become One (Phase 7a)
+
+**Decision:** Replace the five per-phase orchestrators (`mount_exec`,
+`overlay_exec`, `uts_exec`, `cgroup_exec`, `net_exec` — plus the
+already-deleted `spawn_process` / `namespace_exec`) with a single
+`container_exec(const container_config_t *)` in a new `core.c`
+module. The new function takes one unified `container_config_t`
+covering every flag and parameter; behavior in each phase is recovered
+by setting the corresponding flag.
+
+The five duplicate `child_func` definitions, five duplicate
+`close_inherited_fds` definitions, and five file-local `child_args_t`
+struct definitions collapse to one canonical copy each, also in
+`core.c`. `build_container_env()` (decisions.md #21 prepared this
+specifically) moves out of `main.c` into its own `env.c` / `env.h`
+module so tests and future subcommands can use it without dragging in
+the CLI layer.
+
+**Background — what was there:**
+
+By Phase 6 the superseding module pattern (decisions.md #7, #9, #13,
+#16, #21, #22) had produced five `.c` files that each contained:
+
+1. A file-local `child_args_t` typedef carrying the same fields
+   (`program`, `argv`, `envp`, `enable_debug`, `rootfs_path`,
+   `hostname`, `sync_fd`, `user_namespace_active`, plus phase-specific
+   additions).
+2. A `static close_inherited_fds(bool enable_debug)` — the
+   CVE-2024-21626 / CVE-2016-9962 mitigation, defined `static` in
+   `uts.c` first, then copy-pasted into `cgroup.c`, `net.c`, and
+   `overlay.c` because cross-module `static` symbols aren't reachable.
+3. A `static child_func(void *arg)` — the child-side lifecycle (sync
+   wait → setup_uts → setup_rootfs → mount_proc → close_inherited_fds
+   → execve), extended in each phase with one new step
+   (configure_container_net at Phase 6, etc.).
+4. A `*_exec(const *_config_t *)` parent-side orchestrator with
+   ~15 steps: cgroup-setup, sync-pipe, overlay-setup, stack-alloc,
+   veth-name generation (Phase 6+), `clone()`, sync-pipe write,
+   `setup_user_namespace_mapping()`, `add_pid_to_cgroup()`,
+   `waitpid()`, exit-status parse, overlay teardown, error-path
+   cleanup.
+5. A `*_cleanup()` doing the tail half — `free(stack_ptr)` plus
+   whatever cleanup the phase introduced (`remove_cgroup`,
+   `cleanup_net`).
+
+Phase 6's `net.c` reached ~900 lines, of which ~700 were a near-exact
+copy of `cgroup.c`'s plumbing. Bug fixes had to propagate through up to
+five copies. Phase 5's first cut dropped 8+ carry-forward invariants
+from its copy and required a retro audit; Phase 6 dropped its own
+subset before catching them.
+
+**The Phase 7a refactor:**
+
+A unified `container_config_t` subsumes every prior `*_config_t`:
+
+```c
+typedef struct {
+    /* Process */
+    const char *program;
+    char *const *argv;
+    char *const *envp;
+    bool enable_debug;
+
+    /* Namespace flags (Phases 1/2/4/4b/4c/6) */
+    bool enable_pid_namespace;
+    bool enable_mount_namespace;
+    bool enable_uts_namespace;
+    bool enable_user_namespace;
+    bool enable_ipc_namespace;
+    bool enable_network;
+
+    /* Filesystem (Phases 2/3) */
+    const char *rootfs_path;
+    bool enable_overlay;
+    const char *container_dir;
+
+    /* UTS (Phase 4) */
+    const char *hostname;
+
+    /* User namespace mapping (Phase 4b — flat, packed into
+     * user_ns_mapping_t inside core.c before the helper call) */
+    uid_t uid_map_inside;
+    uid_t uid_map_outside;
+    size_t uid_map_range;
+    gid_t gid_map_inside;
+    gid_t gid_map_outside;
+    size_t gid_map_range;
+
+    /* Cgroup limits (Phase 5) */
+    cgroup_limits_t cgroup_limits;
+    bool enable_cgroup;
+
+    /* Network (Phase 6) */
+    veth_config_t veth;
+} container_config_t;
+```
+
+A `container_context_t` aggregates the runtime state each helper
+produces — `overlay_ctx`, `cgroup_ctx`, `net_ctx`, `stack_ptr` — so
+`container_cleanup()` walks all of it in one call. A
+`container_result_t` wraps the exit status plus the context.
+
+The unified `container_exec()` is a single 250-line function that
+covers every flag combination — exactly the lifecycle Phase 6's
+`net_exec` had, with the difference that conditionals on
+`config->enable_*` now gate the optional steps instead of presence
+in the per-phase `*_config_t`.
+
+The unified `child_func()` is the canonical child-side lifecycle:
+sync-wait → `setup_uts` → `setup_rootfs` (calls `mount_proc`
+internally) → `configure_container_net` → `close_inherited_fds` →
+`execve`. One static `close_inherited_fds()` next to it, called from
+the canonical step 6 — no more copy-paste.
+
+**Rationale:**
+
+- **Bug fixes propagate once.** The ~90% boilerplate that was
+  identical across five phases is now identical because there's only
+  one copy. The kind of carry-forward drift that bit Phase 5 and
+  Phase 6 cannot recur — there is nothing to forward.
+- **The helpers stay where they belong.** `setup_uts`,
+  `setup_rootfs`, `mount_proc`, `setup_overlay`, `teardown_overlay`,
+  `setup_cgroup`, `add_pid_to_cgroup`, `remove_cgroup`, `setup_net`,
+  `configure_container_net`, `cleanup_net`, `generate_veth_names`,
+  `find_ip_binary` — all remain in their respective `.c` files and
+  are called from `core.c`'s parent or child half. Phase 7a is not a
+  "rewrite as one giant file" refactor; it removes the *orchestration
+  duplication* without touching the actual primitive implementations.
+- **Test coverage is preserved by design.** Every Phase 2-6 test now
+  calls `container_exec()` with the equivalent flag set. `test_core.c`
+  adds two regressions (bare exec, PID-only) covering what the
+  deleted `test_spawn.c` / `test_namespace.c` tested. The success
+  criterion is "every Phase 0-6 test passes behaviorally identical."
+- **`build_container_env()` extraction enables Phase 7b/8 reuse.** A
+  future `cli.c` subcommand dispatcher (Phase 7b) and bundle loader
+  (Phase 8c) both need a clean container environment without dragging
+  in `main.c`. Putting it in `env.c` makes the future extraction
+  mechanical.
+
+**Trade-offs:**
+
+- **`core.c` is harder to read in one pass than any single `*_exec()`
+  was.** A reader has to hold the full lifecycle in their head — 15
+  parent-side steps, 7 child-side steps, every flag combination —
+  rather than tracing through (say) `mount_exec` to learn just Phase
+  2's slice. Mitigation: comments inside `container_exec` mark each
+  step with the phase that introduced it.
+- **Reading order is reversed.** Pre-7a, a learner traced Phase 0 →
+  Phase 1 → Phase 2 chronologically through ever-larger `*_exec`
+  functions. Post-7a, they read `container_exec` once and then learn
+  what each helper (`setup_uts`, `setup_overlay`, etc.) does in
+  isolation. The chronological story now lives in the phase guides
+  and this decisions.md, not in the source layout.
+- **Two `child_args_t` snapshot semantics still matter.**
+  `clone(2)` without `CLONE_VM` copies the parent's address space at
+  clone-time, so any field the parent writes after `clone()` is
+  invisible to the child. `core.c`'s `child_args_t` is populated
+  before clone and never touched again — same invariant Phase 6
+  established (decisions.md #25), just with one consolidated struct.
+
+**What the principle illustrates:**
+
+Pedagogical duplication has a half-life. Phases 0-6 used the
+superseding module pattern (decisions.md #7, #9, #13, #16) because
+**learning** the same idea twice cements it. By Phase 6 the readers
+who would learn from the duplication already had, and the readers who
+came in fresh to Phase 6 had to wade through five identical
+prologues before seeing one line of network code. The optimal time to
+consolidate is when the cost of repetition exceeds the teaching
+benefit — which the Phase 5 first-cut audit and the Phase 6
+carry-forward checklist together demonstrated had arrived.
+
+**Files affected:**
+
+- `src/core.c` — NEW, 438 lines: `container_exec`, `container_cleanup`,
+  one canonical `child_func`, one canonical `close_inherited_fds`,
+  the file-local `child_args_t`.
+- `include/core.h` — NEW: `container_config_t`, `container_context_t`,
+  `container_result_t`, public signatures.
+- `src/env.c` — NEW, 67 lines: `build_container_env` moved from
+  `main.c` verbatim (decisions.md #21 already made it self-contained).
+- `include/env.h` — NEW: `build_container_env` declaration +
+  `MAX_ENV_ENTRIES`.
+- `src/mount.c` — SLIMMED: dropped `child_args_t`, `static
+  child_func`, `mount_exec`, `mount_cleanup`. Kept `setup_rootfs`,
+  `mount_proc`. Includes pruned to what's actually used.
+- `src/overlay.c` — SLIMMED: dropped `child_args_t`, `static
+  close_inherited_fds`, `static child_func`, `overlay_exec`,
+  `overlay_cleanup`, the §3.5 leaked-fd debug-test block. Kept
+  `setup_overlay`, `teardown_overlay`, the static path/dir helpers
+  they use.
+- `src/uts.c` — SLIMMED: dropped `child_args_t`, `static
+  close_inherited_fds`, `static child_func`, `uts_exec`, `uts_cleanup`.
+  Kept `setup_uts`, `setup_user_namespace_mapping` (signature change
+  per Decision #31).
+- `src/cgroup.c` — SLIMMED: dropped `child_args_t`, `static
+  close_inherited_fds`, `static child_func`, `cgroup_exec`,
+  `cgroup_cleanup`, and the synthetic `uts_config_t uts_cfg = {...}`
+  workaround (Phase 5 §3.7). Kept `setup_cgroup`,
+  `add_pid_to_cgroup`, `remove_cgroup`, `generate_cgroup_name`.
+- `src/net.c` — SLIMMED: dropped `child_args_t`, `static
+  close_inherited_fds`, `static child_func`, `net_exec`,
+  `net_cleanup`. Kept `setup_net`, `configure_container_net`,
+  `cleanup_net`, `generate_veth_names`, the `run_ip_command*` /
+  `run_iptables_command` static helpers. `find_ip_binary` promoted to
+  public (Decision #32).
+- `include/mount.h` / `overlay.h` / `uts.h` / `cgroup.h` / `net.h` —
+  per-phase `*_config_t` / `*_result_t` / `*_exec` / `*_cleanup`
+  declarations removed. `uts.h` gains `user_ns_mapping_t` (Decision
+  #31). `net.h` gains `find_ip_binary` declaration (Decision #32).
+- `src/spawn.c`, `src/namespace.c`, `tests/test_spawn.c`,
+  `tests/test_namespace.c`, `include/spawn.h`, `include/namespace.h` —
+  DELETED entirely. Subsumed by `container_exec` with appropriate
+  flags; `test_core.c` covers the regression cases.
+- `src/main.c` — `container_config_t` literal replaces the prior
+  `net_config_t`; `container_exec()` + `container_cleanup()` replace
+  `net_exec()` + `net_cleanup()`. The CLI parsing and validation
+  logic is unchanged.
+- `Makefile` — `HELPER_OBJS` variable factored out (Decision #33);
+  `TEST_SPAWN` / `TEST_NAMESPACE` removed; `TEST_CORE` added; every
+  test rule now links against `$(HELPER_OBJS)`.
+
+**Verification:** `make clean && make` builds with zero warnings.
+`sudo make test` runs all six test binaries (`test_core`,
+`test_mount`, `test_overlay`, `test_uts`, `test_cgroup`, `test_net`)
+plus the unprivileged subset of `test_uts`.
+
+**Fix Applied:** 2026-05-13
+
+---
+
+### 31. `user_ns_mapping_t` Replaces the Synthetic `uts_config_t` Workaround (Phase 7a)
+
+**Decision:** Introduce a five-field struct `user_ns_mapping_t` in
+`uts.h` and change `setup_user_namespace_mapping()`'s signature from
+`(pid_t child_pid, const uts_config_t *config)` to `(pid_t child_pid,
+const user_ns_mapping_t *config)`. The new struct contains only the
+fields the mapping helper actually reads.
+
+**Background:**
+
+Phase 4b introduced `setup_user_namespace_mapping()` as a parent-side
+helper. Its signature took a `const uts_config_t *` because the only
+caller at the time was `uts_exec`, which already had a `uts_config_t`
+in hand. The function reads six fields out of that struct
+(`uid_map_inside`, `uid_map_outside`, `uid_map_range`,
+`gid_map_inside`, `gid_map_outside`, `gid_map_range`) plus
+`enable_debug`. It does not touch the other ~15 fields.
+
+Phase 5's `cgroup_exec` superseded `uts_exec` but still needed to
+call `setup_user_namespace_mapping()`. The cleanest call site would
+have changed the helper's signature to accept just the mapping data —
+but at the time, doing so would have required editing `uts.h`,
+`uts.c`, the test files, and every prior caller. The faster path was
+to **construct a partial `uts_config_t` inline** and pass that:
+
+```c
+/* Phase 5 / 6 cgroup_exec — synthetic config workaround */
+uts_config_t uts_cfg = {
+    .uid_map_inside  = config->uid_map_inside,
+    .uid_map_outside = config->uid_map_outside,
+    .uid_map_range   = config->uid_map_range,
+    .gid_map_inside  = config->gid_map_inside,
+    .gid_map_outside = config->gid_map_outside,
+    .gid_map_range   = config->gid_map_range,
+    .enable_debug    = config->enable_debug,
+    /* Other fields zero-init'd — never read. */
+};
+setup_user_namespace_mapping(pid, &uts_cfg);
+```
+
+That code shipped in Phase 5 and Phase 6 and worked correctly — the
+zero-init'd fields were never read. But it was a structural lie: the
+function's signature claimed it needed a `uts_config_t`, when in fact
+it needed seven fields packaged in any container.
+
+**The Phase 7a fix:**
+
+A new struct dedicated to what the helper actually consumes:
+
+```c
+/* uts.h */
+typedef struct {
+    uid_t  uid_map_inside;
+    uid_t  uid_map_outside;
+    size_t uid_map_range;
+    gid_t  gid_map_inside;
+    gid_t  gid_map_outside;
+    size_t gid_map_range;
+    bool   enable_debug;
+} user_ns_mapping_t;
+
+int setup_user_namespace_mapping(pid_t child_pid,
+                                 const user_ns_mapping_t *config);
+```
+
+`core.c`'s `container_exec()` packs the flat `uid_map_*` /
+`gid_map_*` fields from `container_config_t` into a
+`user_ns_mapping_t` immediately before the call:
+
+```c
+if (config->enable_user_namespace) {
+    user_ns_mapping_t mapping = {
+        .uid_map_inside  = config->uid_map_inside,
+        .uid_map_outside = config->uid_map_outside,
+        .uid_map_range   = config->uid_map_range,
+        .gid_map_inside  = config->gid_map_inside,
+        .gid_map_outside = config->gid_map_outside,
+        .gid_map_range   = config->gid_map_range,
+        .enable_debug    = config->enable_debug
+    };
+    if (setup_user_namespace_mapping(pid, &mapping) < 0) { ... }
+}
+```
+
+**Rationale:**
+
+- **Signature truthfulness.** The function now advertises exactly
+  what it needs. A future caller reading the declaration can tell
+  immediately that no other fields are consulted — no need to inspect
+  the implementation.
+- **The synthetic-workaround pattern doesn't propagate.** Phase 5
+  added one synthetic config; Phase 6 inherited it and added nothing
+  new because `cgroup_config_t` already had the mapping fields. But
+  any further superseding phase would have inherited the same lie.
+  Stopping it at Phase 7a (the refactor that consolidates everything)
+  costs one small struct + one signature change.
+- **The struct is reusable.** Phase 7b's `cmd_exec` subcommand,
+  Phase 8a's inspector, and Phase 8c's OCI bundle parser will all
+  need user-namespace mapping data; they can now take a
+  `user_ns_mapping_t` directly without going near the (now-deleted)
+  `uts_config_t`.
+
+**Trade-offs:**
+
+- **Eight call-site lines to construct the struct.** The verbose form
+  in `container_exec()` is more visible than the prior synthetic
+  workaround was. Acceptable — the visibility is the point; readers
+  see exactly which fields flow into the helper.
+- **`user_ns_mapping_t` lives in `uts.h`, not `core.h`.** A reader
+  might expect a "container-wide" struct to live with
+  `container_config_t`. Putting it in `uts.h` keeps it next to the
+  helper that consumes it (the principle: types live next to their
+  primary consumer, not next to their primary producer). The
+  alternative would split the helper's interface across two headers.
+
+**Files affected:**
+
+- `include/uts.h` — `user_ns_mapping_t` added; `setup_user_namespace_mapping`
+  signature changed to take `const user_ns_mapping_t *`.
+- `src/uts.c` — function body unchanged; only the parameter type
+  changes. The body reads the same six fields off the new struct.
+- `src/core.c` — `container_exec()` constructs the
+  `user_ns_mapping_t` immediately before the call.
+- `src/cgroup.c` — the synthetic `uts_config_t uts_cfg = {...}`
+  workaround block (Phase 5 §3.7) deleted along with the rest of the
+  per-phase exec body (Decision #30).
+
+**Fix Applied:** 2026-05-13
+
+---
+
+### 32. `find_ip_binary()` Promoted from `static` to Public (Phase 7a)
+
+**Decision:** Drop the `static` qualifier on `find_ip_binary()`'s
+definition in `src/net.c` and add a matching `extern` declaration to
+`include/net.h`. The function is now callable from any module that
+includes `net.h` — specifically `core.c`, which needs the parent-side
+early-failure check (Phase 6 invariant: fail loudly before `clone()`
+if no `ip` binary is reachable on the host) without duplicating the
+three-path search logic.
+
+**Background:**
+
+Phase 6 introduced `find_ip_binary()` to resolve `/sbin/ip` →
+`/usr/sbin/ip` → `/bin/ip` (Decision #24). The function was defined
+`static` because Phase 6's only callers were both inside `net.c` —
+`net_exec`'s parent-side pre-clone check and `run_ip_command`'s
+helper.
+
+Phase 7a's `container_exec()` (in `core.c`) carries forward the
+parent-side early-failure check:
+
+```c
+if (config->enable_network && !find_ip_binary()) {
+    fprintf(stderr, "[parent] --net requires /sbin/ip, /usr/sbin/ip, "
+                    "or /bin/ip; install the `iproute2` package\n");
+    result.child_pid = -1;
+    return result;
+}
+```
+
+That call lives in `core.c`. With `find_ip_binary()` still `static`
+inside `net.c`, the linker rejects the cross-module reference.
+
+**The fix is two halves:**
+
+1. **`include/net.h`** — add the declaration:
+   ```c
+   const char *find_ip_binary(void);
+   ```
+2. **`src/net.c`** — change the definition from
+   `static const char *find_ip_binary(void)` to
+   `const char *find_ip_binary(void)`.
+
+Both halves are required. Adding the declaration alone leaves the
+function file-scope, and the linker still rejects the reference.
+Removing the `static` alone gives external linkage but no declaration
+that other translation units can see; the cross-module caller would
+fall back to an implicit-function-declaration warning under `-Wall`,
+and the project explicitly builds clean.
+
+**Rationale:**
+
+- **Single source of truth for the path search.** The three-path
+  search (`/sbin/ip` → `/usr/sbin/ip` → `/bin/ip`, Decision #24,
+  Error #17) is a non-trivial invariant — host paths first, rootfs
+  path last. Duplicating that logic in `core.c` would create a
+  second copy that has to track every future change. Promotion to
+  public is the minimum change that lets `core.c` reuse the existing
+  helper.
+- **No new attack surface.** The function is read-only over the
+  filesystem (`access(path, X_OK)`); promoting it to public exposes
+  no state and grants no new capability to any caller.
+- **The internal callers (`run_ip_command`, `run_ip_command_ignore`)
+  inside `net.c` are unchanged.** They continue to call
+  `find_ip_binary()` directly; the only difference is that the
+  function is now also linkable from outside the translation unit.
+
+**Trade-offs:**
+
+- **Both halves must move together.** A common error mode is to add
+  the declaration and forget to drop the `static`, or vice versa. The
+  Phase 7a guide §6.4 / §6.5 audit grep
+  (`grep -rnE '\b(mount|overlay|uts|cgroup|net)_(exec|cleanup|...)'`)
+  catches the more general "stale dead-code" case but does not
+  specifically catch this one — a `static` left in place produces a
+  linker error rather than a grep-able token. The Makefile build
+  surfaces it on the first `make`. Documented here so future
+  promotions (e.g., a helper that needs to be reachable from `cli.c`
+  in Phase 7b) remember both halves.
+- **Slightly weaker information hiding.** Pre-7a, the function was
+  file-scope and could be inlined / removed / renamed at will.
+  Post-7a, renaming it requires updating every external caller. The
+  loss is small (`find_ip_binary` is an obvious name) and the gain
+  (single search-path source) is real.
+
+**Files affected:**
+
+- `include/net.h` — `const char *find_ip_binary(void);` declaration
+  added next to `generate_veth_names` / `setup_net` /
+  `configure_container_net` / `cleanup_net`.
+- `src/net.c` — `static` qualifier dropped from the definition.
+  Function body unchanged.
+- `src/core.c` — `container_exec()` calls `find_ip_binary()` as part
+  of the parent-side validation that runs before `clone()` when
+  `enable_network` is set.
+
+**Fix Applied:** 2026-05-13
+
+---
+
+### 33. Makefile `HELPER_OBJS` Unified Link Chain (Phase 7a)
+
+**Decision:** Factor the per-phase test link rules into a single
+`HELPER_OBJS` Make variable containing every helper module's `.o`
+file. Every test target now links against `$(HELPER_OBJS)` plus its
+own test object; the main `minicontainer` binary links against
+`$(BUILD_DIR)/main.o $(HELPER_OBJS)`. Six identical rules instead of
+six near-identical ones.
+
+**Background — what was there:**
+
+Through Phase 6 the Makefile had one link rule per test, each listing
+the helper chain explicitly:
+
+```makefile
+$(TEST_MOUNT): $(BUILD_DIR)/test_mount.o $(BUILD_DIR)/mount.o
+	...
+$(TEST_OVERLAY): $(BUILD_DIR)/test_overlay.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
+	...
+$(TEST_UTS): $(BUILD_DIR)/test_uts.o $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
+	...
+$(TEST_CGROUP): $(BUILD_DIR)/test_cgroup.o $(BUILD_DIR)/cgroup.o $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
+	...
+$(TEST_NET): $(BUILD_DIR)/test_net.o $(BUILD_DIR)/net.o $(BUILD_DIR)/cgroup.o $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o $(BUILD_DIR)/mount.o
+	...
+```
+
+Each test pulled in just enough modules to satisfy its own per-phase
+`*_exec()` call. The prerequisite lists grew monotonically — Phase 2
+needed `mount.o`; Phase 3 needed Phase 2's + `overlay.o`; Phase 4
+needed all that + `uts.o`; and so on.
+
+**The Phase 7a refactor:**
+
+Phase 7a's consolidation means every test now calls `container_exec()`
+from `core.c`, which in turn calls into every helper. The minimum
+required prerequisite set for any test is therefore the **full helper
+chain** — there is no longer a per-phase subset. The Makefile mirrors
+that:
+
+```makefile
+HELPER_OBJS = $(BUILD_DIR)/core.o $(BUILD_DIR)/env.o \
+              $(BUILD_DIR)/net.o $(BUILD_DIR)/cgroup.o \
+              $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o \
+              $(BUILD_DIR)/mount.o
+
+$(MINICONTAINER): $(BUILD_DIR)/main.o $(HELPER_OBJS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(TEST_CORE):    $(BUILD_DIR)/test_core.o    $(HELPER_OBJS) ; ...
+$(TEST_MOUNT):   $(BUILD_DIR)/test_mount.o   $(HELPER_OBJS) ; ...
+$(TEST_OVERLAY): $(BUILD_DIR)/test_overlay.o $(HELPER_OBJS) ; ...
+$(TEST_UTS):     $(BUILD_DIR)/test_uts.o     $(HELPER_OBJS) ; ...
+$(TEST_CGROUP):  $(BUILD_DIR)/test_cgroup.o  $(HELPER_OBJS) ; ...
+$(TEST_NET):     $(BUILD_DIR)/test_net.o     $(HELPER_OBJS) ; ...
+```
+
+**Rationale:**
+
+- **The link set is one fact, not six.** Phase 7a's consolidation
+  removed the per-phase orchestrators that justified per-phase link
+  rules. With one orchestrator, one link rule shape is sufficient;
+  defining the helper set once means future module additions
+  (Phase 7b's `cli.o` / `state.o`, Phase 8a's `inspector.o`,
+  Phase 8b's `hardening.o`) extend a single list rather than six.
+- **No more "Phase N test forgot to link Phase N-1's helper" class
+  of error.** Pre-7a, a test that needed (say) `setup_overlay` had
+  to remember to include `overlay.o` in its prerequisites. Now every
+  test pulls every helper; the linker drops unused symbols. The
+  build is correct by construction.
+- **Build-time cost is negligible.** Each helper `.o` is a few KB;
+  six tests times one extra `.o` adds < 100 KB to link work. The
+  helper compilations themselves happen once thanks to the
+  `wildcard`-based source discovery and `-MMD -MP` dependency
+  generation.
+
+**Trade-offs:**
+
+- **Tests no longer encode their dependency surface in the
+  Makefile.** Pre-7a, reading `$(TEST_OVERLAY): ...` told you what
+  helpers Phase 3's test actually used. Post-7a, every test links
+  everything; the dependency information lives in the `#include`
+  directives of the `.c` file instead. Acceptable — `#include` is
+  where new readers look anyway.
+- **Single point of update for module additions.** Adding a new
+  module means editing one line of `HELPER_OBJS` instead of
+  remembering to add it to whichever subset of link rules needed it.
+  Reduces churn but concentrates the failure mode: forget the one
+  line, every test fails to link.
+
+**Removed concerns:**
+
+The pre-7a Makefile also had explicit `$(TEST_SPAWN)` and
+`$(TEST_NAMESPACE)` rules; both were deleted along with their source
+files (`test_spawn.c`, `test_namespace.c`) per Decision #30. The
+`clean:` target's `rm -f` list and the `test:` target's prerequisite
+list lost those entries in the same edit.
+
+**Files affected:**
+
+- `Makefile`:
+  - `HELPER_OBJS` variable introduced near the top.
+  - `$(MINICONTAINER)` rule rewritten to use `$(HELPER_OBJS)`.
+  - `$(TEST_SPAWN)` / `$(TEST_NAMESPACE)` rules + variables
+    deleted; `$(TEST_CORE)` rule + variable added.
+  - All six surviving test rules rewritten to use `$(HELPER_OBJS)`.
+  - `test:` target's prerequisite list updated.
+  - `clean:` target's `rm -f` list updated.
+  - Top-of-file phase comment updated to "Phase 7a: Execution-Core
+    Consolidation".
+
+**Fix Applied:** 2026-05-13
+
+---
+
 ## Errors Found and Fixed
 
 ### Error #1: Typo in WEXITSTATUS Macro
@@ -1590,6 +2167,263 @@ that callers must update `BINS` in `build_rootfs.sh` before the
 phase's examples will work.
 
 **Fix Applied:** 2026-05-12
+
+---
+
+### Error #18: Helper `.c` Cleanup Lockstep with Helper `.h` Cleanup (Phase 7a)
+
+**Date Found:** 2026-05-13
+
+**Problem:** During the Phase 7a refactor, the helper headers
+(`mount.h`, `overlay.h`, `uts.h`, `cgroup.h`, `net.h`) had their
+per-phase `*_config_t` / `*_result_t` / `*_exec()` / `*_cleanup()`
+declarations removed (per Decision #30). The matching function
+bodies in the corresponding `.c` files were *not* removed in the same
+edit. The result: every helper `.c` file still contained an
+`*_exec()` body that referenced its now-deleted types, plus a
+file-local `child_args_t`, a `static child_func()`, and a `static
+close_inherited_fds()` that only existed to serve the
+now-unreachable orchestrator.
+
+**Symptom (first `make` after the header changes):**
+
+```
+$ make clean && make
+gcc ... -c src/net.c -o build/net.o
+src/net.c:597: error: unknown type name 'net_config_t'
+src/net.c:597: error: unknown type name 'net_result_t'
+src/net.c:706: error: unknown type name 'child_args_t'
+...
+src/cgroup.c:363: error: unknown type name 'cgroup_config_t'
+src/cgroup.c:363: error: unknown type name 'cgroup_result_t'
+...
+src/uts.c:265: error: unknown type name 'uts_config_t'
+src/uts.c:265: error: unknown type name 'uts_result_t'
+...
+make: *** [Makefile:64: build/net.o] Error 1
+```
+
+The compile failed before the link step. None of the dead `*_exec`
+bodies were called from anywhere (the new `core.c` provides
+`container_exec` and `main.c` calls that instead), but the compiler
+still tries to compile every `.c` listed in the source set.
+
+**Root Cause:** The Phase 7a refactor was specified in two halves:
+header changes (delete the per-phase types and declarations) and
+source changes (delete the matching function bodies). The first cut
+applied only the header half. The compiler then refused to compile
+the function bodies whose parameter and return types had been
+deleted out from under them.
+
+**Impact:**
+
+- **Severity:** Build-blocking. `make` produces compile errors on
+  every helper `.c` file at once. No partial mitigation — the
+  refactor either applies in both halves or breaks completely.
+- **No runtime risk.** This is a build-time failure; no broken
+  binary ships. The compiler does its job.
+- **No silent corruption.** Compile failures are loud; the error
+  messages name the exact undefined types. Easier to diagnose than
+  the failure modes Errors #4, #9, or #11 produced.
+
+**Fix:**
+
+For each of `mount.c`, `overlay.c`, `uts.c`, `cgroup.c`, `net.c`,
+delete the dead block in the same edit that touched the matching
+header:
+
+1. The file-local `typedef struct { ... } child_args_t;` near the
+   top of the file.
+2. The `static void close_inherited_fds(bool enable_debug) { ... }`
+   helper.
+3. The `static int child_func(void *arg) { ... }` child entry point.
+4. The `*_result_t *_exec(const *_config_t *config) { ... }`
+   parent-side orchestrator.
+5. The `void *_cleanup(*_result_t *result) { ... }` teardown.
+6. In `cgroup.c` specifically: the synthetic `uts_config_t uts_cfg
+   = {...}` workaround inside the (now-deleted) `cgroup_exec` body —
+   it goes away with the surrounding function. Decision #31 covers
+   the matching change in `uts.h` / `uts.c`.
+
+Plus, for unrelated-but-clarifying hygiene, prune the now-unused
+`#include` directives at the top of each file (the deleted code
+needed `<sys/wait.h>` for `waitpid`, `<sys/mount.h>` for the rootfs
+sequence, `<dirent.h>` and `<sys/resource.h>` for
+`close_inherited_fds`, etc.; the surviving helpers don't).
+
+**Lesson:**
+
+When a header change deletes a type, the matching definition (or any
+declaration that uses that type) must move in the same commit. The
+compiler will reject the inconsistent state immediately, so the
+failure is loud — but the work to fix it is per-file, and it's easy
+to apply the header half first and then run `make` expecting success.
+The structural prevention is to treat header changes and source
+changes as a single edit unit when they reference the same types.
+
+A canary audit catches stragglers:
+
+```bash
+grep -rnE '\b(mount|overlay|uts|cgroup|net)_(exec|cleanup|config_t|result_t)\b' \
+    minicontainer/include/ minicontainer/src/ minicontainer/tests/ \
+    | grep -vE '^[^:]+:[0-9]+:\s*(//|/?\*)'
+```
+
+Run after applying both halves. The `grep -vE` filters out comment
+lines (historical documentation referencing the deleted types is
+acceptable; live code references are not). Empty output means the
+cleanup is complete.
+
+**Why the word boundaries matter:** A naïve pattern without `\b`
+catches `test_overlay_cleanup` (a test function name) as a substring
+of `overlay_cleanup`. The `\b` anchors prevent that false positive.
+
+**Files affected (fix):**
+
+- `src/mount.c` — function bodies and prologue deleted; build size
+  dropped from 6904 to 3199 bytes.
+- `src/overlay.c` — same plus the §3.5 leaked-fd debug-test block;
+  17732 → 8341 bytes.
+- `src/uts.c` — same; 15114 → 2565 bytes.
+- `src/cgroup.c` — same plus synthetic-`uts_config_t` workaround;
+  20456 → 5595 bytes.
+- `src/net.c` — same; 33161 → 14518 bytes. `find_ip_binary` also
+  promoted from `static` to public in the same edit (Decision #32).
+
+**Fix Applied:** 2026-05-13
+
+---
+
+### Error #19: Rootless `--hostname` Fails Under Ubuntu 24.04 AppArmor
+
+**Date Found:** 2026-05-14
+
+**Problem:** Running the documented rootless example
+
+```
+./minicontainer --user --pid --hostname mycontainer /bin/sh -c 'id && hostname'
+```
+
+from an *unconfined* shell (a plain `gnome-terminal` bash, an SSH session,
+a tmux pane) on Ubuntu 24.04 fails immediately with:
+
+```
+sethostname: Operation not permitted
+[child] Failed to setup UTS
+```
+
+The same binary, same flags, and same user run from the VS Code
+integrated terminal succeeds. Nothing in the minicontainer source
+differs between the two invocations.
+
+**Root Cause:** Ubuntu 24.04 ships with
+`kernel.apparmor_restrict_unprivileged_userns=1`. When an *unconfined*
+process calls `clone(CLONE_NEWUSER)`, the kernel auto-attaches a
+restrictive default AppArmor profile (`unprivileged_userns`) to the new
+namespace. That profile masks `CAP_SYS_ADMIN` *within* the new userns,
+so `sethostname(2)` returns `EPERM` even though the child is "root"
+inside the namespace and the `CLONE_NEWUTS` flag was set correctly.
+
+VS Code's integrated terminal runs under the `snap.code.code` AppArmor
+profile in **complain** mode (`cat /proc/self/attr/current` →
+`snap.code.code (complain)`). Complain-mode profiles log policy
+violations but do not enforce them, which is why the same invocation
+succeeds there. The mediation only kicks in for processes that the
+kernel treats as unconfined at the point of namespace creation.
+
+**Verification:**
+
+```
+$ cat /etc/os-release | grep PRETTY_NAME
+PRETTY_NAME="Ubuntu 24.04.4 LTS"
+
+$ cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+1
+
+$ cat /proc/self/attr/current        # from gnome-terminal bash
+unconfined
+
+$ cat /proc/self/attr/current        # from VS Code integrated terminal
+snap.code.code (complain)
+```
+
+**Impact:**
+
+- **Severity:** Medium for the rootless quickstart. The `--user --pid`
+  baseline still works (no hostname change is attempted). The failure
+  surfaces the moment a user adds `--hostname` to a rootless invocation
+  — every advertised rootless command except the first one trips it.
+- **Not a code defect.** The kernel + AppArmor stack is doing exactly
+  what `apparmor_restrict_unprivileged_userns=1` asks. The code's
+  step ordering (sync wait → setup_uts) is correct; there is no
+  reordering that would help.
+- **Trust impact for the rootless story.** The README advertises
+  "rootless containers, no sudo" as the Phase 4b headline. A user who
+  runs the documented commands and sees `sethostname: Operation not
+  permitted` will reasonably conclude minicontainer is broken.
+
+**Fix (documentation, not code):** The "sethostname: Operation not
+permitted" troubleshooting entry in `README.md` was rewritten to cover
+the Ubuntu 24.04 mediation explicitly, list the four workarounds
+(disable the sysctl, install a per-binary AppArmor profile declaring
+`userns,`, run from a complain-mode-confined parent, fall back to
+`sudo`), and call out that the existing rootless quickstart commands
+require one of those workarounds on a stock 24.04 install.
+
+**Why no code fix:** Three options were considered.
+
+1. **Detect the mediation and degrade gracefully** (skip `sethostname`
+   with a warning when `--user --hostname` is combined and we're on a
+   24.04-style system). Rejected because the "right" behavior is
+   ambiguous — silently skipping a flag the user passed is worse than
+   surfacing the kernel's verdict.
+2. **Ship a per-binary AppArmor profile that declares `userns,`.**
+   Rejected (for now) as too invasive for an educational project: an
+   `/etc/apparmor.d/minicontainer` install step pulls the project out
+   of "drop-in, no-config" territory. Reconsider in Phase 8b alongside
+   the hardening work.
+3. **Document.** Chosen. The kernel's mediation is the right
+   behavior at the system level (it raises the unprivileged-userns
+   security baseline by exactly the right amount); the right response
+   is to teach users where the boundary is and how to opt in.
+
+**Workarounds (in the documentation):**
+
+```bash
+# 1. Host-wide opt-out (lowers system security baseline)
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+# 2. Per-binary AppArmor profile (recommended, scoped to minicontainer)
+sudo tee /etc/apparmor.d/minicontainer >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile minicontainer /path/to/minicontainer flags=(unconfined) {
+    userns,
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/minicontainer
+
+# 3. Run from a complain-mode-confined parent (VS Code integrated
+#    terminal, lxc-attach session, etc.)
+
+# 4. Fall back to sudo (defeats the rootless goal)
+```
+
+**Lesson:** "rootless" is a property of the *runtime*, not of the host.
+The kernel + LSM stack can mediate what a "rootless" process is
+allowed to do inside its own user namespace, and that mediation is
+opaque to the program itself (`sethostname` just sees `EPERM`).
+Documentation for any rootless feature has to cover the LSM
+interaction explicitly, because the user's first encounter with the
+feature is the most likely place for a wrong impression to form
+("rootless doesn't work on my distro" sticks; "rootless works once
+you allow `userns,` for this binary" doesn't form unless you're
+told). This generalizes beyond AppArmor (SELinux, Landlock, Lockdown
+mode) — each LSM has its own knobs that can produce identical
+`EPERM` surface from inside a "successfully created" namespace.
+
+**Fix Applied:** 2026-05-14 (documentation)
 
 ---
 

@@ -5,48 +5,6 @@
 #include <stdbool.h>
 #include <sys/types.h>
 
-/**
- * Configuration for mount namespace and filesystem isolation
- */
-typedef struct {
-    const char *program;
-    char *const *argv;
-    char *const *envp;
-    bool enable_debug;
-
-    // Namespace flags
-    bool enable_pid_namespace;
-    bool enable_mount_namespace;
-
-    // Filesystem
-    const char *rootfs_path;    // NULL = no rootfs change
-} mount_config_t;
-
-/**
- * Result of mount operation
- */
-typedef struct {
-    pid_t child_pid;
-    int exit_status;
-    bool exited_normally;
-    int signal;
-    void *stack_ptr;
-} mount_result_t;
-
-/**
- * Execute process with mount namespace isolation.
- *
- * @param config  Configuration including rootfs path
- * @return        Result structure
- */
-mount_result_t mount_exec(const mount_config_t *config);
-
-/**
- * Cleanup resources allocated by mount_exec.
- *
- * @param result  Result from mount_exec
- */
-void mount_cleanup(mount_result_t *result);
 
 /**
  * Setup rootfs using pivot_root.

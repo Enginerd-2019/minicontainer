@@ -10,26 +10,6 @@
 #include <limits.h>
 
 /**
- * Configuration for overlay filesystem container.
- * Supersedes mount_config_t — includes all Phase 2 fields plus overlay.
- */
-typedef struct {
-    const char *program;
-    char *const *argv;
-    char *const *envp;
-    bool enable_debug;
-
-    // Namespace flags
-    bool enable_pid_namespace;
-    bool enable_mount_namespace;
-
-    // Filesystem
-    const char *rootfs_path;       // Base image (lowerdir), NULL = no rootfs
-    bool enable_overlay;           // Use overlayfs on top of rootfs
-    const char *container_dir;     // Parent dir for overlay data (default: "./containers")
-} overlay_config_t;
-
-/**
  * Overlay mount context (for setup and teardown).
  */
 typedef struct {
@@ -41,39 +21,6 @@ typedef struct {
     char merged_path[PATH_MAX];
     bool is_mounted;
 } overlay_context_t;
-
-/**
- * Result of overlay operation.
- */
-typedef struct {
-    pid_t child_pid;
-    int exit_status;
-    bool exited_normally;
-    int signal;
-    void *stack_ptr;
-} overlay_result_t;
-
-/**
- * Execute process with optional overlay filesystem isolation.
- *
- * Supersedes mount_exec() — handles all Phase 2 functionality plus
- * copy-on-write overlay filesystem.
- *
- * If enable_overlay is true, creates an overlay mount over rootfs.
- * The container sees a merged view; writes go to a disposable upper layer.
- * On exit, the overlay is torn down and the base image is untouched.
- *
- * @param config  Configuration including rootfs and overlay settings
- * @return        Result structure
- */
-overlay_result_t overlay_exec(const overlay_config_t *config);
-
-/**
- * Cleanup resources allocated by overlay_exec.
- *
- * @param result  Result from overlay_exec
- */
-void overlay_cleanup(overlay_result_t *result);
 
 /**
  * Setup overlay filesystem.

@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-6%20network-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-7a%20refactor-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,15 +12,28 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current Phase:** Phase 6 - Network Namespace (veth pair + optional NAT)
+**Current Phase:** Phase 7a - Execution-Core Consolidation (pure refactor)
 
-Building on Phase 5's resource limits, this phase adds **network isolation** via `CLONE_NEWNET` plus a veth pair that bridges the host's network stack to the container. Each container gets its own loopback, routing table, and interface set; the host-side end of the veth pair stays in the root namespace with an IP on the same /24 (by default), and optional `iptables` MASQUERADE provides outbound internet access. Namespaces answer "what can the container see?"; cgroups answer "how much can it use?"; the network namespace answers "what can it talk to?"
+Phase 7a is a structural refactor with **no new user-visible features**. Phases 0-6 each added an isolation primitive (PID, mount, overlay, UTS, user, IPC, cgroups, network) by introducing a new `*_exec()` function in a new module. By Phase 6 those functions were ~90% identical boilerplate — the same `clone()` / `waitpid()` / stack-allocation / overlay-setup / cgroup-setup / sync-pipe / error-cleanup skeleton, repeated five times. Phase 7a collapses them into a single `container_exec()` in a new `core.c` driven by a unified `container_config_t`. Every Phase 0-6 behavior is preserved byte-identical when the corresponding flags are set; the helpers (`setup_uts`, `setup_rootfs`, `setup_overlay`, `setup_cgroup`, `setup_net`, etc.) remain in their respective modules and are now called once from `core.c`'s unified `child_func`.
 
 ---
 
 ## Features
 
-### Phase 6 (Current)
+### Phase 7a (Current)
+
+- ✅ **Unified `container_exec()`** — One entry point in `core.c` replaces the per-phase `*_exec()` chain (`spawn_process` → `namespace_exec` → `mount_exec` → `overlay_exec` → `uts_exec` → `cgroup_exec` → `net_exec`). Behavior is driven entirely by `container_config_t` flags.
+- ✅ **Unified `container_config_t`** — Subsumes every prior `*_config_t`. Sets the namespace flags, rootfs / overlay / hostname / user-mapping / cgroup-limits / veth fields in one struct.
+- ✅ **Unified `container_context_t`** — Aggregates `overlay_ctx`, `cgroup_ctx`, `net_ctx`, and the clone stack pointer so `container_cleanup()` tears down everything in one call.
+- ✅ **One `child_func()`, one `close_inherited_fds()`, one `child_args_t`** — Five duplicate copies (one per phase module) collapse into a single canonical definition inside `core.c`.
+- ✅ **`env.c` / `env.h` Extracted** — `build_container_env()` moves out of `main.c` into its own module so tests and future subcommands can include it without dragging in the CLI layer. The function body is unchanged from Phase 5's defensive refactor.
+- ✅ **`user_ns_mapping_t` Replaces Synthetic `uts_config_t` Workaround** — Phase 5's `cgroup_exec` had to construct a partial `uts_config_t` just to call `setup_user_namespace_mapping()`; Phase 7a introduces a dedicated five-field struct (`uts.h`) that captures only what the mapping actually needs.
+- ✅ **`find_ip_binary()` Promoted to Public** — Declared in `net.h` so `core.c`'s parent-side early-failure check (Phase 6 invariant — fail loudly before `clone()` when `ip(8)` is missing) can call it without duplicating the path search.
+- ✅ **`spawn.c` / `namespace.c` / `test_spawn.c` / `test_namespace.c` Deleted** — Their behavior is fully covered by `container_exec` with appropriate flag combinations; `test_core.c` retains the bare-spawn and PID-only regression cases.
+- ✅ **All Phase 2-6 Tests Updated** — `test_mount.c`, `test_overlay.c`, `test_uts.c`, `test_cgroup.c`, `test_net.c` now call `container_exec(&cfg)` with `container_config_t` instead of the deleted per-phase APIs; local `build_container_env()` stubs replaced by `#include "env.h"`.
+- ✅ **Makefile `HELPER_OBJS` Pattern** — Every test links against the same helper chain as `minicontainer` (minus `main.o`, plus the test's own `.o`). One list, six rules — Phase 7a's whole point translated to the build system.
+
+### Phase 6
 
 - ✅ **Network Namespace Isolation** - `CLONE_NEWNET` gives the container its own loopback, routing table, and interfaces
 - ✅ **`--net` Flag** - Enables `CLONE_NEWNET` and provisions a veth pair connecting the container to the host
@@ -110,6 +123,27 @@ make
 
 This compiles the `minicontainer` executable in the current directory.
 
+#### Ubuntu 24.04+ rootless users — one-time AppArmor setup
+
+Ubuntu 24.04 sets `kernel.apparmor_restrict_unprivileged_userns=1`,
+which silently restricts what unprivileged user namespaces created by
+unconfined processes can do. Without a per-binary AppArmor profile,
+rootless minicontainer (`--user`) fails with `sethostname: Operation
+not permitted` and similar EPERM surface. Run this once:
+
+```bash
+make install-apparmor      # asks for sudo once; loads /etc/apparmor.d/minicontainer
+```
+
+`make uninstall-apparmor` removes it. The profile only declares
+`userns,` (it's not a sandbox) — same pattern Docker, Podman,
+Chromium, and Firefox use for their unprivileged-userns needs. See
+[docs/decisions.md](docs/decisions.md) Error #19 for the full story.
+
+If you move or rename the built binary afterward, re-run
+`make install-apparmor` so the profile's path matches. Other distros
+(earlier Ubuntu, Fedora, Arch, RHEL/Rocky) don't need this step.
+
 ### Run
 
 ```bash
@@ -117,6 +151,7 @@ This compiles the `minicontainer` executable in the current directory.
 ./minicontainer /bin/ls -la
 
 # Rootless container (no sudo — user namespace maps UID 0 to host user)
+# Ubuntu 24.04+: requires `make install-apparmor` once (see Build above)
 ./minicontainer --user --pid --hostname mycontainer /bin/sh -c 'id && hostname'
 
 # Rootless with rootfs (proc mount may warn — see Troubleshooting)
@@ -241,37 +276,43 @@ make valgrind
 ```
 minicontainer/
 ├── include/
-│   ├── net.h                # Phase 6: Network namespace, veth pair, NAT API
-│   ├── cgroup.h             # Phase 5: cgroups v2 resource limits API
-│   ├── uts.h                # Phase 4/4b/4c: UTS + user + IPC namespace API
-│   ├── overlay.h            # Phase 3: OverlayFS, environment, fd cleanup API
-│   ├── mount.h              # Phase 2: Mount namespace & rootfs API
-│   ├── namespace.h          # Phase 1: PID namespace isolation API
-│   └── spawn.h              # Phase 0: Process spawning API
+│   ├── core.h               # Phase 7a: container_config_t, container_exec(), container_cleanup()
+│   ├── env.h                # Phase 7a: build_container_env() (extracted from main.c)
+│   ├── net.h                # Phase 6: veth setup helpers, find_ip_binary() (public since 7a)
+│   ├── cgroup.h             # Phase 5: cgroups v2 setup/limits helpers
+│   ├── uts.h                # Phase 4/4b/4c: setup_uts(), setup_user_namespace_mapping(), user_ns_mapping_t (since 7a)
+│   ├── overlay.h            # Phase 3: setup_overlay(), teardown_overlay()
+│   └── mount.h              # Phase 2: setup_rootfs(), mount_proc()
 ├── src/
-│   ├── main.c               # CLI entry point and argument parsing
-│   ├── net.c                # Phase 6: net namespace, veth setup, ip(8) driver (supersedes cgroup.c)
-│   ├── cgroup.c             # Phase 5: cgroup setup/teardown, clone/exec (supersedes uts.c)
-│   ├── uts.c                # Phase 4/4b/4c: UTS + user + IPC namespace, sync pipe
-│   ├── overlay.c            # Phase 3: OverlayFS, close_inherited_fds
-│   ├── mount.c              # Phase 2: setup_rootfs, mount_proc
-│   ├── namespace.c          # Phase 1: clone() + PID namespace logic
-│   └── spawn.c              # Phase 0: fork/execve implementation
+│   ├── main.c               # CLI entry point — populates container_config_t, calls container_exec()
+│   ├── core.c               # Phase 7a: unified container_exec / child_func / close_inherited_fds (one canonical copy)
+│   ├── env.c                # Phase 7a: build_container_env() (calloc + bounds-check version from Phase 5)
+│   ├── net.c                # Phase 6: setup_net, configure_container_net, cleanup_net, generate_veth_names, find_ip_binary
+│   ├── cgroup.c             # Phase 5: setup_cgroup, add_pid_to_cgroup, remove_cgroup
+│   ├── uts.c                # Phase 4/4b: setup_uts, setup_user_namespace_mapping
+│   ├── overlay.c            # Phase 3: setup_overlay, teardown_overlay (+ static path/dir helpers)
+│   └── mount.c              # Phase 2: setup_rootfs, mount_proc
 ├── tests/
+│   ├── test_core.c          # Phase 7a: bare-exec + pid-only regressions (covers prior test_spawn / test_namespace cases)
 │   ├── test_net.c           # Phase 6: namespace creation, backward compat, net + cgroup (requires root)
 │   ├── test_cgroup.c        # Phase 5: cgroup lifecycle, memory/CPU/PID limits (requires root)
 │   ├── test_uts.c           # Phase 4/4b/4c: UTS + user + IPC namespace tests
 │   ├── test_overlay.c       # Phase 3: Overlay/env/fd tests (requires root + rootfs)
-│   ├── test_mount.c         # Phase 2: Mount/rootfs tests (requires root + rootfs)
-│   ├── test_namespace.c     # Phase 1: Namespace tests (requires root)
-│   └── test_spawn.c         # Phase 0: Spawn tests
+│   └── test_mount.c         # Phase 2: Mount/rootfs tests (requires root + rootfs)
 ├── scripts/
-│   └── build_rootfs.sh      # Builds minimal rootfs from host binaries (BINS includes `ip` for Phase 6)
+│   └── build_rootfs.sh      # Builds minimal rootfs from host binaries (BINS includes `ip`, `curl`, NSS modules)
 ├── docs/
 │   └── decisions.md         # Design decisions and error log
-├── Makefile                 # Build system
+├── Makefile                 # Build system (HELPER_OBJS unified link chain since 7a)
 └── README.md                # This file
 ```
+
+**Files removed in Phase 7a:** `include/spawn.h`, `include/namespace.h`,
+`src/spawn.c`, `src/namespace.c`, `tests/test_spawn.c`,
+`tests/test_namespace.c`. Their functionality is fully covered by
+`container_exec()` with `enable_pid_namespace` set (or unset, for the
+bare-spawn case). The deletions are why Phase 7a is a *pure refactor*
+— old code paths are replaced 1:1, no new behavior.
 
 ---
 
@@ -285,113 +326,195 @@ minicontainer/
 │  • Parses --pid, --rootfs, --overlay, --hostname,    │
 │    --memory, --cpus, --pids, --net, --net-host-ip,   │
 │    --net-container-ip, --net-netmask, --no-nat, etc. │
-│  • build_container_env() — clean environment         │
+│  • build_container_env() — clean environment (env.c) │
 │  • Misplaced flag detection                          │
-│  • Calls net_exec()                                  │
+│  • Populates container_config_t, calls               │
+│    container_exec()  (Phase 7a: one entry point)     │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
 ┌──────────────────────────────────────────────────────┐
-│            net.c (Orchestration Layer)               │
-│  • generate_veth_names() BEFORE clone()              │
-│  • setup_cgroup() → mkdir /sys/fs/cgroup/...         │
-│    write memory.max, cpu.max, pids.max               │
-│  • setup_overlay() → mount OverlayFS (from overlay.c)│
-│  • clone() with NEWPID|NEWNS|NEWUTS|NEWUSER|NEWIPC   │
-│    |NEWNET                                           │
-│  • setup_net() → ip link add veth pair, move         │
-│    container end into child netns, host IP + NAT     │
-│  • Sync pipe: UID/GID maps + signal once netns is    │
-│    fully provisioned (widened to OR --net)           │
-│  • add_pid_to_cgroup() → write cgroup.procs          │
-│  • waitpid() and exit status parsing                 │
-│  • teardown_overlay() → unmount and cleanup          │
-│  • cleanup_net() → delete host veth + iptables rule  │
-│  • remove_cgroup() → rmdir /sys/fs/cgroup/...        │
+│      core.c — Unified Orchestrator (Phase 7a)        │
+│                                                      │
+│  container_exec(const container_config_t *)          │
+│  - 15-step parent-side lifecycle (preserved from     │
+│    Phase 5/6, now a single canonical copy):          │
+│    1.  setup_cgroup()        (if enable_cgroup)      │
+│    2.  pipe(sync_pipe)       (if user OR network)    │
+│    3.  setup_overlay()       (if overlay + rootfs)   │
+│    4.  malloc(STACK_SIZE)                            │
+│    5.  generate_veth_names() BEFORE clone()          │
+│    6.  populate child_args (snapshot, pre-clone)     │
+│    7.  clone(CLONE_NEW* per config flags)            │
+│    8.  setup_user_namespace_mapping() (user_ns)      │
+│    9.  setup_net()           (if network)            │
+│   10.  write sync byte → child unblocks              │
+│   11.  add_pid_to_cgroup()   (AFTER sync)            │
+│   12.  waitpid()                                     │
+│   13.  parse WIFEXITED / WIFSIGNALED                 │
+│   14.  teardown_overlay() if active                  │
+│   15.  (cleanup_net / remove_cgroup / free stack     │
+│         deferred to container_cleanup())             │
+│                                                      │
+│  container_cleanup(container_result_t *)             │
+│  - cleanup_net() → delete host veth + iptables rule  │
+│  - remove_cgroup() → rmdir /sys/fs/cgroup/...        │
+│  - free(stack_ptr)                                   │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
 ┌──────────────────────────────────────────────────────┐
-│            Child Process (child_func)                │
+│   Child Process (core.c child_func — single copy)    │
 │  • Wait on sync pipe (if --user OR --net)            │
-│  • setup_uts(): sethostname() in new UTS namespace   │
-│  • setup_rootfs(): pivot_root to new rootfs          │
-│  • mount_proc(): mount /proc (warning if user ns)    │
-│  • configure_container_net(): lo up, IP add to       │
-│    veth_c, default route via host_ip                 │
-│  • close_inherited_fds(): close leaked parent fds    │
-│  • execve() with clean container environment         │
+│  • setup_uts()              (uts.c)                  │
+│  • setup_rootfs()           (mount.c)                │
+│  • mount_proc() with graceful /proc degradation      │
+│  • configure_container_net() (net.c, if network)     │
+│  • close_inherited_fds() — CVE-2024-21626/CVE-2016-  │
+│    9962 mitigation, single canonical copy            │
+│  • execve(program, argv, envp) — clean container env │
 └──────────────────────────────────────────────────────┘
+
+Helper modules called from core.c's parent and child halves:
+  mount.c, overlay.c, uts.c, cgroup.c, net.c
+Each retains only the helper functions it owns — no per-phase
+*_exec() orchestrator, no duplicate child_func, no duplicate
+close_inherited_fds.
 ```
 
 **Phase transitions:**
-- Phase 0: `spawn.c` (`fork/execve`)
-- Phase 1: `namespace.c` (`clone(CLONE_NEWPID)`)
-- Phase 2: `mount.c` (`clone(CLONE_NEWPID | CLONE_NEWNS)` + `pivot_root`)
-- Phase 3: `overlay.c` (OverlayFS + env isolation + fd cleanup), calls into `mount.c` for `setup_rootfs`/`mount_proc`
-- Phase 4: `uts.c` (`CLONE_NEWUTS` + `sethostname`), calls into `overlay.c` and `mount.c`
-- Phase 4b: `uts.c` extended with `CLONE_NEWUSER`, sync pipe, UID/GID mapping (no new module — see code duplication note)
-- Phase 4c: `uts.c` extended with `CLONE_NEWIPC` (one flag, zero new child-side code)
-- Phase 5: `cgroup.c` (cgroups v2 resource limits), supersedes `uts.c` as exec module, imports `setup_uts`/`setup_user_namespace_mapping` from `uts.h` and overlay/mount helpers
-- Phase 6: `net.c` (`CLONE_NEWNET` + veth pair + optional MASQUERADE), supersedes `cgroup.c` as exec module, imports `setup_cgroup`/`add_pid_to_cgroup`/`remove_cgroup` from `cgroup.h` and the rest of the chain
-- Earlier modules retained for their respective phase tests
+- Phase 0: bare `fork/execve` (`spawn_process`)
+- Phase 1: `clone(CLONE_NEWPID)` (`namespace_exec`)
+- Phase 2: `mount.c` (`mount_exec` — `CLONE_NEWPID | CLONE_NEWNS` + `pivot_root`)
+- Phase 3: `overlay.c` (`overlay_exec` — OverlayFS + env isolation + fd cleanup), calling into `mount.c`
+- Phase 4: `uts.c` (`uts_exec` — `CLONE_NEWUTS` + `sethostname`), calling into `overlay.c` and `mount.c`
+- Phase 4b: `uts.c` extended in place with `CLONE_NEWUSER`, sync pipe, UID/GID mapping
+- Phase 4c: `uts.c` extended in place with `CLONE_NEWIPC` (one flag, zero new child-side code)
+- Phase 5: `cgroup.c` (`cgroup_exec`) supersedes `uts.c` as the top-level exec module
+- Phase 6: `net.c` (`net_exec`) supersedes `cgroup.c` as the top-level exec module
+- **Phase 7a:** every `*_exec()` collapsed into `container_exec()` in `core.c`. The helper modules (mount.c, overlay.c, uts.c, cgroup.c, net.c) keep their helpers (`setup_*`, `cleanup_*`) — they no longer carry the orchestration boilerplate.
 
-**Note on code duplication:** Each phase's `*_exec()` function (e.g., `overlay_exec`, `uts_exec`) shares ~90% of its structure with the previous phase — `clone()`, `waitpid()`, stack allocation, and exit status parsing are repeated each time. This is a deliberate pedagogical choice: each module is self-contained and readable without cross-referencing earlier phases. A production runtime would factor this into a shared execution core, and this refactoring is planned for Phase 7 (CLI & Lifecycle).
+**Why the duplication existed (and why 7a removed it):** Each phase's
+`*_exec()` shared ~90% of its structure with the previous phase —
+`clone()`, `waitpid()`, stack allocation, sync-pipe orchestration, and
+exit status parsing repeated five times by Phase 6. This was a
+deliberate pedagogical choice: each module was self-contained and
+readable without cross-referencing earlier phases. The cost
+accumulated: bug fixes had to propagate to five copies (Phase 5's first
+cut dropped invariants from its copy and required a retro audit; Phase
+6 repeated the pattern), and every new phase added ~250 lines of
+boilerplate before introducing one line of actual isolation logic.
+Phase 7a's `container_exec()` is a single 250-line orchestrator that
+covers every flag combination. The price is that `core.c` is harder to
+read in one pass than any single `*_exec()` was — but it's exactly as
+hard to read as the most complex one (`net_exec`), and it doesn't
+multiply. Decisions.md #30 has the full rationale.
 
 ### API Design
 
-**Configuration structure:**
+**Configuration structure (Phase 7a — unified):**
+
+A single `container_config_t` carries every flag and parameter. Setting
+a flag without its dependent fields is harmless (e.g.,
+`enable_uts_namespace = true` with `hostname = NULL` creates the
+namespace but doesn't change the hostname); setting a parameter without
+the gating flag is silently ignored (e.g., `hostname = "foo"` with
+`enable_uts_namespace = false` doesn't sethostname).
+
 ```c
-net_config_t config = {
+#include "core.h"
+#include "env.h"
+
+char **env = build_container_env(NULL, false);
+char *argv[] = {"/bin/sh", "-c", "echo hello", NULL};
+
+container_config_t cfg = {
     .program = "/bin/sh",
-    .argv = argv,                     // NULL-terminated array
-    .envp = env,                      // From build_container_env()
+    .argv    = argv,                  // NULL-terminated
+    .envp    = env,                   // From build_container_env()
     .enable_debug = false,
-    .enable_pid_namespace = true,     // Use CLONE_NEWPID
-    .enable_mount_namespace = true,   // Use CLONE_NEWNS
-    .rootfs_path = "./rootfs",        // NULL = no rootfs change
-    .enable_overlay = true,           // Use OverlayFS on top of rootfs
-    .container_dir = NULL,            // NULL = default "./containers"
-    .enable_uts_namespace = true,     // Use CLONE_NEWUTS
-    .hostname = "mycontainer",        // NULL = no hostname change
-    .enable_user_namespace = true,    // Use CLONE_NEWUSER (rootless)
-    .enable_ipc_namespace = true,     // Use CLONE_NEWIPC (IPC isolation)
-    .uid_map_inside = 0,              // Container root...
-    .uid_map_outside = getuid(),      // ...maps to host user
-    .uid_map_range = 1,
-    .gid_map_inside = 0,
+
+    // Namespace flags (Phase 1 / 2 / 4 / 4b / 4c / 6)
+    .enable_pid_namespace   = true,   // CLONE_NEWPID
+    .enable_mount_namespace = true,   // CLONE_NEWNS
+    .enable_uts_namespace   = true,   // CLONE_NEWUTS
+    .enable_user_namespace  = true,   // CLONE_NEWUSER (rootless)
+    .enable_ipc_namespace   = true,   // CLONE_NEWIPC
+    .enable_network         = true,   // CLONE_NEWNET
+
+    // Filesystem (Phase 2 / 3)
+    .rootfs_path   = "./rootfs",
+    .enable_overlay = true,
+    .container_dir = NULL,            // NULL = "./containers"
+
+    // UTS (Phase 4)
+    .hostname = "mycontainer",
+
+    // User namespace mapping (Phase 4b)
+    .uid_map_inside  = 0,
+    .uid_map_outside = getuid(),
+    .uid_map_range   = 1,
+    .gid_map_inside  = 0,
     .gid_map_outside = getgid(),
-    .gid_map_range = 1,
-    // Phase 5: cgroup resource limits
+    .gid_map_range   = 1,
+
+    // cgroup resource limits (Phase 5)
     .enable_cgroup = true,
     .cgroup_limits = {
         .memory_limit = 100 * 1024 * 1024,  // 100 MB
-        .cpu_quota = 50000,                  // 50% of one core
-        .cpu_period = 100000,                // (over 100ms period)
-        .pid_limit = 20                      // Max 20 processes
+        .cpu_quota    = 50000,               // 50% of one core
+        .cpu_period   = 100000,              // (over 100ms period)
+        .pid_limit    = 20                   // Max 20 processes
     },
-    // Phase 6: network namespace + veth pair
-    .enable_network = true,           // Use CLONE_NEWNET
+
+    // Network — veth + optional NAT (Phase 6)
     .veth = {
         .host_ip      = "10.0.0.1",
         .container_ip = "10.0.0.2",
         .netmask      = "24",
-        .enable_nat   = true              // iptables MASQUERADE for outbound
+        .enable_nat   = true                 // iptables MASQUERADE
     }
 };
 ```
 
-**Result structure:**
-```c
-net_result_t result = net_exec(&config);
+**Result structure (Phase 7a — unified):**
 
-if (result.exited_normally) {
-    printf("Exit code: %d\n", result.exit_status);
+```c
+container_result_t r = container_exec(&cfg);
+
+if (r.exited_normally) {
+    printf("Exit code: %d\n", r.exit_status);
 } else {
-    printf("Killed by signal %d\n", result.signal);  // 137 = OOM-killed
+    printf("Killed by signal %d\n", r.signal);   // 137 = OOM-killed
 }
 
-net_cleanup(&result);  // Tear down veth + NAT, remove cgroup, free stack
+container_cleanup(&r);   // cleanup_net + remove_cgroup + free(stack)
+free(env);
+```
+
+`container_result_t.ctx` is a `container_context_t` aggregating the
+runtime state each helper produced (`overlay_ctx`, `cgroup_ctx`,
+`net_ctx`, `stack_ptr`). `container_cleanup()` walks the context in
+reverse setup order; calling it on a zero-initialized result is a
+no-op (idempotent).
+
+**user_ns_mapping_t** — a Phase 7a addition in `uts.h`. Replaces the
+synthetic-`uts_config_t` workaround that Phase 5's `cgroup_exec` used
+to thread mapping data through `setup_user_namespace_mapping()`. The
+flat `uid_map_*` / `gid_map_*` fields on `container_config_t` are
+packed into a `user_ns_mapping_t` inside `core.c` and passed to the
+helper:
+
+```c
+typedef struct {
+    uid_t uid_map_inside;
+    uid_t uid_map_outside;
+    size_t uid_map_range;
+    gid_t gid_map_inside;
+    gid_t gid_map_outside;
+    size_t gid_map_range;
+    bool  enable_debug;
+} user_ns_mapping_t;
 ```
 
 ---
@@ -460,10 +583,17 @@ On container exit: upper/, work/, merged/ are removed.
 rootfs/ is never modified.
 ```
 
-### The overlay_exec Pattern (Phase 3)
+### The clone/pivot_root/execve Pattern (introduced in Phase 3, unified in Phase 7a)
+
+The Phase 3 introduction of OverlayFS established the parent/child
+split that every subsequent phase elaborated. Phase 7a moved the
+parent-side orchestration into `container_exec()` and the child-side
+sequence into `core.c`'s `child_func()`, so the diagram below now
+describes the canonical structure of those two functions rather than a
+per-module `overlay_exec`.
 
 ```
-Parent Process                   Child Process (new PID + mount namespace)
+Parent (container_exec)          Child Process (new PID + mount namespace)
      │
      ├── setup_overlay()
      │   ├── init_overlay_paths()
@@ -495,8 +625,10 @@ Parent Process                   Child Process (new PID + mount namespace)
      │   ├── umount2(merged/, MNT_DETACH)
      │   └── remove upper/, work/, merged/, container_base/
      │
-     │ overlay_cleanup()
-     │ (Frees clone stack)
+     │ container_cleanup()   (Phase 7a — was overlay_cleanup() pre-7a)
+     │ ├── cleanup_net()
+     │ ├── remove_cgroup()
+     │ └── free(stack_ptr)
      ▼
 ```
 
@@ -628,9 +760,7 @@ hit the rootfs directory directly. Adding `--overlay` changes that:
 $ rm -f rootfs/tmp/curl_out
 
 # Run the same curl with --overlay.
-$ sudo ./minicontainer --pid --rootfs ./rootfs --overlay --net /bin/sh -c \
-    'curl -sS --connect-timeout 5 --max-time 20 \
-        -o /tmp/curl_out -w "%{http_code}\n" https://example.com'
+$ sudo ./minicontainer --pid --rootfs ./rootfs --overlay --net /bin/sh -c 'curl -sS --connect-timeout 5 --max-time 20 -o /tmp/curl_out -w "%{http_code}\n" https://example.com'
 200
 
 # The write went to the overlay's upperdir, which was discarded on
@@ -656,8 +786,7 @@ $ sudo ./minicontainer --pid --rootfs ./rootfs --overlay --net /bin/sh
 
 # Inside the container (no PS1 prompt — Phase 7b adds proper PTY/TTY
 # allocation; today the shell runs in line-mode without job control):
-curl -sS --connect-timeout 5 --max-time 20 \
-    -o /tmp/curl_out -w "%{http_code}\n" https://example.com
+curl -sS --connect-timeout 5 --max-time 20 -o /tmp/curl_out -w "%{http_code}\n" https://enginerd2019.dev
 # 200
 
 ls -l /tmp/curl_out
@@ -994,6 +1123,11 @@ Following shell/POSIX conventions:
 ## Design Decisions
 
 See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
+- **Phase 7a execution-core consolidation** — why five `*_exec()` functions collapse into one `container_exec()`, how the unified `container_config_t` / `container_context_t` / `container_result_t` are organized, what the `child_args_t` snapshot semantics buy you (Decision #30)
+- **`user_ns_mapping_t` replaces the synthetic `uts_config_t` workaround** from Phase 5 — why the signature change to `setup_user_namespace_mapping()` is worth a dedicated five-field struct (Decision #31)
+- **`find_ip_binary()` promoted from `static` to public** — the second half of the promotion (the `static` qualifier on the definition has to be dropped in lockstep with adding the declaration to `net.h`) (Decision #32)
+- **Makefile `HELPER_OBJS` unified link chain** — one list, six rules; the consequence of Phase 7a's consolidation reaching the build system (Decision #33)
+- **Helper `.c` cleanup lockstep with helper `.h` cleanup** — why removing a type from a header obligates removing the function bodies that referenced it from the same module's `.c` file (Error #18)
 - Why `net.c` is a separate module (supersedes `cgroup.c`, imports its API)
 - Why network setup uses `fork+exec` of `ip(8)` instead of raw netlink (pedagogical clarity > performance)
 - Three-path `find_ip_binary()` search — same helper used pre-clone (host) and post-pivot_root (rootfs)
@@ -1001,7 +1135,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - Why the sync pipe is widened to fire on `enable_user_namespace OR enable_network` (veth move must finish before the child runs)
 - Why `cleanup_net()` stores `nat_source_cidr` in the context (so cleanup doesn't need the original config)
 - Why `cgroup.c` is a separate module (vs. extending `uts.c` like Phase 4b/4c)
-- `build_container_env()` defensive refactor for Phase 7 extraction (Decision #21)
+- `build_container_env()` defensive refactor that enabled the Phase 7a extraction into `env.c` (Decision #21)
 - Cgroup three-phase lifecycle (create before clone, add PID after, remove after exit)
 - IPC namespace isolation and why it's explicit opt-in (not auto-enabled)
 - Why IPC namespace ≠ all shared memory (POSIX `shm_open` is a mount namespace concern)
@@ -1016,8 +1150,8 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - Why pivot_root() instead of chroot()
 - Mount propagation (MS_PRIVATE | MS_REC) before pivot_root
 - Lazy unmount (MNT_DETACH) for old root and overlay cleanup
-- Modular design (spawn.c/namespace.c/mount.c/overlay.c/uts.c separation)
-- All errors found and fixed during implementation (Errors #1–#16)
+- Modular design (mount.c/overlay.c/uts.c/cgroup.c/net.c — helpers retained after Phase 7a consolidation)
+- All errors found and fixed during implementation (Errors #1–#18)
 
 ---
 
@@ -1105,7 +1239,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] `build_container_env()` defensive refactor (decisions.md #21)
 - [x] Unit tests (`test_cgroup` requires root)
 
-### ✅ Phase 6: Network Namespace (Current)
+### ✅ Phase 6: Network Namespace
 - [x] New `net.c`/`net.h` module supersedes `cgroup.c` as exec path
 - [x] `CLONE_NEWNET` — container gets its own loopback, routing table, interfaces
 - [x] veth pair created via `ip link add`; container end moved with `ip link set ... netns <pid>`
@@ -1118,15 +1252,32 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] `cleanup_net()` deletes host veth + iptables rule (kernel handles container end at netns destruction)
 - [x] Unit tests (`test_net` requires root + iproute2)
 
-### 📋 Phase 7: CLI & Lifecycle
-- [ ] Container lifecycle management
-- [ ] Start/stop/exec commands
-- [ ] Refactor shared `*_exec()` boilerplate into common execution core
+### ✅ Phase 7a: Execution-Core Consolidation (Current)
+- [x] New `core.c`/`core.h` module — unified `container_exec()`, `container_cleanup()`, `container_config_t`, `container_context_t`, `container_result_t`
+- [x] Five duplicate `child_func` / `close_inherited_fds` / `child_args_t` copies collapsed to one canonical definition each in `core.c`
+- [x] New `env.c`/`env.h` — `build_container_env()` extracted from `main.c` for reuse by tests and (future) subcommands
+- [x] `user_ns_mapping_t` (in `uts.h`) replaces the synthetic-`uts_config_t` workaround from Phase 5
+- [x] `find_ip_binary()` promoted from `static` to public (declared in `net.h`) so `core.c`'s early-failure check can call it
+- [x] Helper headers slimmed: `mount.h`, `overlay.h`, `uts.h`, `cgroup.h`, `net.h` drop their per-phase `*_config_t` / `*_result_t` / `*_exec()` / `*_cleanup()` declarations
+- [x] Helper sources slimmed in lockstep: each `.c` drops its file-local `child_args_t`, `static child_func()`, `static close_inherited_fds()`, `*_exec()`, `*_cleanup()`
+- [x] `spawn.c` / `namespace.c` / `test_spawn.c` / `test_namespace.c` deleted entirely
+- [x] All Phase 2-6 tests migrated to `container_exec()` / `container_config_t`; local `build_container_env()` stubs replaced by `#include "env.h"`
+- [x] New `test_core.c` covers the bare-exec and PID-only cases (former `test_spawn` / `test_namespace` coverage)
+- [x] Makefile `HELPER_OBJS` unified link chain — every test links against the same helper set as `minicontainer` (minus `main.o`, plus the test's own `.o`)
+- [x] Zero new user-visible features — pure refactor; every Phase 0-6 test passes behaviorally identical
 
-### 📋 Phase 8: Inspector Integration
-- [ ] OCI runtime spec compliance
-- [ ] Image management
-- [ ] Container inspection tools
+### 📋 Phase 7b: CLI & Lifecycle + Bind Mounts
+- [ ] Subcommand dispatch (`run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`)
+- [ ] Container state files (`/run/minicontainer/<id>/state.json` + pidfile, `$XDG_RUNTIME_DIR/...` for rootless)
+- [ ] `container_exec()` split into `container_start()` + `container_wait()` so state can be written between the two halves
+- [ ] `--volume host:container[:ro]` bind mounts
+- [ ] `--interactive` PTY allocation
+- [ ] `cleanup` subcommand scans for stale containers
+
+### 📋 Phase 8: Inspector + Hardening + OCI Bundles
+- [ ] **8a:** Static `libprocfs.a` extracted as a sibling project; cgroup read-side + `/proc` parsing reused by container `inspect` / `stats` / `top` / `netstat` subcommands
+- [ ] **8b:** Production hardening — opt-in `--secure` flag: capability dropping (raw `capset(2)`, no libcap), `PR_SET_NO_NEW_PRIVS`, seccomp BPF allow-list (raw `prctl(PR_SET_SECCOMP)`, no libseccomp), read-only `/sys`, atomic state-file writes, container ID collision retry
+- [ ] **8c:** OCI Runtime Spec compliance — hand-rolled `config.json` parser, `--bundle <dir>` flag, minimal `pull <tag>` whitelist (alpine/ubuntu, explicitly not a registry client), `oci-state.json` round-trip with runc-compatible tools
 
 ---
 
@@ -1438,11 +1589,98 @@ closing (3 through `RLIMIT_NOFILE`) when `/proc/self/fd` is unavailable.
 
 ### "sethostname: Operation not permitted"
 
-**Problem:** `sethostname` fails because the child is not in a new UTS namespace.
+**Symptom:**
 
-**Check:**
-1. Are you using `--hostname`? This flag auto-enables `CLONE_NEWUTS`
-2. Are you running with `sudo`? UTS namespace creation requires `CAP_SYS_ADMIN`
+```
+$ ./minicontainer --user --pid --hostname mycontainer /bin/sh -c 'id && hostname'
+sethostname: Operation not permitted
+[child] Failed to setup UTS
+```
+
+This bites the rootless flow specifically — every `--user --hostname …`
+example in the quickstart trips it. The first thing to check is which
+of two distinct causes is biting you.
+
+#### Cause A — Ubuntu 24.04 (and newer) restricts unprivileged user namespaces
+
+If you're on Ubuntu 24.04+ and the symptom appears only when you add
+`--user`, AppArmor is mediating your unprivileged user namespace.
+Ubuntu 24.04 ships with `kernel.apparmor_restrict_unprivileged_userns=1`.
+When an *unconfined* process creates a new user namespace, the kernel
+attaches a default AppArmor profile that masks `CAP_SYS_ADMIN` inside
+the new namespace — so `sethostname(2)` returns `EPERM` even though
+the child is "root" within its own userns and `CLONE_NEWUTS` was set
+correctly.
+
+**Verify:**
+
+```bash
+cat /etc/os-release | grep PRETTY_NAME
+# PRETTY_NAME="Ubuntu 24.04.4 LTS"
+
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+# 1 — restriction is active
+
+cat /proc/self/attr/current
+# unconfined  ← restriction will be applied when you create a userns
+# (a value like "snap.code.code (complain)" means you're already
+#  inside a complain-mode profile and the restriction is bypassed —
+#  which is why the same command works in a VS Code terminal)
+```
+
+**Fix (recommended) — install the shipped AppArmor profile:**
+
+```bash
+make install-apparmor       # asks for sudo once
+```
+
+This renders `scripts/apparmor/minicontainer.profile.in` with the
+binary's absolute path, installs it to `/etc/apparmor.d/minicontainer`,
+and loads it via `apparmor_parser -r`. The profile declares `userns,`
+and otherwise leaves the binary unconfined — the same pattern Docker,
+Podman, Chromium, and Firefox use for their unprivileged-userns needs.
+This preserves the host's system-wide userns mediation for every other
+program. Remove with `make uninstall-apparmor`. If you move or rename
+the binary, re-run `make install-apparmor` so the profile's path
+matches.
+
+**Alternatives** (in roughly decreasing order of preference):
+
+```bash
+# Option A — Run from a process already under a complain-mode AppArmor
+#   profile (VS Code's integrated terminal qualifies on a default
+#   Ubuntu install). Useful for one-off experiments, not a real fix.
+
+# Option B — Use sudo. Defeats the rootless goal but works everywhere.
+sudo ./minicontainer --pid --hostname mycontainer /bin/sh -c 'id && hostname'
+
+# Option C — Disable the mediation host-wide. NOT RECOMMENDED.
+#   This lowers the system security baseline for every program on the
+#   host (including programs that exploit unprivileged-userns bugs);
+#   it's the wrong knob to turn for one binary's needs.
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+The code's step ordering (sync wait on UID/GID map → `setup_uts`) is
+correct; this is not a bug to reorder around. The kernel's mediation
+is opaque to `sethostname` itself, which just sees `EPERM`. See Error
+#19 in `docs/decisions.md` for the longer write-up.
+
+#### Cause B — `--hostname` is not actually enabling `CLONE_NEWUTS`
+
+This shouldn't happen with the standard build (the `--hostname` flag
+auto-enables `enable_uts_namespace`) but is the right thing to check
+when the symptom appears *without* `--user`:
+
+1. Confirm `--hostname <name>` is on the command line (not a typo like `-hostname`).
+2. Confirm you're running the freshly built binary (`make clean && make` then
+   `./minicontainer …` from `minicontainer/`).
+3. With `--debug`, the parent prints `[parent] Creating UTS namespace` before
+   `clone()` — its absence means `enable_uts_namespace` was false.
+
+If `CLONE_NEWUTS` is set, the child is in a new UTS namespace and
+`sethostname` should succeed — under root, or under `--user` once one
+of Cause A's workarounds is in place.
 
 ---
 
@@ -1520,9 +1758,19 @@ sudo setcap cap_sys_admin+ep ./minicontainer
 
 ### Linker errors after phase transition
 
-**Problem:** `undefined reference to 'mount_exec'`
+**Problem:** `undefined reference to 'container_exec'` / `undefined reference to 'build_container_env'`
 
-**Solution:** Update the Makefile to compile and link the new source files. See [decisions.md](docs/decisions.md) for details.
+**Solution:** Update the Makefile to compile and link the new source files. Phase 7a centralized this via a `HELPER_OBJS` variable that every test target reuses; if your link rule predates Phase 7a, add `$(BUILD_DIR)/core.o $(BUILD_DIR)/env.o` to its prerequisite list. See decisions.md Decision #33 for the rationale.
+
+---
+
+### Linker errors after deleting per-phase types from a header
+
+**Problem:** After slimming a helper header (e.g., removing `net_config_t` and `net_result_t` from `net.h`), the build fails with `error: unknown type name 'net_config_t'` inside `net.c` — even though those types are no longer used externally.
+
+**Cause:** A per-phase `*_exec()` body in the corresponding `.c` file still references the type via its signature or local variable. Phase 7a consolidates `*_exec()` into `core.c::container_exec()`, so the per-phase exec bodies are no longer reachable — but the compiler still tries to compile them as long as they sit in the helper's `.c` file.
+
+**Solution:** When you remove a `*_config_t` / `*_result_t` / `*_exec()` / `*_cleanup()` declaration from a helper header, delete its function body from the matching `.c` file in the same commit. The two have to move together. The file-local `child_args_t`, `static child_func()`, and `static close_inherited_fds()` in the same `.c` file go with them — they only existed to serve the now-deleted exec. See decisions.md Error #18 for the full case and the audit grep that catches stragglers.
 
 ---
 

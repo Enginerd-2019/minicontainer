@@ -1,120 +1,12 @@
 // Note: _GNU_SOURCE is provided by the Makefile via -D_GNU_SOURCE.
-// Do NOT redefine it here (Error #8 from decisions.md).
-#include "net.h"        // Phase 6: was "cgroup.h" in Phase 5
+#include "core.h" // Phase 7
+#include "env.h"  // Phase 7
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <string.h>
-
-#define MAX_ENV_ENTRIES 256
-#define DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-/**
- * Build container environment.
- *
- * Originally introduced in Phase 3 (§3.4) to replace the host environ leak
- * after pivot_root. Refactored in Phase 5 (§3.7) to drop caller-invariant
- * assumptions: this version is safe to call from any context, not just
- * main.c with its --env validation.
- *
- * Algorithm:
- *   1. Start with a minimal container baseline (PATH, HOME, TERM).
- *   2. Merge custom entries: if a key already exists, replace; otherwise append.
- *   3. Return a NULL-terminated argv-style array suitable for execve().
- *
- * Ownership: caller owns the returned pointer and must free() it. The
- * function does not duplicate the string contents — they point into
- * defaults[] (static storage) or custom_env[] (caller's storage).
- *
- * @param custom_env    NULL-terminated array of "KEY=VALUE" strings, or NULL.
- * @param enable_debug  Print the final environment for inspection.
- * @return  Heap-allocated, NULL-terminated env array; NULL on allocation failure.
- */
-static char **build_container_env(char *const *custom_env, bool enable_debug) {
-    /* Minimal container baseline. Matches Docker's default-environment policy:
-     * never leak the host's PATH/HOME/SHELL, since those reference host paths
-     * that don't exist inside the container rootfs. */
-    char *defaults[] = {
-        "PATH=" DEFAULT_PATH,
-        "HOME=/root",
-        "TERM=xterm",
-        NULL
-    };
-
-    /* Count baseline entries so we can index past them in the merge loop. */
-    int count = 0;
-    while (defaults[count]) count++;
-
-    /* Over-allocate to a compile-time ceiling rather than sizing exactly to
-     * fit custom_env. Reasons (see §3.7):
-     *   - calloc zero-initializes every slot, providing an implicit NULL
-     *     terminator everywhere we haven't written yet.
-     *   - MAX_ENV_ENTRIES is a constant — the size calculation cannot be
-     *     wrong, even under integer overflow or a misformed input array.
-     *   - The bounds check below caps total entries at max_entries - 1,
-     *     so a malformed custom_env can drop entries but never overflow.
-     */
-    int max_entries = count + MAX_ENV_ENTRIES + 1;
-    char **env = calloc(max_entries, sizeof(char *));
-    if (!env) {
-        perror("calloc");
-        return NULL;
-    }
-
-    /* Copy the baseline. No NULL-terminator placement needed — calloc set
-     * every slot to NULL already. */
-    for (int i = 0; i < count; i++) {
-        env[i] = defaults[i];
-    }
-
-    /* Merge custom entries. Replace existing keys; append new ones. */
-    if (custom_env) {
-        for (int i = 0; custom_env[i]; i++) {
-            /* Locate the key/value separator. Entries without '=' are
-             * malformed (no KEY=VALUE form) — skip silently rather than
-             * abort, matching shell-style environment behavior. */
-            const char *eq = strchr(custom_env[i], '=');
-            if (!eq) continue;
-
-            /* Compare on "KEY=" (including the '=') so prefix matches like
-             * "PATH" vs "PATHINFO" don't collide. */
-            size_t key_len = eq - custom_env[i];
-            bool replaced = false;
-
-            for (int j = 0; j < count; j++) {
-                if (strncmp(env[j], custom_env[i], key_len + 1) == 0) {
-                    env[j] = custom_env[i];  /* In-place key replacement. */
-                    replaced = true;
-                    break;
-                }
-            }
-
-            /* Defense-in-depth: even though main.c caps custom_env at
-             * MAX_ENV_ENTRIES - 1, check at the append site so this function
-             * stays safe when extracted into a shared utility module
-             * (Phase 7) and called from contexts that don't pre-validate. */
-            if (!replaced && count < max_entries - 1) {
-                env[count++] = custom_env[i];
-            }
-        }
-    }
-
-    /* Final NULL terminator. calloc already placed one, but explicit
-     * termination makes the contract clear and survives any future
-     * refactoring. */
-    env[count] = NULL;
-
-    if (enable_debug) {
-        printf("[parent] Container environment:\n");
-        for (int i = 0; env[i]; i++) {
-            printf("[parent]   %s\n", env[i]);
-        }
-    }
-
-    return env;
-}
 
 /**
  * Parse memory limit string (e.g., "100M", "1G", "512K").
@@ -149,18 +41,17 @@ static void usage(const char *progname) {
     fprintf(stderr, "  --pid                    Enable PID namespace\n");
     fprintf(stderr, "  --rootfs <path>          Path to root filesystem\n");
     fprintf(stderr, "  --overlay                Enable copy-on-write overlay\n");
-    fprintf(stderr, "  --container-dir <p>      Directory for overlay data (default: ./containers)\n");
+    fprintf(stderr, "  --container-dir <p>      Directory for overlay data\n");
     fprintf(stderr, "  --hostname <name>        Set container hostname\n");
     fprintf(stderr, "  --user                   Enable user namespace (run without sudo)\n");
     fprintf(stderr, "  --ipc                    Enable IPC namespace\n");
     fprintf(stderr, "  --memory <limit>         Memory limit (e.g., 100M, 1G)\n");
     fprintf(stderr, "  --cpus <fraction>        CPU limit (e.g., 0.5 = 50%%)\n");
-    fprintf(stderr, "  --pids <max>             Max number of processes\n");
-    /* Phase 6: new flags */
+    fprintf(stderr, "  --pids <max>             Max processes\n");
     fprintf(stderr, "  --net                    Enable network namespace + veth pair\n");
-    fprintf(stderr, "  --net-host-ip <addr>     Host-side veth IP (default 10.0.0.1)\n");
-    fprintf(stderr, "  --net-container-ip <a>   Container-side veth IP (default 10.0.0.2)\n");
-    fprintf(stderr, "  --net-netmask <cidr>     CIDR suffix (default 24)\n");
+    fprintf(stderr, "  --net-host-ip <addr>     Host-side veth IP\n");
+    fprintf(stderr, "  --net-container-ip <a>   Container-side veth IP\n");
+    fprintf(stderr, "  --net-netmask <cidr>     CIDR suffix\n");
     fprintf(stderr, "  --no-nat                 Disable iptables MASQUERADE\n");
     fprintf(stderr, "  --env KEY=VALUE          Set environment variable (repeatable)\n");
     fprintf(stderr, "  --help                   Show this help\n");
@@ -168,7 +59,6 @@ static void usage(const char *progname) {
     fprintf(stderr, "  sudo %s --pid --rootfs ./rootfs --hostname web /bin/sh\n", progname);
     fprintf(stderr, "  %s --user --pid --ipc --hostname test /bin/sh  # No sudo needed\n", progname);
     fprintf(stderr, "  sudo %s --pid --memory 100M --cpus 0.5 --pids 20 /bin/sh\n", progname);
-    /* Phase 6: new example */
     fprintf(stderr, "  sudo %s --pid --rootfs ./rootfs --net /bin/sh  # With network\n", progname);
 }
 
@@ -370,34 +260,29 @@ int main(int argc, char *argv[]) {
     }
 
     // Configure
-    net_config_t config = {
+    container_config_t config = {
         .program = argv[optind],
         .argv = &argv[optind],
         .envp = container_env,
         .enable_debug = enable_debug,
-        // Phase 4b auto-enable: --rootfs implies --pid (carried forward)
         .enable_pid_namespace = enable_pid_namespace || (rootfs_path != NULL),
         .enable_mount_namespace = (rootfs_path != NULL),
         .enable_uts_namespace = (hostname != NULL),
         .enable_user_namespace = enable_user_namespace,
         .enable_ipc_namespace = enable_ipc_namespace,
-        .enable_network = enable_network,             // Phase 6
+        .enable_network = enable_network,
         .rootfs_path = rootfs_path,
         .enable_overlay = enable_overlay,
         .container_dir = container_dir,
         .hostname = hostname,
-        // Default user mapping: container root → current host user
         .uid_map_inside = 0,
         .uid_map_outside = getuid(),
         .uid_map_range = 1,
         .gid_map_inside = 0,
         .gid_map_outside = getgid(),
         .gid_map_range = 1,
-        // Cgroup
         .cgroup_limits = limits,
         .enable_cgroup = enable_cgroup,
-        /* Phase 6: veth zero-initialized when --net is off.
-         * enable_nat defaults to true unless --no-nat was passed. */
         .veth = {
             .host_ip      = "",
             .container_ip = "",
@@ -421,11 +306,11 @@ int main(int argc, char *argv[]) {
                 sizeof(config.veth.netmask) - 1);
     }
 
-    // Execute (Phase 6: was cgroup_exec in Phase 5)
-    net_result_t result = net_exec(&config);
+    // Execute (Phase 7: Unified execution via config struct)
+     container_result_t result = container_exec(&config);
 
-    // Cleanup (Phase 6: was cgroup_cleanup in Phase 5)
-    net_cleanup(&result);
+    
+    container_cleanup(&result);
     free(container_env);
 
     // Handle result

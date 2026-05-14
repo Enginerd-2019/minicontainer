@@ -1,0 +1,33 @@
+# AppArmor profile for minicontainer
+#
+# Purpose: allow this binary to create unprivileged user namespaces on
+# distributions that set `kernel.apparmor_restrict_unprivileged_userns=1`
+# (Ubuntu 24.04+). Without this profile, an unconfined invocation of
+# minicontainer that uses `--user` is silently attached to a default
+# restrictive AppArmor profile when it calls `clone(CLONE_NEWUSER)`,
+# which masks `CAP_SYS_ADMIN` inside the new namespace and breaks
+# `sethostname(2)`, namespace-internal mounts, etc.
+#
+# The `userns,` rule tells AppArmor "this binary may create unprivileged
+# user namespaces." `flags=(unconfined)` keeps everything else
+# unrestricted — this profile is opt-in to the userns mediation, not a
+# full sandbox. (For comparison: Docker, Podman, Chromium, and Firefox
+# all ship analogous profiles with userns,.)
+#
+# The literal token below (between "@" signs, MINICONTAINER, "_PATH",
+# "@") is replaced at install time by the Makefile's install-apparmor
+# target with the absolute path of the built binary (via readlink -f).
+#
+# Install:   make install-apparmor
+# Uninstall: make uninstall-apparmor
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile minicontainer @MINICONTAINER_PATH@ flags=(unconfined) {
+    userns,
+
+    # Local site-specific additions, if any.
+    include if exists <local/minicontainer>
+}

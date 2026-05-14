@@ -3,16 +3,15 @@
 
 // NOTE: _GNU_SOURCE is provided by the Makefile via -D_GNU_SOURCE.
 // Do NOT redefine it here (Error #8 from decisions.md).
-
 #include <sched.h>
 #include <stdbool.h>
 #include <sys/types.h>
 #include <arpa/inet.h>   // INET_ADDRSTRLEN
 #include <net/if.h>      // IFNAMSIZ
-#include "cgroup.h"      // cgroup_config_t-style fields, cgroup_context_t
 
 /**
- * Veth-specific configuration. Embedded inside net_config_t.
+ * Veth-specific configuration. Embedded inside container_config_t
+ * as the `veth` field.
  * Defaults (set by main.c when --net is enabled):
  *   host_ip="10.0.0.1", container_ip="10.0.0.2", netmask="24", enable_nat=true
  */
@@ -40,81 +39,17 @@ typedef struct {
 } net_context_t;
 
 /**
- * Configuration for container with network namespace support.
- * Supersedes cgroup_config_t — includes all Phase 5 fields plus network.
- */
-typedef struct {
-    // Base configuration (unchanged from Phase 5)
-    const char *program;
-    char *const *argv;
-    char *const *envp;
-    bool enable_debug;
-
-    // Namespace flags (enable_network is new)
-    bool enable_pid_namespace;
-    bool enable_mount_namespace;
-    bool enable_uts_namespace;
-    bool enable_user_namespace;
-    bool enable_ipc_namespace;
-    bool enable_network;              // New in Phase 6
-
-    // Filesystem (unchanged)
-    const char *rootfs_path;
-    bool enable_overlay;
-    const char *container_dir;
-
-    // UTS settings (unchanged)
-    const char *hostname;
-
-    // User namespace mapping (unchanged from Phase 4b)
-    uid_t uid_map_inside;
-    uid_t uid_map_outside;
-    size_t uid_map_range;
-    gid_t gid_map_inside;
-    gid_t gid_map_outside;
-    size_t gid_map_range;
-
-    // Cgroup limits (unchanged from Phase 5)
-    cgroup_limits_t cgroup_limits;
-    bool enable_cgroup;
-
-    // Network (new in Phase 6)
-    veth_config_t veth;
-} net_config_t;
-
-/**
- * Result of container execution with network.
- * Includes both cgroup and net contexts for cleanup.
- */
-typedef struct {
-    pid_t child_pid;
-    int exit_status;
-    bool exited_normally;
-    int signal;
-    void *stack_ptr;
-    cgroup_context_t cgroup_ctx;
-    net_context_t net_ctx;
-} net_result_t;
-
-/**
- * Execute process with optional network namespace isolation.
+ * Locate the `ip` binary in one of three canonical locations:
+ *   /sbin/ip, /usr/sbin/ip, /bin/ip (in that order).
  *
- * Supersedes cgroup_exec() — handles all Phase 5 functionality plus
- * veth-pair creation, network configuration, and cleanup.
+ * Phase 7a: promoted from `static` in net.c to a public function so
+ * core.c's early-failure check (before clone) can call it without
+ * having to duplicate the path-search logic.
  *
- * @param config  Configuration including namespace, filesystem, cgroup, network
- * @return        Result structure (cgroup + net contexts for cleanup)
+ * Returns a pointer to a static string (do not free) or NULL if no
+ * `ip` binary is found.
  */
-net_result_t net_exec(const net_config_t *config);
-
-/**
- * Cleanup resources allocated by net_exec.
- * Deletes host veth (kernel removes container veth with the netns),
- * removes iptables NAT rule if added, removes cgroup, frees stack.
- *
- * @param result  Result from net_exec
- */
-void net_cleanup(net_result_t *result);
+const char *find_ip_binary(void);
 
 /**
  * Generate unique veth pair names. Called BEFORE clone() so the names are
