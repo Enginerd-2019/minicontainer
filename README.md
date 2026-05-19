@@ -1436,6 +1436,88 @@ sudo iptables -t nat -L POSTROUTING -v
 
 ---
 
+### `apt` / `curl` / DNS fails inside a non-bundled rootfs
+
+**Problem:** With `--net` enabled, the container has connectivity (you can
+`ping 8.8.8.8` or reach `10.0.0.1`), but anything that needs name resolution
+fails:
+
+```
+Err:1 http://archive.ubuntu.com/ubuntu jammy InRelease
+  Temporary failure resolving 'archive.ubuntu.com'
+E: Package 'nano' has no installation candidate
+```
+
+Inside the container, `cat /etc/resolv.conf` reports
+`No such file or directory` — even though `ls /etc/resolv.conf` on the host
+shows the file just fine.
+
+**Cause:** Most distros ship `/etc/resolv.conf` as a **symlink** to a
+host-only path managed by their resolver daemon. Ubuntu 22.04 / 24.04 use
+`/etc/resolv.conf → ../run/systemd/resolve/stub-resolv.conf`, populated by
+`systemd-resolved`. On the host that target exists and the symlink resolves
+correctly. Inside the container the rootfs has the symlink but nothing
+populates the target — so the symlink dangles silently after `pivot_root`.
+Programs that call `open("/etc/resolv.conf")` get `ENOENT`, glibc's resolver
+falls back to "no nameservers configured", and DNS is dead.
+
+The bundled rootfs from `scripts/build_rootfs.sh` is not affected — it
+writes a regular file at `rootfs/etc/resolv.conf` (the host's resolvers if
+they're not `127.0.0.53`, otherwise `1.1.1.1` + `8.8.8.8`). The failure
+mode bites only when you bring your own rootfs: `debootstrap`,
+`docker export`, an Ubuntu cloud-image tarball, etc.
+
+**Verify** (from outside the container, with your rootfs at `./myroot`):
+
+```bash
+ls -la ./myroot/etc/resolv.conf
+# lrwxrwxrwx ... resolv.conf -> ../run/systemd/resolve/stub-resolv.conf
+#                                ^^^ symlink to a host-only path
+
+readlink -e ./myroot/etc/resolv.conf
+# (empty) — target doesn't resolve inside the rootfs
+```
+
+A regular file shows as `-rw-r--r--` (no `l` in the mode) and `readlink -e`
+prints the absolute path.
+
+**Fix:** Replace the dangling symlink with a real file. Pick whichever
+matches your network:
+
+```bash
+# Public resolvers (works anywhere with outbound DNS)
+sudo rm -f ./myroot/etc/resolv.conf
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' \
+    | sudo tee ./myroot/etc/resolv.conf
+
+# Or copy the host's, if it isn't itself a systemd-resolved stub
+sudo cp -L /etc/resolv.conf ./myroot/etc/resolv.conf
+```
+
+The `-L` on `cp` is important — it follows the host's symlink and copies the
+*contents* of the resolved target, not the symlink itself (which would just
+re-create the broken link).
+
+Want this baked into the rootfs prep step? `scripts/build_rootfs.sh` already
+does exactly this for the bundled rootfs (it skips the host's
+`127.0.0.53`-stub case and writes public resolvers as a fallback). Crib that
+logic for your own bootstrap script.
+
+**Still seeing "Temporary failure resolving" after fixing `/etc/resolv.conf`?**
+You've cleared the resolver-config layer; the next-most-common cause is the
+host's `filter/FORWARD` chain defaulting to `DROP` (Docker, UFW, and
+firewalld all do this). DNS packets leave glibc's resolver fine but get
+killed at FORWARD before they ever reach the MASQUERADE rule. See the
+"Iptables prerequisite" callout under "HTTPS from inside the container
+(curl)" earlier in this README, and **Known Limitation #8** in
+`docs/decisions.md`, for the ACCEPT-rule fix (two `iptables -I` lines) and
+the rationale for not auto-installing it. A quick diagnostic: `sudo
+iptables -L FORWARD -v -n` showing nonzero "packets dropped" while the
+matching MASQUERADE rule in `iptables -t nat -L POSTROUTING -v -n` shows
+`0 packets` is the unambiguous signature.
+
+---
+
 ### "Error: --net-host-ip ... require --net" (Phase 6)
 
 **Problem:** You passed `--net-host-ip` / `--net-container-ip` /

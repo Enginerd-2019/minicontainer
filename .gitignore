@@ -13,6 +13,7 @@ test_*           # Future-proof: test_net (Phase 6), test_cli (Phase 7), etc.
 
 # Generated rootfs (built from host binaries, not source)
 rootfs/
+ubuntu-root/
 
 # Runtime container state (created by --overlay; per-container subdirs of
 # upper/work/merged). Phase 3+ writes here. Default location set in main.c;
