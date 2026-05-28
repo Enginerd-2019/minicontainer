@@ -24,6 +24,14 @@ typedef struct {
     char *const *envp;
     bool enable_debug;
 
+    // Canonical container identity.  Generated once per `cmd_run`
+    // (Phase 7b) by state.h's generate_container_id() and threaded
+    // through every downstream module (overlay, cgroup, state file,
+    // veth naming).  Must be set before container_exec / container_start;
+    // an empty string is an error.  See decisions.md "Canonical
+    // container-ID source".
+    char container_id[13];
+
     // Namespace flags
     bool enable_pid_namespace;
     bool enable_mount_namespace;

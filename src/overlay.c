@@ -7,21 +7,7 @@
 #include <errno.h>
 #include <string.h>
 #include <limits.h>
-#include <time.h>
 #include <ftw.h>
-
-/**
- * Generate a 12-character hex container ID.
- */
-static void generate_container_id(char *id){
-    
-    // This will generate randomness in the id
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-
-    unsigned long hash = ts.tv_sec ^ ts.tv_nsec ^ getpid();
-    snprintf(id, 13, "%012lx", hash & 0xFFFFFFFFFFFF);
-}
 
 /**
  * Callback for nftw() to remove directory tree.
@@ -48,19 +34,28 @@ static int remove_directory(const char *path) {
 /**
  * Initialize overlay paths in context.
  *
- * Generates a container ID, resolves absolute paths, and populates
- * the upper/work/merged path fields in ctx.
+ * Copies in the canonical container ID (state.h is the sole generator
+ * — see decisions.md "Canonical container-ID source"), resolves
+ * absolute paths, and populates the upper/work/merged path fields in
+ * ctx.
  *
  * @param ctx            Overlay context to populate
  * @param rootfs_path    Path to base image (lowerdir)
  * @param container_dir  Parent directory for overlay data (NULL = "./containers")
+ * @param container_id   Canonical 12-hex container ID; must be non-NULL and non-empty
  * @param enable_debug   Print resolved paths
  * @return               0 on success, -1 on failure
  */
 static int init_overlay_paths(overlay_context_t *ctx, const char *rootfs_path,
-                              const char *container_dir, bool enable_debug) {
-    // Generate container ID
-    generate_container_id(ctx->container_id);
+                              const char *container_dir,
+                              const char *container_id, bool enable_debug) {
+    if (!container_id || container_id[0] == '\0') {
+        fprintf(stderr, "init_overlay_paths: container_id is required\n");
+        return -1;
+    }
+    // Copy in the canonical container ID.  State.h is the sole generator.
+    strncpy(ctx->container_id, container_id, sizeof(ctx->container_id) - 1);
+    ctx->container_id[sizeof(ctx->container_id) - 1] = '\0';
 
     // Resolve rootfs to absolute path
     if (!realpath(rootfs_path, ctx->lower_path)) {
@@ -209,13 +204,19 @@ static int mount_overlay(overlay_context_t *ctx, bool enable_debug) {
  * sub-function independently.
  */
 int setup_overlay(overlay_context_t *ctx, const char *rootfs_path,
-                  const char *container_dir, bool enable_debug) {
+                  const char *container_dir, const char *container_id,
+                  bool enable_debug) {
     if (!ctx || !rootfs_path) {
         fprintf(stderr, "setup_overlay: invalid arguments\n");
         return -1;
     }
+    if (!container_id || container_id[0] == '\0') {
+        fprintf(stderr, "setup_overlay: container_id is required\n");
+        return -1;
+    }
 
-    if (init_overlay_paths(ctx, rootfs_path, container_dir, enable_debug) < 0) {
+    if (init_overlay_paths(ctx, rootfs_path, container_dir,
+                           container_id, enable_debug) < 0) {
         return -1;
     }
 

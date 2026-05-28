@@ -1,6 +1,7 @@
 // Note: _GNU_SOURCE is provided by the Makefile via -D_GNU_SOURCE.
-#include "core.h" // Phase 7
-#include "env.h"  // Phase 7
+#include "core.h"  // Phase 7
+#include "env.h"   // Phase 7
+#include "state.h" // Phase 7b — canonical container_id generation
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
@@ -305,6 +306,12 @@ int main(int argc, char *argv[]) {
                 net_netmask ? net_netmask : "24",
                 sizeof(config.veth.netmask) - 1);
     }
+
+    // Phase 7b: generate the canonical container ID once, here, so
+    // every downstream module (overlay, cgroup, state file, veth)
+    // sees the same value.  See decisions.md "Canonical container-ID
+    // source".  This call moves into cmd_run when cli.c lands.
+    generate_container_id(config.container_id);
 
     // Execute (Phase 7: Unified execution via config struct)
      container_result_t result = container_exec(&config);

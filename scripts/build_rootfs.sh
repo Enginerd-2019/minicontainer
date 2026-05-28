@@ -45,6 +45,22 @@ for ca in /etc/ssl/certs/ca-certificates.crt \
     fi
 done
 
+# Terminfo for curses-based binaries (nano, less, vi). ncurses opens
+# $TERM at /etc/terminfo, /lib/terminfo, or /usr/share/terminfo; ldd
+# cannot see these data files, so they need their own copy step. Without
+# them, nano dies with "Error opening terminal: xterm." even though TERM
+# is inherited from the host. Cover Debian/Ubuntu and RHEL/Fedora layouts.
+for tdir in /usr/share/terminfo /lib/terminfo /etc/terminfo; do
+    if [ -d "$tdir" ]; then
+        mkdir -p "$ROOTFS/usr/share/terminfo/x"
+        for entry in xterm xterm-256color xterm-color; do
+            [ -r "$tdir/x/$entry" ] && \
+                cp "$tdir/x/$entry" "$ROOTFS/usr/share/terminfo/x/"
+        done
+        break
+    fi
+done
+
 # Minimal DNS resolver config. Prefer the host's resolv.conf; fall back
 # to public resolvers if the host doesn't have one (e.g. systemd-resolved
 # stub that points only at 127.0.0.53, which the container cannot reach).

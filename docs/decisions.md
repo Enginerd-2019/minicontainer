@@ -1518,6 +1518,122 @@ list lost those entries in the same edit.
 
 ---
 
+### 34. Canonical Container-ID Source: `state.h::generate_container_id` (Phase 7b)
+
+**Decision:** A single function in `state.c` — `generate_container_id`,
+reading 6 bytes from `/dev/urandom` and hex-encoding them — is the
+sole place a 12-character container ID is minted. Every other module
+(overlay, cgroup, future state file writer, future inspector code)
+receives the ID as a parameter and stores it on its own context
+struct. The Phase 7b `container_config_t.container_id` field carries
+the canonical ID into `container_start` / `container_exec`; the CLI
+generates it once at the top of `cmd_run` (currently `main.c` during
+the transitional Phase 7b implementation).
+
+**Background — what was there:**
+
+Phase 3 introduced overlay support and needed per-container directory
+names. It chose a `static void generate_container_id(char *id)` in
+`overlay.c` using `clock_gettime(CLOCK_REALTIME) ^ getpid()` hashed
+to 48 bits. That was fine in isolation — the overlay ID was internal
+to overlay.c's directory naming and never had to agree with any
+other module's view of the container.
+
+Phase 5 onward gradually erased that isolation: cgroup directories
+adopted the overlay's ID via parameter passing, then veth interface
+names did the same. By Phase 7a the overlay-generated ID was the
+container's identity *implicitly*, but nothing in the source code
+documented that — `overlay.c::generate_container_id` was still
+`static` and the function name was still generic.
+
+**The Phase 7b forcing function:**
+
+Phase 7b's CLI (`list`, `stop`, `inspect`, `cleanup`) makes the
+container ID **user-visible** for the first time. State files live
+at `/run/minicontainer/<id>/state.json`. `cleanup` walks
+`./containers/*` and `/run/minicontainer/*` and decides "is this
+overlay/state pair orphaned?" by matching directory names against
+each other. That match requires the two trees to share an ID space.
+
+If overlay.c and state.c independently generated their own IDs,
+`cleanup` would mark every container as orphaned (no overlap), and
+`list` would show one ID while `./containers/` showed a different
+one for the same container.
+
+**Resolution:**
+
+- **Delete** `static void generate_container_id` from `src/overlay.c`.
+- **Add** `void generate_container_id(char id_out[CONTAINER_ID_LEN + 1])`
+  to `include/state.h` / `src/state.c`, using `/dev/urandom`.
+- **Extend** `setup_overlay()`'s signature with `const char *container_id`.
+  Empty/NULL is rejected with `setup_overlay: container_id is required`.
+- **Add** `char container_id[CONTAINER_ID_LEN + 1]` to
+  `container_config_t` in `core.h`. Threaded into `setup_overlay`
+  through `core.c`.
+- **Generate once at the top of the runtime chain.** Today that's
+  `main.c` (`generate_container_id(config.container_id);` immediately
+  before `container_exec`). When `cli.c::cmd_run` lands (Phase 7b
+  step 7), the call moves there and disappears from `main.c`.
+- **Tests:** `tests/test_overlay.c::base_overlay_config` populates
+  `cfg.container_id` via the same `generate_container_id` so the
+  test exercises the production path. No other test triggers
+  `setup_overlay`, so no other test was affected.
+
+**Rationale:**
+
+- **One source of truth for identity.** The same container's state
+  file, overlay directory, cgroup directory, and veth name all
+  agree on a single 12-hex ID. `cleanup`'s pairing logic works.
+- **No timestamp leakage.** `/dev/urandom` reveals no operational
+  metadata — wall-clock time of container start, PID-namespace
+  position, host load — all of which a `time^pid` hash exposes.
+- **Future-proofs Phase 8a.** The inspector reads `state.json`,
+  finds `cgroup_path`, and reads cgroup stats from there. Step 12
+  cleanup reaps the corresponding `./containers/<id>/`. Both
+  depend on ID consistency.
+- **Minimal surface area for randomness.** Crypto/randomness lives
+  in exactly one file. Future hardening (using `getentropy(3)` or
+  guarding against partial reads from `/dev/urandom`) happens in
+  one place.
+
+**Alternatives considered:**
+
+- **Let `cmd_run` pass the ID into a `state_dir_root()`-style
+  static** inside overlay.c, but keep overlay.c's generator as a
+  fallback for tests that don't set the ID. Rejected: the fallback
+  hides bugs (tests that forget to set the ID would silently use
+  the legacy algorithm) and the runtime path would gain a "should
+  never happen" branch.
+- **Make `generate_container_id` an inline header function.**
+  Rejected: it has to open `/dev/urandom`, which is an I/O syscall;
+  inlining buys nothing and bloats every caller's translation unit.
+- **Use a UUID library (libuuid).** Rejected: introduces an
+  external dependency for ~10 lines of `read(/dev/urandom)` code.
+  The project's stance (decisions.md #1 - "no external deps for
+  things you can write in a paragraph") applies here.
+
+**Files affected:**
+
+- `include/overlay.h` — `setup_overlay()` signature gains `const char *container_id`.
+- `src/overlay.c` — `static generate_container_id` deleted;
+  `init_overlay_paths` takes the ID as a parameter and copies it
+  into `ctx->container_id`.
+- `include/state.h` — new public declaration `void generate_container_id(char id_out[CONTAINER_ID_LEN + 1])`.
+- `src/state.c` — implementation using `/dev/urandom`.
+- `include/core.h` — `container_config_t.container_id` field added.
+- `src/core.c` — `config->container_id` threaded into `setup_overlay`.
+- `src/main.c` — `generate_container_id(config.container_id);` added
+  before `container_exec`. Transitional — moves into `cli.c::cmd_run`
+  in Phase 7b step 7.
+- `Makefile` — `state.o` added to `HELPER_OBJS` so the runtime and
+  every test link against the new generator.
+- `tests/test_overlay.c` — `base_overlay_config` calls
+  `generate_container_id(cfg.container_id)`.
+
+**Fix Applied:** 2026-05-20
+
+---
+
 ## Errors Found and Fixed
 
 ### Error #1: Typo in WEXITSTATUS Macro

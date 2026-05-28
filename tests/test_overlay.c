@@ -1,6 +1,7 @@
 // Phase 7a: was overlay_exec/overlay_config_t — now container_exec.
 #include "core.h"
 #include "env.h"
+#include "state.h"   // Phase 7b: canonical container_id generator
 #include <assert.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -26,6 +27,8 @@ static container_config_t base_overlay_config(char **env, char *const *argv) {
         .gid_map_outside = getgid(),
         .gid_map_range = 1,
     };
+    // Phase 7b: canonical container ID — setup_overlay requires this.
+    generate_container_id(cfg.container_id);
     return cfg;
 }
 

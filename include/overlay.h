@@ -26,14 +26,20 @@ typedef struct {
  * Setup overlay filesystem.
  * Creates directories and mounts overlayfs with MS_NODEV | MS_NOSUID.
  *
- * @param ctx          Overlay context (populated on success)
- * @param rootfs_path  Path to base image (lowerdir)
+ * @param ctx           Overlay context (populated on success)
+ * @param rootfs_path   Path to base image (lowerdir)
  * @param container_dir Parent directory for overlay data
- * @param enable_debug Enable debug output
- * @return             0 on success, -1 on failure
+ * @param container_id  Canonical 12-hex container ID (from state.h's
+ *                      generate_container_id; same ID used by state.json
+ *                      and cgroup directory naming so cleanup can match
+ *                      overlay dirs to live state files).  Required;
+ *                      passing NULL or an empty string is an error.
+ * @param enable_debug  Enable debug output
+ * @return              0 on success, -1 on failure
  */
 int setup_overlay(overlay_context_t *ctx, const char *rootfs_path,
-                  const char *container_dir, bool enable_debug);
+                  const char *container_dir, const char *container_id,
+                  bool enable_debug);
 
 /**
  * Teardown overlay filesystem.

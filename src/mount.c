@@ -123,3 +123,128 @@ int mount_proc(bool enable_debug){
 
     return 0;
 }
+
+int bind_mount_apply(const bind_mount_t *m, bool enable_debug) {
+    if (!m || !m->host_path[0] || !m->container_path[0]) {
+        fprintf(stderr, "[bind] invalid bind mount spec\n");
+        return -1;
+    }
+
+    /* Determine whether the host source is a directory or a file.
+     * For files, we touch the target so mount(2) has a target to
+     * overlay onto. For directories, we mkdir -p. */
+    struct stat st;
+    if (stat(m->host_path, &st) < 0) {
+        fprintf(stderr, "[bind] host_path %s: %s\n",
+                m->host_path, strerror(errno));
+        return -1;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        /* mkdir -p the target. */
+        mkdir(m->container_path, 0755);  /* ignore EEXIST */
+    } else {
+        /* Ensure parent dir exists, then touch the file. */
+        int fd = open(m->container_path, O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) close(fd);
+    }
+
+    if (enable_debug) {
+        printf("[bind] %s -> %s%s\n",
+               m->host_path, m->container_path,
+               m->readonly ? " (ro)" : "");
+    }
+
+    if (mount(m->host_path, m->container_path, NULL,
+              MS_BIND, NULL) < 0) {
+        fprintf(stderr, "[bind] mount(MS_BIND) %s -> %s: %s\n",
+                m->host_path, m->container_path, strerror(errno));
+        return -1;
+    }
+
+    /* Read-only: kernel ignores MS_RDONLY on the initial MS_BIND.
+     * Need a separate remount to actually enforce. */
+    if (m->readonly) {
+        if (mount(NULL, m->container_path, NULL,
+                  MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) {
+            fprintf(stderr,
+                "[bind] remount-ro %s: %s\n",
+                m->container_path, strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Mount a private devpts instance on /dev/pts and redirect /dev/ptmx
+ * to the new instance's master multiplexer.
+ *
+ * Why two steps: posix_openpt(2) opens "/dev/ptmx". Inside the
+ * rootfs that's either a stale character-device inode shipped with
+ * the rootfs (disconnected from the devpts driver) or non-existent.
+ * Mounting devpts with newinstance creates a private instance whose
+ * own master multiplexer lives at /dev/pts/ptmx. The second step is
+ * a symlink from /dev/ptmx to /dev/pts/ptmx so posix_openpt finds
+ * the right device. See Documentation/filesystems/devpts.txt.
+ */
+int mount_devpts(bool enable_debug, bool user_namespace_active) {
+    /* Ensure /dev and /dev/pts both exist.  The build_rootfs.sh
+     * minimal rootfs omits /dev entirely; Ubuntu and Alpine ship it
+     * empty.  Both mkdir calls are idempotent — EEXIST is fine. */
+    if (mkdir("/dev", 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "[devpts] mkdir /dev: %s\n", strerror(errno));
+        return -1;
+    }
+    if (mkdir("/dev/pts", 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "[devpts] mkdir /dev/pts: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* The four-character options string is the magic.  newinstance
+     * gives this mount its own private master/slave numbering.
+     * ptmxmode=0666 lets non-root inside the container open the
+     * master.  mode=0620 + gid=5 matches the Debian/Ubuntu host
+     * convention for /dev/pts/<N> ownership (gid 5 = "tty"). */
+    const char *opts = "newinstance,ptmxmode=0666,mode=0620,gid=5";
+    if (mount("devpts", "/dev/pts", "devpts", 0, opts) < 0) {
+        if (user_namespace_active) {
+            fprintf(stderr,
+                "[devpts] Warning: devpts mount denied "
+                "(user namespace restriction) — pty allocation "
+                "inside the container will fail\n");
+            return 0;  /* graceful degradation, same as mount_proc */
+        }
+        fprintf(stderr, "[devpts] mount devpts on /dev/pts: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    /* /dev/ptmx → /dev/pts/ptmx so glibc's posix_openpt(2) finds the
+     * newinstance master.  Two ways to wire this: bind-mount (used by
+     * Docker for legacy ABI compat) or symlink (used by every modern
+     * distro on the host).  Symlink is simpler and doesn't care about
+     * the target inode's pre-existing type — we just unlink whatever
+     * stale /dev/ptmx the rootfs shipped with (if any) and create a
+     * fresh symlink. */
+    if (unlink("/dev/ptmx") < 0 && errno != ENOENT) {
+        fprintf(stderr,
+            "[devpts] unlink stale /dev/ptmx: %s\n", strerror(errno));
+        /* Non-fatal — symlink() below will fail with EEXIST if there's
+         * still something there, and that's the loud error worth
+         * reporting. */
+    }
+    if (symlink("/dev/pts/ptmx", "/dev/ptmx") < 0) {
+        fprintf(stderr,
+            "[devpts] symlink /dev/pts/ptmx -> /dev/ptmx: %s\n",
+            strerror(errno));
+        return -1;
+    }
+
+    if (enable_debug) {
+        printf("[devpts] mounted newinstance on /dev/pts, "
+               "/dev/ptmx -> /dev/pts/ptmx\n");
+    }
+    return 0;
+}

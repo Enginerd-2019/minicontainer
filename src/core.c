@@ -222,7 +222,8 @@ container_result_t container_exec(const container_config_t *config) {
     const char *effective_rootfs = config->rootfs_path;
     if (config->enable_overlay && config->rootfs_path) {
         if (setup_overlay(&result.ctx.overlay_ctx, config->rootfs_path,
-                          config->container_dir, config->enable_debug) < 0) {
+                          config->container_dir, config->container_id,
+                          config->enable_debug) < 0) {
             fprintf(stderr, "[parent] Failed to setup overlay\n");
             if (sync_pipe[0] >= 0) { close(sync_pipe[0]); close(sync_pipe[1]); }
             if (config->enable_cgroup) {
