@@ -9,6 +9,8 @@
 #include "cgroup.h"   // cgroup_limits_t, cgroup_context_t
 #include "overlay.h"  // overlay_context_t
 #include "net.h"      // veth_config_t, net_context_t
+#include "state.h"
+#include "mount.h"
 
 /**
  * Unified container configuration. Supersedes every prior *_config_t
@@ -24,13 +26,14 @@ typedef struct {
     char *const *envp;
     bool enable_debug;
 
-    // Canonical container identity.  Generated once per `cmd_run`
-    // (Phase 7b) by state.h's generate_container_id() and threaded
-    // through every downstream module (overlay, cgroup, state file,
-    // veth naming).  Must be set before container_exec / container_start;
-    // an empty string is an error.  See decisions.md "Canonical
-    // container-ID source".
-    char container_id[13];
+    // Canonical container identity (Phase 7b).  Generated once per
+    // `cmd_run` by state.h's generate_container_id() and threaded
+    // into every downstream module (overlay, cgroup, state file, veth
+    // naming).  An empty string is rejected by setup_overlay and is
+    // a bug — the CLI is responsible for populating this before
+    // calling container_start / container_exec.  See §3.5
+    // "Canonical container-ID source" and decisions.md.
+    char container_id[CONTAINER_ID_LEN + 1];
 
     // Namespace flags
     bool enable_pid_namespace;
@@ -62,6 +65,20 @@ typedef struct {
 
     // Network (veth)
     veth_config_t veth;
+
+    // Bind mounts (Phase 7b)
+    bind_mount_t mounts[MAX_MOUNTS];
+    int mount_count;
+
+    // Interactive PTY (Phase 7b). Single boolean — the slave path is
+    // allocated inside the child after mount_devpts, and the master fd
+    // is returned to the caller via container_result_t.pty_master_fd.
+    bool enable_pty;
+
+    // Detached mode (Phase 7b)
+    bool detach;
+    int  stdout_fd;            // -1 = inherit; cmd_start writes to log file
+    int  stderr_fd;            // -1 = inherit; cmd_start writes to log file
 } container_config_t;
 
 /**
@@ -86,17 +103,59 @@ typedef struct {
     bool  exited_normally;
     int   signal;
     container_context_t ctx;
+    int pty_master_fd;
 } container_result_t;
 
 /**
- * Execute a process inside a container described by config. This is
- * the single entry point for spawning a containerized process —
- * supersedes all prior *_exec() functions.
+ * Phase 7b: parent-side container setup.  Runs the original Phase 7a
+ * pipeline through the clone(2) call and the post-clone wiring
+ * (close-read-end of sync pipe, user-ns map, setup_net, write-sync,
+ * add_pid_to_cgroup), then returns.  Does NOT wait for the child.
  *
- * The behavior is driven entirely by config flags. To get Phase-5
- * behavior (cgroups but no network): set enable_cgroup=true and
- * enable_network=false. To get Phase-6 behavior (cgroups + network):
- * set both true. Etc.
+ * The split exists so cmd_run can write the state file BETWEEN
+ * launch and reap (`cmd_run`: start → state_save → wait), and so
+ * cmd_start can launch a detached container by calling start and
+ * exiting without ever calling wait.
+ *
+ * On success, `result.child_pid > 0` and `result.ctx` is populated
+ * with whatever was allocated (overlay, cgroup, net, stack).  On
+ * failure, `result.child_pid < 0`; caller should still call
+ * container_cleanup(&result) to release any partial allocations.
+ *
+ * If `config->enable_pty`, the parent sets up a SOCK_STREAM
+ * socketpair before clone and receives the master fd via SCM_RIGHTS
+ * after clone.  On success the master fd is stored on
+ * `result.pty_master_fd` (-1 otherwise).  Caller owns the fd.
+ *
+ * @param config  Container configuration (Phase 7a + 7b fields)
+ * @return        Result with child_pid set and ctx populated
+ */
+container_result_t container_start(const container_config_t *config);
+
+/**
+ * Phase 7b: parent-side waitpid + overlay teardown.  Companion to
+ * container_start.  Mutates `result` in place:
+ *   - result->exit_status   = WEXITSTATUS(status) on normal exit
+ *   - result->exited_normally = true on normal exit, false on signal
+ *   - result->signal        = WTERMSIG(status) when killed by signal
+ * Overlay teardown runs here (immediately after waitpid) because the
+ * overlay's per-execution lifetime ends with the child.
+ *
+ * Caller is responsible for calling container_cleanup() afterward
+ * (or for not calling it — cmd_start deliberately skips both wait
+ * and cleanup so the detached container survives the parent's exit).
+ *
+ * @param result        Result from container_start (mutated in place)
+ * @param enable_debug  Verbose teardown logging
+ */
+void container_wait(container_result_t *result, bool enable_debug);
+
+/**
+ * Phase 7a's monolithic entry point.  After 7b's split, this is a
+ * thin wrapper: container_start() followed by container_wait().
+ * Existing Phase 7a tests and the transitional main.c keep working
+ * unchanged.  cmd_run does NOT call this — it needs the state-file
+ * write between the two halves and so calls them directly.
  *
  * @param config  Container configuration
  * @return        Result with child status and runtime context

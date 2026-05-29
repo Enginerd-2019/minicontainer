@@ -16,6 +16,7 @@
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <dirent.h>
+#include "pty.h"
 
 #define STACK_SIZE (1024 * 1024)
 
@@ -38,6 +39,12 @@ typedef struct {
     bool network_active;         // Gates configure_container_net()
     veth_config_t veth;          // Snapshot of veth config
     net_context_t net_ctx;       // Snapshot of net context (veth names)
+    bind_mount_t mounts[MAX_MOUNTS];
+    int  mount_count;
+    bool enable_pty;          // Whether to allocate a PTY in the child
+    int  pty_sock_fd;         // Child's end of socketpair; -1 if no PTY
+    int  stdout_fd;           // -1 = leave alone
+    int  stderr_fd;           // -1 = leave alone
 } child_args_t;
 
 /**
@@ -130,6 +137,20 @@ static int child_func(void *arg) {
             fprintf(stderr, "[child] Failed to setup rootfs\n");
             return 1;
         }
+
+        /* Apply bind mounts AFTER pivot_root, BEFORE mount_proc (so
+         * our /proc setup wins over any bind-mounted /proc). */
+        for (int i = 0; i < args->mount_count; i++) {
+            if (bind_mount_apply(&args->mounts[i],
+                                 args->enable_debug) < 0) {
+                fprintf(stderr,
+                    "[child] Failed to apply bind mount %s -> %s\n",
+                    args->mounts[i].host_path,
+                    args->mounts[i].container_path);
+                return 1;
+            }
+        }
+
         if (mount_proc(args->enable_debug) < 0) {
             if (args->user_namespace_active) {
                 fprintf(stderr,
@@ -140,6 +161,59 @@ static int child_func(void *arg) {
                 return 1;
             }
         }
+
+        /* Mount a private devpts instance.  Runs whenever a rootfs is
+         * set, regardless of --interactive — every container with its
+         * own mount namespace gets a working pty subsystem so
+         * curses-based and pty-allocating programs (apt, nano, less)
+         * work even non-interactively.  Graceful degradation under
+         * user namespace, same shape as mount_proc. */
+        if (mount_devpts(args->enable_debug,
+                         args->user_namespace_active) < 0) {
+            fprintf(stderr, "[child] Failed to mount devpts\n");
+            return 1;
+        }
+    }
+
+    /* Allocate a PTY inside the container (--interactive).  Must run
+     * after mount_devpts so /dev/ptmx points at the newinstance
+     * master multiplexer.  Master fd is sent back to the parent via
+     * SCM_RIGHTS on the pre-clone socketpair; child keeps slave fd
+     * for pty_set_ctty. */
+    pty_pair_t pty = { .master_fd = -1, .slave_fd = -1, .slave_path = {0} };
+    if (args->enable_pty) {
+        if (pty_open_in_child(&pty, args->enable_debug) < 0) {
+            fprintf(stderr, "[child] Failed to allocate PTY\n");
+            return 1;
+        }
+        if (pty_send_master(args->pty_sock_fd, pty.master_fd) < 0) {
+            fprintf(stderr, "[child] Failed to send PTY master to parent\n");
+            close(pty.master_fd);
+            close(pty.slave_fd);
+            return 1;
+        }
+        /* Parent now owns a duplicate of master_fd; child has no
+         * further need for its copy.  slave_fd stays open until
+         * pty_set_ctty dup2s it over stdio. */
+        close(pty.master_fd);
+        pty.master_fd = -1;
+
+        /* Done with the socketpair endpoint.  Close before
+         * close_inherited_fds runs so the latter doesn't try to
+         * close it twice. */
+        close(args->pty_sock_fd);
+        args->pty_sock_fd = -1;
+
+        if (pty_set_ctty(pty.slave_fd) < 0) {
+            fprintf(stderr, "[child] Failed to set PTY as ctty\n");
+            return 1;
+        }
+        /* pty_set_ctty dup2'd slave_fd over stdio and closed it. */
+    } else {
+        /* Detached mode: dup the log fds over stdout/stderr.  PTY
+         * mode already replaced stdio via pty_set_ctty. */
+        if (args->stdout_fd >= 0) dup2(args->stdout_fd, STDOUT_FILENO);
+        if (args->stderr_fd >= 0) dup2(args->stderr_fd, STDERR_FILENO);
     }
 
     /* 5. Network configuration (Phase 6). */
@@ -160,14 +234,66 @@ static int child_func(void *arg) {
     return 127;
 }
 
-container_result_t container_exec(const container_config_t *config) {
+/**
+ * Phase 7b: parent-side waitpid + overlay teardown.  Companion to
+ * container_start.  Steps 13-15 of the original Phase 7a
+ * container_exec pipeline, lifted into a separate function so the
+ * CLI can interleave a state-file write between container_start and
+ * container_wait (cmd_run) or skip container_wait entirely
+ * (cmd_start, which detaches the child).
+ *
+ * On waitpid failure (e.g. EINTR storm), result->exit_status is set
+ * to -1 and overlay/net teardown still runs.
+ */
+void container_wait(container_result_t *result, bool enable_debug) {
+    if (!result || result->child_pid < 0) return;
+
+    bool overlay_active = result->ctx.overlay_ctx.is_mounted;
+
+    /* Step 13: waitpid */
+    int status;
+    if (waitpid(result->child_pid, &status, 0) < 0) {
+        perror("waitpid");
+        result->exit_status = -1;
+        if (overlay_active) {
+            teardown_overlay(&result->ctx.overlay_ctx, enable_debug);
+        }
+        cleanup_net(&result->ctx.net_ctx, enable_debug);
+        return;
+    }
+
+    /* Step 14: parse status */
+    if (WIFEXITED(status)) {
+        result->exited_normally = true;
+        result->exit_status = WEXITSTATUS(status);
+        if (enable_debug) {
+            printf("[parent] Child exited: %d\n", result->exit_status);
+        }
+    } else if (WIFSIGNALED(status)) {
+        result->exited_normally = false;
+        result->signal = WTERMSIG(status);
+        result->exit_status = 128 + result->signal;
+        if (enable_debug) {
+            printf("[parent] Child killed by signal: %d\n", result->signal);
+        }
+    }
+
+    /* Step 15: teardown overlay (cgroup + net deferred to container_cleanup) */
+    if (overlay_active) {
+        teardown_overlay(&result->ctx.overlay_ctx, enable_debug);
+    }
+}
+
+container_result_t container_start(const container_config_t *config) {
     container_result_t result = {0};
+    result.pty_master_fd = -1;
     bool overlay_active = false;
     int sync_pipe[2] = {-1, -1};
+    int pty_sock[2]  = {-1, -1};
 
     /* Validate */
     if (!config || !config->program || !config->argv) {
-        fprintf(stderr, "container_exec: invalid config\n");
+        fprintf(stderr, "container_start: invalid config\n");
         result.child_pid = -1;
         return result;
     }
@@ -263,7 +389,35 @@ container_result_t container_exec(const container_config_t *config) {
         }
     }
 
-    /* Step 5: child_args */
+    /* Step 4c (Phase 7b): PTY socketpair if --interactive.  Must exist
+     * before clone() so the child inherits sv[1] in its fd table.  The
+     * child opens the master with posix_openpt after mount_devpts and
+     * sends the master fd back via SCM_RIGHTS on this socketpair; the
+     * parent receives it in step 12b below. */
+    if (config->enable_pty) {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, pty_sock) < 0) {
+            perror("socketpair");
+            free(stack);
+            if (overlay_active) teardown_overlay(&result.ctx.overlay_ctx, config->enable_debug);
+            if (sync_pipe[0] >= 0) { close(sync_pipe[0]); close(sync_pipe[1]); }
+            if (config->enable_cgroup) {
+                remove_cgroup(&result.ctx.cgroup_ctx, config->enable_debug);
+            }
+            result.child_pid = -1;
+            result.ctx.stack_ptr = NULL;
+            return result;
+        }
+        if (config->enable_debug) {
+            printf("[parent] PTY socketpair: parent fd %d, child fd %d\n",
+                   pty_sock[0], pty_sock[1]);
+        }
+    }
+
+    /* Step 5: child_args.  Phase 7b: explicit -1 sentinels for the new
+     * fd fields are load-bearing — zero-initialization would leave them
+     * at STDIN_FILENO and the child's `dup2(args->stdout_fd, ...)` would
+     * dup stdin over stdout.  mounts[] is filled via memcpy below
+     * because designated init can't express an array copy. */
     child_args_t child_args = {
         .program = config->program,
         .argv = config->argv,
@@ -275,8 +429,17 @@ container_result_t container_exec(const container_config_t *config) {
         .user_namespace_active = config->enable_user_namespace,
         .network_active = config->enable_network,
         .veth = config->veth,
-        .net_ctx = result.ctx.net_ctx
+        .net_ctx = result.ctx.net_ctx,
+        .mount_count = config->mount_count,
+        .enable_pty = config->enable_pty,
+        .pty_sock_fd = pty_sock[1],            // -1 if !enable_pty (init value)
+        .stdout_fd = config->stdout_fd,
+        .stderr_fd = config->stderr_fd
     };
+    if (config->mount_count > 0) {
+        memcpy(child_args.mounts, config->mounts,
+               sizeof(bind_mount_t) * (size_t)config->mount_count);
+    }
 
     /* Step 6: clone flags */
     int flags = SIGCHLD;
@@ -303,6 +466,7 @@ container_result_t container_exec(const container_config_t *config) {
     pid_t pid = clone(child_func, stack + STACK_SIZE, flags, &child_args);
     if (pid < 0) {
         perror("clone");
+        if (pty_sock[0] >= 0) { close(pty_sock[0]); close(pty_sock[1]); }
         free(stack);
         if (overlay_active) teardown_overlay(&result.ctx.overlay_ctx, config->enable_debug);
         if (sync_pipe[0] >= 0) { close(sync_pipe[0]); close(sync_pipe[1]); }
@@ -317,10 +481,14 @@ container_result_t container_exec(const container_config_t *config) {
 
     if (config->enable_debug) printf("[parent] Child PID: %d\n", pid);
 
-    /* Step 8: close read end in parent */
+    /* Step 8: close fds the child now owns. */
     if (sync_pipe[0] >= 0) {
         close(sync_pipe[0]);
         sync_pipe[0] = -1;
+    }
+    if (pty_sock[1] >= 0) {
+        close(pty_sock[1]);
+        pty_sock[1] = -1;
     }
 
     /* Step 9: user-ns mapping */
@@ -337,6 +505,7 @@ container_result_t container_exec(const container_config_t *config) {
         if (setup_user_namespace_mapping(pid, &mapping) < 0) {
             fprintf(stderr, "[parent] Failed to setup user namespace mapping\n");
             if (sync_pipe[1] >= 0) close(sync_pipe[1]);
+            if (pty_sock[0] >= 0) close(pty_sock[0]);
             kill(pid, SIGKILL);
             waitpid(pid, NULL, 0);
             free(stack);
@@ -356,6 +525,7 @@ container_result_t container_exec(const container_config_t *config) {
                       config->enable_debug) < 0) {
             fprintf(stderr, "[parent] Failed to setup network\n");
             if (sync_pipe[1] >= 0) close(sync_pipe[1]);
+            if (pty_sock[0] >= 0) close(pty_sock[0]);
             kill(pid, SIGKILL);
             waitpid(pid, NULL, 0);
             free(stack);
@@ -385,6 +555,7 @@ container_result_t container_exec(const container_config_t *config) {
         if (add_pid_to_cgroup(&result.ctx.cgroup_ctx, pid,
                               config->enable_debug) < 0) {
             fprintf(stderr, "[parent] Failed to add PID to cgroup\n");
+            if (pty_sock[0] >= 0) close(pty_sock[0]);
             kill(pid, SIGKILL);
             waitpid(pid, NULL, 0);
             free(stack);
@@ -397,33 +568,55 @@ container_result_t container_exec(const container_config_t *config) {
         }
     }
 
-    /* Step 13: waitpid */
-    int status;
-    if (waitpid(pid, &status, 0) < 0) {
-        perror("waitpid");
-        result.exit_status = -1;
-        if (overlay_active) teardown_overlay(&result.ctx.overlay_ctx, config->enable_debug);
-        cleanup_net(&result.ctx.net_ctx, config->enable_debug);
-        return result;
-    }
-
-    /* Step 14: parse status */
-    if (WIFEXITED(status)) {
-        result.exited_normally = true;
-        result.exit_status = WEXITSTATUS(status);
-        if (config->enable_debug) printf("[parent] Child exited: %d\n", result.exit_status);
-    } else if (WIFSIGNALED(status)) {
-        result.exited_normally = false;
-        result.signal = WTERMSIG(status);
-        result.exit_status = 128 + result.signal;
+    /* Step 12b (Phase 7b): receive PTY master fd from child via
+     * SCM_RIGHTS.  Runs AFTER write-sync (step 11) because the child
+     * waits on the sync pipe before mounting devpts + allocating the
+     * pty + calling pty_send_master.  Closing pty_sock[0] before
+     * pty_recv_master returns would cause the recvmsg to fail. */
+    if (config->enable_pty) {
+        if (pty_recv_master(pty_sock[0], &result.pty_master_fd) < 0) {
+            fprintf(stderr, "[parent] Failed to receive PTY master from child\n");
+            close(pty_sock[0]);
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            free(stack);
+            if (overlay_active) teardown_overlay(&result.ctx.overlay_ctx, config->enable_debug);
+            cleanup_net(&result.ctx.net_ctx, config->enable_debug);
+            if (config->enable_cgroup) {
+                remove_cgroup(&result.ctx.cgroup_ctx, config->enable_debug);
+            }
+            result.child_pid = -1;
+            result.ctx.stack_ptr = NULL;
+            return result;
+        }
+        close(pty_sock[0]);
+        pty_sock[0] = -1;
         if (config->enable_debug) {
-            printf("[parent] Child killed by signal: %d\n", result.signal);
+            printf("[parent] Received PTY master fd %d from child\n",
+                   result.pty_master_fd);
         }
     }
 
-    /* Step 15: teardown overlay (cgroup + net deferred to container_cleanup) */
-    if (overlay_active) teardown_overlay(&result.ctx.overlay_ctx, config->enable_debug);
+    /* container_start ends here.  Steps 13-15 (waitpid + parse status +
+     * teardown overlay) live in container_wait, which the caller invokes
+     * separately so it can interleave a state-file write between launch
+     * and reap (cmd_run) or skip the wait entirely (cmd_start). */
+    return result;
+}
 
+/**
+ * Phase 7a's monolithic entry point.  After the Phase 7b split this is
+ * a thin wrapper: container_start() to launch, container_wait() to reap
+ * (only if the child actually launched).  Kept for backwards
+ * compatibility with the transitional main.c and the existing
+ * tests/test_*.c suite — cmd_run does NOT call this because it needs
+ * the state-file write between the two halves.
+ */
+container_result_t container_exec(const container_config_t *config) {
+    container_result_t result = container_start(config);
+    if (result.child_pid > 0) {
+        container_wait(&result, config ? config->enable_debug : false);
+    }
     return result;
 }
 

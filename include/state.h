@@ -92,4 +92,15 @@ int state_list(container_info_t *infos, int max_infos);
  */
 int state_remove(const char *id);
 
+/**
+ * `mkdir -p` semantics on a single path.  Walks the path, creates any
+ * missing parent directories with the same mode, idempotent on
+ * EEXIST.  Exposed publicly (Phase 7b step 7) so cli.c's cmd_start
+ * can create the per-container `logs/` subdirectory before opening
+ * stdout/stderr log files.
+ *
+ * @return  0 on success, -1 with errno set on failure
+ */
+int mkdir_p(const char *path, mode_t mode);
+
 #endif // STATE_H

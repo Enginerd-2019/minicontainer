@@ -62,7 +62,7 @@ void state_dir_path(const char *id, char *out, size_t size) {
     snprintf(out, size, "%s/%s", state_dir_root(), id);
 }
 
-static int mkdir_p(const char *path, mode_t mode) {
+int mkdir_p(const char *path, mode_t mode) {
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", path);
     for (char *p = tmp + 1; *p; p++) {

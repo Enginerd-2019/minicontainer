@@ -26,7 +26,9 @@ DEPS       = $(SRC_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 HELPER_OBJS = $(BUILD_DIR)/core.o $(BUILD_DIR)/env.o \
               $(BUILD_DIR)/net.o $(BUILD_DIR)/cgroup.o \
               $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o \
-              $(BUILD_DIR)/mount.o $(BUILD_DIR)/state.o
+              $(BUILD_DIR)/mount.o $(BUILD_DIR)/state.o \
+              $(BUILD_DIR)/pty.o $(BUILD_DIR)/cli.o \
+              $(BUILD_DIR)/cleanup.o
 
 # Executables
 MINICONTAINER  = minicontainer
