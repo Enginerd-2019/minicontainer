@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-7a%20refactor-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-7b%20CLI%20lifecycle-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,15 +12,36 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current Phase:** Phase 7a - Execution-Core Consolidation (pure refactor)
+**Current Phase:** Phase 7b — CLI Lifecycle, State Files, Bind Mounts, PTY
 
-Phase 7a is a structural refactor with **no new user-visible features**. Phases 0-6 each added an isolation primitive (PID, mount, overlay, UTS, user, IPC, cgroups, network) by introducing a new `*_exec()` function in a new module. By Phase 6 those functions were ~90% identical boilerplate — the same `clone()` / `waitpid()` / stack-allocation / overlay-setup / cgroup-setup / sync-pipe / error-cleanup skeleton, repeated five times. Phase 7a collapses them into a single `container_exec()` in a new `core.c` driven by a unified `container_config_t`. Every Phase 0-6 behavior is preserved byte-identical when the corresponding flags are set; the helpers (`setup_uts`, `setup_rootfs`, `setup_overlay`, `setup_cgroup`, `setup_net`, etc.) remain in their respective modules and are now called once from `core.c`'s unified `child_func`.
+Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`), runtime state files at `/run/minicontainer/<id>/` with `state.json`+`pidfile`+`logs/`, detached containers, bind mounts via `--volume`, full interactive PTY via `--interactive` (private newinstance devpts inside every container; master fd handed back from child to parent via SCM_RIGHTS), and a `cleanup` subcommand that sweeps stale state directories, cgroups, host veth interfaces, iptables MASQUERADE rules, and overlay debris. Phase 7a's monolithic `container_exec()` splits into `container_start()` + `container_wait()` so the CLI can write the state file between launch and reap (and so `cmd_start` can exit immediately after launch for detached mode). `main.c` drops from ~340 lines to ~60 — pure dispatcher over a `parse_subcommand` switch with an implicit-run fallback that keeps every Phase 0–7a invocation pattern (`./minicontainer --pid /bin/sh`) working unchanged.
 
 ---
 
 ## Features
 
-### Phase 7a (Current)
+### Phase 7b (Current)
+
+- ✅ **Subcommand CLI** — `run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`. `parse_subcommand` lives in `cli.c`; `main.c` is a ~60-line dispatcher.
+- ✅ **Implicit-run backwards compatibility** — every Phase 0–7a invocation pattern (`./minicontainer --pid /bin/sh`, `./minicontainer /bin/echo hi`) still routes to `cmd_run` without a subcommand keyword. Heuristic: `argv[1]` starts with `-` OR is an executable path.
+- ✅ **Container state files** at `/run/minicontainer/<id>/` (root) or `$XDG_RUNTIME_DIR/minicontainer/<id>/` (rootless): `state.json` + `pidfile` + `logs/{stdout,stderr}.log` for detached. Hand-rolled JSON (no jansson/cJSON dependency).
+- ✅ **`container_exec()` split** into `container_start()` (parent-side setup through `clone` + sync + `add_pid_to_cgroup`) + `container_wait()` (waitpid + teardown). `cmd_run` writes the state file between the two; `cmd_start` exits after `container_start` and the child reparents to init. `container_exec()` is retained as a thin wrapper for backwards compatibility.
+- ✅ **`start` — detached containers** — writes `state.json`, opens `logs/{stdout,stderr}.log`, calls `container_start`, prints the 12-hex-char container ID, exits.
+- ✅ **`stop <id>`** — SIGTERM then SIGKILL after a configurable timeout (default 10 s).
+- ✅ **`exec <id> <cmd>`** — `setns(2)` into the existing container's namespaces, then `clone(SIGCHLD, …)` with **no `CLONE_NEW*` flags** so the new child inherits the joined namespaces rather than creating fresh ones.
+- ✅ **`list`** — walks `/run/minicontainer/`, prints ID / PID / started_at / command for every alive container.
+- ✅ **`inspect <id>`** — pretty-prints `state.json`. (Live runtime introspection lands in Phase 8a.)
+- ✅ **`cleanup`** — sweeps stale state dirs, orphan cgroups (`/sys/fs/cgroup/minicontainer_*` with empty `cgroup.procs`), orphan `veth_h_*` interfaces, stale iptables MASQUERADE rules, and orphan overlay directories. Liveness via `kill(pid, 0) == 0`.
+- ✅ **`--volume host:container[:ro]`** bind mounts. Applied in `child_func` AFTER `setup_rootfs`, BEFORE `mount_proc` so a bind can't shadow `/proc`. Read-only uses the two-call `mount(MS_BIND)` + `mount(MS_BIND|MS_REMOUNT|MS_RDONLY)` pattern — the kernel silently ignores `MS_RDONLY` on the initial MS_BIND.
+- ✅ **`--interactive` / `-i` PTY** — newinstance `devpts` mounted inside the container with `mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666,mode=0620,gid=5")`; `/dev/ptmx` symlinked to `/dev/pts/ptmx`; PTY pair allocated *inside* the child after `mount_devpts`; master fd handed back to the parent via `SCM_RIGHTS` on a pre-clone `socketpair(AF_UNIX, SOCK_STREAM, 0, sv)`; parent drives `pty_forward`. Line editing, Ctrl-C forwarding, and curses-based tools (`nano`, `vim`, `less`, `top`) all work.
+- ✅ **`--detach` / `-D`** — same as the `start` subcommand surface; `cmd_run` redirects to `cmd_start` when this flag is set.
+- ✅ **`mount_devpts` runs unconditionally when a rootfs is set** — not gated on `--interactive`. Apt's "Is /dev/pts mounted?" warning and nano's silent exit (both surfacing whenever a curses-linked or pty-allocating program runs inside the container) require devpts even for non-interactive workloads.
+- ✅ **Canonical container ID** — generated once per container by `state.h::generate_container_id()` (12 hex chars from `/dev/urandom`); threaded through every downstream module via `container_config_t.container_id`. The Phase 3 `static generate_container_id` inside `overlay.c` is removed — overlay, cgroup, state file, and veth naming all share the one canonical ID. See decisions.md #34.
+- ✅ **Five new modules** — `cli.h`/`cli.c` (dispatcher + handlers), `state.h`/`state.c` (state file I/O), `pty.h`/`pty.c` (PTY + SCM_RIGHTS handoff), `cleanup.h`/`cleanup.c` (stale-resource sweeper). All link via Phase 7a's `HELPER_OBJS` aggregate — adding a module is one row in the Makefile.
+- ✅ **Three new test suites** — `test_state` (round-trip, missing-ID, list-with-liveness, mkdir_p idempotency), `test_bind` (directory + file + read-only bind mounts in isolated mount namespaces via `unshare(CLONE_NEWNS)`), `test_cli` (`parse_subcommand` over every known subcommand + 9 negative cases). Plus two latent state.c bugs (decisions.md Errors #20, #21) caught by the new suites that the Phase 0–7a integration tests never exercised.
+- ✅ **build_rootfs.sh additions** — bundles xterm terminfo (so `nano` and other ncurses-linked binaries find their terminal description files); `sleep` added to `BINS`.
+
+### Phase 7a
 
 - ✅ **Unified `container_exec()`** — One entry point in `core.c` replaces the per-phase `*_exec()` chain (`spawn_process` → `namespace_exec` → `mount_exec` → `overlay_exec` → `uts_exec` → `cgroup_exec` → `net_exec`). Behavior is driven entirely by `container_config_t` flags.
 - ✅ **Unified `container_config_t`** — Subsumes every prior `*_config_t`. Sets the namespace flags, rootfs / overlay / hostname / user-mapping / cgroup-limits / veth fields in one struct.
@@ -146,6 +167,42 @@ If you move or rename the built binary afterward, re-run
 
 ### Run
 
+#### Phase 7b — Subcommand lifecycle
+
+```bash
+# Explicit subcommand
+./minicontainer run --pid /bin/echo hello
+
+# Implicit-run (Phase 0–7a invocations still work; no `run` keyword needed)
+./minicontainer --pid /bin/echo hello                 # flag-prefixed
+./minicontainer /bin/echo hello                       # bare program
+
+# Detached container — prints a 12-hex-char ID, returns immediately
+CID=$(sudo ./minicontainer start --pid --rootfs ./rootfs --net \
+        --memory 100M /bin/sh -c 'while true; do sleep 60; done')
+echo "$CID"   # e.g. a1b2c3d4e5f6
+
+# Find / introspect / stop / sweep
+sudo ./minicontainer list                       # table: ID, PID, started_at, command
+sudo ./minicontainer inspect "$CID"             # state.json pretty-printed
+sudo ./minicontainer exec "$CID" /bin/ps aux    # run a command inside the existing container
+sudo ./minicontainer stop "$CID"                # SIGTERM → 10s timeout → SIGKILL
+sudo ./minicontainer cleanup                    # sweep stale state/cgroups/veth/iptables/overlay
+
+# Bind mounts — host:container[:ro]
+sudo ./minicontainer run --pid --rootfs ./rootfs \
+    --volume "$PWD"/data:/data \
+    --volume "$PWD"/config:/etc/config:ro \
+    /bin/sh -c 'ls /data; cat /etc/config/app.conf'
+
+# Interactive PTY — Ctrl-C, line editing, curses tools (nano, less, top) all work
+sudo ./minicontainer run --interactive --pid --rootfs ./ubuntu-root /bin/sh
+# inside: nano /tmp/test.txt   # opens cleanly, save/exit Ctrl-O / Ctrl-X
+#         sleep 100; ^C; echo $?   # 130 (= 128 + SIGINT 2) — signals reach the container
+```
+
+#### Phase 0–7a flag examples (still work via implicit-run)
+
 ```bash
 # Basic usage (no namespace)
 ./minicontainer /bin/ls -la
@@ -259,7 +316,8 @@ sudo setcap cap_sys_admin+ep ./minicontainer
 ### Test
 
 ```bash
-# Run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5 + 6)
+# Run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5 + 6 + 7b)
+# 22 Phase 0–6 assertions + 10 Phase 7b assertions across test_cli/test_state/test_bind
 make test
 
 # Run example commands
@@ -276,34 +334,45 @@ make valgrind
 ```
 minicontainer/
 ├── include/
-│   ├── core.h               # Phase 7a: container_config_t, container_exec(), container_cleanup()
+│   ├── cli.h                # Phase 7b: subcommand_t enum, parse_subcommand, cmd_* declarations
+│   ├── state.h              # Phase 7b: container_state_t, generate_container_id, state_save/load/list/remove, mkdir_p
+│   ├── pty.h                # Phase 7b: pty_pair_t, pty_open_in_child, pty_send_master, pty_recv_master, pty_set_ctty, pty_forward
+│   ├── cleanup.h            # Phase 7b: cleanup_stale_resources
+│   ├── core.h               # Phase 7a + 7b: container_config_t (gains container_id/mounts/enable_pty/detach/stdout_fd/stderr_fd), container_start, container_wait, container_exec wrapper
 │   ├── env.h                # Phase 7a: build_container_env() (extracted from main.c)
+│   ├── mount.h              # Phase 2 + 7b: setup_rootfs(), mount_proc(), bind_mount_apply(), mount_devpts()
 │   ├── net.h                # Phase 6: veth setup helpers, find_ip_binary() (public since 7a)
 │   ├── cgroup.h             # Phase 5: cgroups v2 setup/limits helpers
 │   ├── uts.h                # Phase 4/4b/4c: setup_uts(), setup_user_namespace_mapping(), user_ns_mapping_t (since 7a)
-│   ├── overlay.h            # Phase 3: setup_overlay(), teardown_overlay()
-│   └── mount.h              # Phase 2: setup_rootfs(), mount_proc()
+│   └── overlay.h            # Phase 3 + 7b: setup_overlay() takes container_id (canonical ID threading), teardown_overlay()
 ├── src/
-│   ├── main.c               # CLI entry point — populates container_config_t, calls container_exec()
-│   ├── core.c               # Phase 7a: unified container_exec / child_func / close_inherited_fds (one canonical copy)
+│   ├── main.c               # Phase 7b: ~60-line subcommand dispatcher with implicit-run fallback
+│   ├── cli.c                # Phase 7b: parse_subcommand, cli_usage, parse_run_flags, parse_volume, state_from_config, cmd_run/start/stop/exec/inspect/list/cleanup
+│   ├── state.c              # Phase 7b: state file I/O (hand-rolled JSON), generate_container_id (/dev/urandom), mkdir_p (idempotent)
+│   ├── pty.c                # Phase 7b: pty_open_in_child (after mount_devpts), pty_send_master/pty_recv_master (SCM_RIGHTS), pty_set_ctty, pty_forward
+│   ├── cleanup.c            # Phase 7b: sweeps state dirs / cgroups / veth_h_* / iptables NAT / overlay dirs by container ID
+│   ├── core.c               # Phase 7a + 7b: container_start + container_wait + container_exec wrapper; child_func runs mount_devpts + PTY allocation + bind mount loop
 │   ├── env.c                # Phase 7a: build_container_env() (calloc + bounds-check version from Phase 5)
+│   ├── mount.c              # Phase 2 + 7b: setup_rootfs, mount_proc, bind_mount_apply (with MS_RDONLY remount), mount_devpts (newinstance + /dev/ptmx symlink)
 │   ├── net.c                # Phase 6: setup_net, configure_container_net, cleanup_net, generate_veth_names, find_ip_binary
 │   ├── cgroup.c             # Phase 5: setup_cgroup, add_pid_to_cgroup, remove_cgroup
 │   ├── uts.c                # Phase 4/4b: setup_uts, setup_user_namespace_mapping
-│   ├── overlay.c            # Phase 3: setup_overlay, teardown_overlay (+ static path/dir helpers)
-│   └── mount.c              # Phase 2: setup_rootfs, mount_proc
+│   └── overlay.c            # Phase 3 + 7b: setup_overlay takes container_id param, teardown_overlay (+ static path/dir helpers)
 ├── tests/
+│   ├── test_state.c         # Phase 7b: state file round-trip, missing-ID, list-with-liveness, mkdir_p idempotent (requires root for /run)
+│   ├── test_bind.c          # Phase 7b: directory/file/read-only bind mounts in isolated mount namespaces (unshare CLONE_NEWNS)
+│   ├── test_cli.c           # Phase 7b: parse_subcommand over every known subcommand + 9 negative cases (no root needed)
 │   ├── test_core.c          # Phase 7a: bare-exec + pid-only regressions (covers prior test_spawn / test_namespace cases)
 │   ├── test_net.c           # Phase 6: namespace creation, backward compat, net + cgroup (requires root)
 │   ├── test_cgroup.c        # Phase 5: cgroup lifecycle, memory/CPU/PID limits (requires root)
 │   ├── test_uts.c           # Phase 4/4b/4c: UTS + user + IPC namespace tests
-│   ├── test_overlay.c       # Phase 3: Overlay/env/fd tests (requires root + rootfs)
+│   ├── test_overlay.c       # Phase 3 + 7b: Overlay tests; base_overlay_config populates container_id (canonical ID)
 │   └── test_mount.c         # Phase 2: Mount/rootfs tests (requires root + rootfs)
 ├── scripts/
-│   └── build_rootfs.sh      # Builds minimal rootfs from host binaries (BINS includes `ip`, `curl`, NSS modules)
+│   └── build_rootfs.sh      # Builds minimal rootfs from host binaries (BINS includes `ip`, `curl`, `python3`, `nano`, `sleep`; bundles xterm terminfo for ncurses binaries; NSS modules + CA bundle for DNS/TLS)
 ├── docs/
-│   └── decisions.md         # Design decisions and error log
-├── Makefile                 # Build system (HELPER_OBJS unified link chain since 7a)
+│   └── decisions.md         # Design decisions (now through #34: canonical container-ID source) and error log (Errors #1–#21)
+├── Makefile                 # Build system (HELPER_OBJS picks up state.o / pty.o / cli.o / cleanup.o automatically)
 └── README.md                # This file
 ```
 
@@ -322,64 +391,83 @@ bare-spawn case). The deletions are why Phase 7a is a *pure refactor*
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                main.c (CLI Layer)                    │
-│  • Parses --pid, --rootfs, --overlay, --hostname,    │
-│    --memory, --cpus, --pids, --net, --net-host-ip,   │
-│    --net-container-ip, --net-netmask, --no-nat, etc. │
-│  • build_container_env() — clean environment (env.c) │
-│  • Misplaced flag detection                          │
-│  • Populates container_config_t, calls               │
-│    container_exec()  (Phase 7a: one entry point)     │
+│       main.c — Dispatcher (Phase 7b, ~60 lines)      │
+│  • parse_subcommand(argv[1]) → subcommand_t          │
+│  • switch on enum, route to cmd_*                    │
+│  • Implicit-run fallback for Phase 0–7a compat:      │
+│    argv[1] starts with '-' OR is an executable path  │
+│    → cmd_run(argc, argv)                             │
 └─────────────────────┬────────────────────────────────┘
                       │
                       ▼
 ┌──────────────────────────────────────────────────────┐
-│      core.c — Unified Orchestrator (Phase 7a)        │
+│       cli.c — Subcommand Handlers (Phase 7b)         │
 │                                                      │
-│  container_exec(const container_config_t *)          │
-│  - 15-step parent-side lifecycle (preserved from     │
-│    Phase 5/6, now a single canonical copy):          │
-│    1.  setup_cgroup()        (if enable_cgroup)      │
-│    2.  pipe(sync_pipe)       (if user OR network)    │
-│    3.  setup_overlay()       (if overlay + rootfs)   │
-│    4.  malloc(STACK_SIZE)                            │
-│    5.  generate_veth_names() BEFORE clone()          │
-│    6.  populate child_args (snapshot, pre-clone)     │
-│    7.  clone(CLONE_NEW* per config flags)            │
-│    8.  setup_user_namespace_mapping() (user_ns)      │
-│    9.  setup_net()           (if network)            │
-│   10.  write sync byte → child unblocks              │
-│   11.  add_pid_to_cgroup()   (AFTER sync)            │
-│   12.  waitpid()                                     │
-│   13.  parse WIFEXITED / WIFSIGNALED                 │
-│   14.  teardown_overlay() if active                  │
-│   15.  (cleanup_net / remove_cgroup / free stack     │
-│         deferred to container_cleanup())             │
+│  parse_subcommand, cli_usage                         │
+│  parse_run_flags  (shared by cmd_run + cmd_start;    │
+│                    validates --rootfs/--overlay/--net│
+│                    sub-flags, --interactive/--detach │
+│                    mutex; populates container_id via │
+│                    state.h::generate_container_id)   │
+│  parse_volume     (host:container[:ro] → bind_mount_t)│
+│  state_from_config (cfg → state.json fields)         │
 │                                                      │
-│  container_cleanup(container_result_t *)             │
-│  - cleanup_net() → delete host veth + iptables rule  │
-│  - remove_cgroup() → rmdir /sys/fs/cgroup/...        │
-│  - free(stack_ptr)                                   │
+│  cmd_run / cmd_start / cmd_stop / cmd_exec /         │
+│  cmd_inspect / cmd_list / cmd_cleanup                │
 └─────────────────────┬────────────────────────────────┘
                       │
+                      ▼
+┌──────────────────────────────────────────────────────┐
+│      core.c — Runtime Orchestrator (Phase 7a + 7b)   │
+│                                                      │
+│  container_start(const container_config_t *)         │
+│  - Phase 7a 15-step parent pipeline, plus 7b:        │
+│    • PTY socketpair(AF_UNIX) BEFORE clone if PTY     │
+│    • memcpy mounts[] into child_args BEFORE clone    │
+│    • pty_recv_master AFTER add_pid_to_cgroup if PTY  │
+│  - Returns when child is launched (no waitpid)       │
+│                                                      │
+│  container_wait(container_result_t *, bool debug)    │
+│  - waitpid + status parse + overlay teardown         │
+│                                                      │
+│  container_exec()  — thin wrapper around start+wait  │
+│                      (Phase 7a tests + transitional  │
+│                       call sites still use this)     │
+│                                                      │
+│  container_cleanup() — cleanup_net + remove_cgroup   │
+│                        + free(stack)                 │
+└─────────────────────┬────────────────────────────────┘
+                      │ clone()
                       ▼
 ┌──────────────────────────────────────────────────────┐
 │   Child Process (core.c child_func — single copy)    │
-│  • Wait on sync pipe (if --user OR --net)            │
-│  • setup_uts()              (uts.c)                  │
-│  • setup_rootfs()           (mount.c)                │
-│  • mount_proc() with graceful /proc degradation      │
-│  • configure_container_net() (net.c, if network)     │
-│  • close_inherited_fds() — CVE-2024-21626/CVE-2016-  │
-│    9962 mitigation, single canonical copy            │
-│  • execve(program, argv, envp) — clean container env │
+│  1. Wait on sync pipe (if --user OR --net OR PTY)    │
+│  2. setup_uts()                       (uts.c)        │
+│  3. setup_rootfs()                    (mount.c)      │
+│  4. bind_mount_apply loop             (mount.c, 7b)  │
+│  5. mount_proc() with graceful degradation           │
+│  6. mount_devpts()                    (mount.c, 7b)  │
+│  7. PTY block if enable_pty: pty_open_in_child →     │
+│     pty_send_master → close(pty_sock_fd) →           │
+│     pty_set_ctty(slave_fd)            (pty.c, 7b)    │
+│  8. configure_container_net()         (net.c)        │
+│  9. close_inherited_fds()  (CVE-2024-21626 mitigation)│
+│ 10. execve(program, argv, envp)                      │
 └──────────────────────────────────────────────────────┘
 
-Helper modules called from core.c's parent and child halves:
-  mount.c, overlay.c, uts.c, cgroup.c, net.c
-Each retains only the helper functions it owns — no per-phase
-*_exec() orchestrator, no duplicate child_func, no duplicate
-close_inherited_fds.
+Adjacent (host-side) modules:
+
+  state.c    — /run/minicontainer/<id>/state.json + pidfile;
+               generate_container_id (/dev/urandom);
+               mkdir_p (idempotent); state_save/load/list/remove
+  cleanup.c  — cleanup_stale_resources(): orphan state dirs,
+               cgroups, veth_h_*, iptables MASQUERADE rules,
+               overlay debris — paired by container ID
+  env.c      — build_container_env (clean container env)
+  pty.c      — SCM_RIGHTS sender/receiver, pty_forward
+
+Helper modules unchanged from Phase 7a:
+  overlay.c, uts.c, cgroup.c, net.c
 ```
 
 **Phase transitions:**
@@ -393,6 +481,7 @@ close_inherited_fds.
 - Phase 5: `cgroup.c` (`cgroup_exec`) supersedes `uts.c` as the top-level exec module
 - Phase 6: `net.c` (`net_exec`) supersedes `cgroup.c` as the top-level exec module
 - **Phase 7a:** every `*_exec()` collapsed into `container_exec()` in `core.c`. The helper modules (mount.c, overlay.c, uts.c, cgroup.c, net.c) keep their helpers (`setup_*`, `cleanup_*`) — they no longer carry the orchestration boilerplate.
+- **Phase 7b:** `container_exec()` splits into `container_start()` + `container_wait()`. New modules `cli.c` (subcommand dispatch + handlers), `state.c` (state file I/O + canonical container_id), `pty.c` (SCM_RIGHTS PTY handoff), `cleanup.c` (stale-resource sweeper). `mount.c` gains `bind_mount_apply` + `mount_devpts`. `core.c`'s `child_func` inserts bind mounts (between `setup_rootfs` and `mount_proc`), `mount_devpts` (after `mount_proc`), and the optional PTY allocation block (after `mount_devpts`). `main.c` becomes a thin dispatcher.
 
 **Why the duplication existed (and why 7a removed it):** Each phase's
 `*_exec()` shared ~90% of its structure with the previous phase —
@@ -473,19 +562,54 @@ container_config_t cfg = {
         .container_ip = "10.0.0.2",
         .netmask      = "24",
         .enable_nat   = true                 // iptables MASQUERADE
-    }
+    },
+
+    // Canonical container identity (Phase 7b)
+    // Generated once per cmd_run by state.h::generate_container_id
+    // (/dev/urandom → 12 hex chars).  Threaded into overlay, cgroup,
+    // veth naming, and state file paths.  Empty string is rejected
+    // by setup_overlay.
+    .container_id = "abc123def456",   // populated via generate_container_id
+
+    // Bind mounts (Phase 7b) — host:container[:ro]
+    .mounts      = { /* ... bind_mount_t array ... */ },
+    .mount_count = 0,                 // 0 = no bind mounts
+
+    // Interactive PTY (Phase 7b) — single bool; master fd returns
+    // on container_result_t.pty_master_fd after container_start.
+    .enable_pty = false,
+
+    // Detached mode (Phase 7b) — log file fds for cmd_start.
+    // -1 sentinels are load-bearing: 0 is STDIN_FILENO, a real fd.
+    .detach    = false,
+    .stdout_fd = -1,
+    .stderr_fd = -1,
 };
 ```
 
-**Result structure (Phase 7a — unified):**
+**Result structure (Phase 7a + 7b — unified):**
 
 ```c
+// Phase 7a-compatible single call: equivalent to container_start +
+// container_wait.  Phase 7a tests and the transitional main.c use this.
 container_result_t r = container_exec(&cfg);
+
+// Phase 7b two-call shape used by cmd_run / cmd_start so the CLI can
+// write the state file between launch and reap, or skip wait entirely
+// for detached mode.
+container_result_t r = container_start(&cfg);     // launches child, returns
+if (r.child_pid < 0) { /* error */ }
+// ... write /run/minicontainer/<id>/state.json here ...
+if (cfg.enable_pty && r.pty_master_fd >= 0) {
+    pty_forward(r.pty_master_fd);                 // host stdio ↔ container PTY
+    close(r.pty_master_fd);
+}
+container_wait(&r, cfg.enable_debug);             // waitpid + teardown overlay
 
 if (r.exited_normally) {
     printf("Exit code: %d\n", r.exit_status);
 } else {
-    printf("Killed by signal %d\n", r.signal);   // 137 = OOM-killed
+    printf("Killed by signal %d\n", r.signal);    // 137 = OOM-killed
 }
 
 container_cleanup(&r);   // cleanup_net + remove_cgroup + free(stack)
@@ -1047,6 +1171,24 @@ make test
 - ✓ Backward compatibility (no `--net`, Phase 5 behavior preserved)
 - ✓ Network namespace combined with cgroup (veth + memory/cpu/pids active simultaneously)
 
+**Phase 7b CLI tests** (`test_cli` - no root required):
+- ✓ `parse_subcommand` returns the right enum for every known subcommand (`run`, `start`, `stop`, `exec`, `inspect`, `list`, `cleanup`)
+- ✓ `parse_subcommand` returns `SUBCMD_UNKNOWN` for `NULL`, empty string, case-mismatch, prefix-only, prefix-extra, flag (`--pid`), executable path, garbage
+
+**Phase 7b state tests** (`test_state` - requires root for `/run`):
+- ✓ Full-field round-trip — seeded `container_state_t` → `state_save` → `state_load` → every field matches
+- ✓ `state_remove` clears the directory (state.json + pidfile + the directory itself)
+- ✓ `state_load` on a missing ID returns -1
+- ✓ `state_list` reports correct `alive` flag for live (self-PID) and dead (PID 999999) entries
+- ✓ `mkdir_p` is nested and idempotent (returns 0 when leaf already exists as a directory)
+
+**Phase 7b bind-mount tests** (`test_bind` - requires root for `unshare` + `mount`):
+- ✓ Directory bind round-trips content (write to source, read through target)
+- ✓ Read-only bind rejects `open(O_WRONLY)` with `EROFS` (validates the two-call `MS_BIND` + `MS_REMOUNT|MS_RDONLY` pattern)
+- ✓ File bind overlays a placeholder correctly (uses `open(O_CREAT)` seed instead of `mkdir`)
+
+Each test_bind case forks into its own `unshare(CLONE_NEWNS)` + `mount("/", MS_REC|MS_PRIVATE)` child, so the bind mounts the test creates never leak to the host.
+
 ### Manual Testing
 
 ```bash
@@ -1123,6 +1265,9 @@ Following shell/POSIX conventions:
 ## Design Decisions
 
 See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
+- **Canonical container-ID source: `state.h::generate_container_id`** — why Phase 3's `static generate_container_id` inside `overlay.c` is deleted in Phase 7b, why a single `/dev/urandom`-backed generator becomes the sole source, how the canonical ID threads through every downstream module via `container_config_t.container_id` (Decision #34)
+- **`state.json` namespace bool key disambiguation** — why namespace bool keys carry a `_ns` suffix (`pid_ns`, `mount_ns`, …) — the naive `strstr`-based `find_key` was matching the top-level `"pid": 12345` int instead of the nested `"pid": true` bool and silently round-tripping `enable_pid_namespace` as `false` (Error #20, caught by `test_state`)
+- **`mkdir_p` idempotency contract** — why the function must return 0 when the leaf already exists as a directory (treat `EEXIST` + `S_ISDIR` as success), not just pass through the raw final `mkdir` errno (Error #21, caught by `test_state`)
 - **Phase 7a execution-core consolidation** — why five `*_exec()` functions collapse into one `container_exec()`, how the unified `container_config_t` / `container_context_t` / `container_result_t` are organized, what the `child_args_t` snapshot semantics buy you (Decision #30)
 - **`user_ns_mapping_t` replaces the synthetic `uts_config_t` workaround** from Phase 5 — why the signature change to `setup_user_namespace_mapping()` is worth a dedicated five-field struct (Decision #31)
 - **`find_ip_binary()` promoted from `static` to public** — the second half of the promotion (the `static` qualifier on the definition has to be dropped in lockstep with adding the declaration to `net.h`) (Decision #32)
@@ -1162,7 +1307,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 3. ~~**Environment variable leak**~~ — **Fixed in Phase 3** via `build_container_env()` and `--env`
 4. ~~**No copy-on-write filesystem**~~ — **Fixed in Phase 3** via OverlayFS
 5. ~~**No mount hardening**~~ — **Fixed in Phase 3** via `MS_NODEV | MS_NOSUID`
-6. **Single command** — Runs one command then exits (no daemon mode)
+6. ~~**Single command** — Runs one command then exits (no daemon mode)~~ — **Mitigated in Phase 7b** via the `start` subcommand (detached mode — parent exits, child reparents to init) and `exec` (run a command inside an already-running container). The container itself still runs one entrypoint, but the runtime now supports multi-process workflows.
 7. ~~**Requires root for namespaces**~~ — **Mitigated in Phase 4b** via `CLONE_NEWUSER` and `--user` flag (rootless containers). `/proc` mount may be restricted by AppArmor in user namespace mode
 8. **Rootfs must be pre-built** — No image pull or layer support; rootfs directory must exist before running
 9. **No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
@@ -1252,7 +1397,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] `cleanup_net()` deletes host veth + iptables rule (kernel handles container end at netns destruction)
 - [x] Unit tests (`test_net` requires root + iproute2)
 
-### ✅ Phase 7a: Execution-Core Consolidation (Current)
+### ✅ Phase 7a: Execution-Core Consolidation
 - [x] New `core.c`/`core.h` module — unified `container_exec()`, `container_cleanup()`, `container_config_t`, `container_context_t`, `container_result_t`
 - [x] Five duplicate `child_func` / `close_inherited_fds` / `child_args_t` copies collapsed to one canonical definition each in `core.c`
 - [x] New `env.c`/`env.h` — `build_container_env()` extracted from `main.c` for reuse by tests and (future) subcommands
@@ -1266,13 +1411,20 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] Makefile `HELPER_OBJS` unified link chain — every test links against the same helper set as `minicontainer` (minus `main.o`, plus the test's own `.o`)
 - [x] Zero new user-visible features — pure refactor; every Phase 0-6 test passes behaviorally identical
 
-### 📋 Phase 7b: CLI & Lifecycle + Bind Mounts
-- [ ] Subcommand dispatch (`run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`)
-- [ ] Container state files (`/run/minicontainer/<id>/state.json` + pidfile, `$XDG_RUNTIME_DIR/...` for rootless)
-- [ ] `container_exec()` split into `container_start()` + `container_wait()` so state can be written between the two halves
-- [ ] `--volume host:container[:ro]` bind mounts
-- [ ] `--interactive` PTY allocation
-- [ ] `cleanup` subcommand scans for stale containers
+### ✅ Phase 7b: CLI & Lifecycle + Bind Mounts + PTY (Current)
+- [x] Subcommand dispatch (`run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`) — `parse_subcommand` + `subcommand_t` enum in `cli.c`/`cli.h`; `main.c` is the ~60-line dispatcher
+- [x] Implicit-run fallback for Phase 0–7a invocation patterns (`./minicontainer --pid /bin/sh` still works)
+- [x] Container state files at `/run/minicontainer/<id>/` (root) or `$XDG_RUNTIME_DIR/minicontainer/<id>/` (rootless): `state.json` + `pidfile` + `logs/{stdout,stderr}.log` (detached only)
+- [x] `container_exec()` split into `container_start()` (parent setup + clone + sync + `add_pid_to_cgroup`) and `container_wait()` (waitpid + parse + teardown overlay); thin `container_exec()` wrapper retained for Phase 0–7a compatibility
+- [x] Canonical container ID via `state.h::generate_container_id` (12 hex chars from `/dev/urandom`); threaded through every downstream module via `container_config_t.container_id`. Overlay's static generator deleted (decisions.md #34)
+- [x] `--volume host:container[:ro]` bind mounts — applied in `child_func` between `setup_rootfs` and `mount_proc`; read-only uses the two-call `MS_BIND` + `MS_REMOUNT|MS_RDONLY` pattern
+- [x] `--interactive` / `-i` PTY allocation — private newinstance devpts mounted inside the child; PTY pair allocated child-side via `pty_open_in_child`; master fd handed back to the parent via `SCM_RIGHTS` on a pre-clone `socketpair`; parent drives `pty_forward`
+- [x] `--detach` / `-D` detached mode — `cmd_start` opens `logs/stdout.log`+`logs/stderr.log`, calls `container_start`, prints the ID, exits without waiting
+- [x] `mount_devpts` runs unconditionally when a rootfs is set (not gated on `--interactive`) so apt's dialog frontend, nano, less, and every other pty-allocating program work in every container
+- [x] `cleanup` subcommand — sweeps stale state dirs, orphan cgroups (empty `cgroup.procs`), orphan `veth_h_*` interfaces, stale iptables MASQUERADE rules, and orphan overlay directories. Liveness via `kill(pid, 0) == 0`
+- [x] Five new modules: `cli.{h,c}`, `state.{h,c}`, `pty.{h,c}`, `cleanup.{h,c}`, with `mount.{h,c}` gaining `bind_mount_apply` + `mount_devpts`
+- [x] Three new test suites — `test_cli`, `test_state`, `test_bind` — that exposed two latent state.c bugs the Phase 0–7a integration suite never reached (decisions.md Errors #20 and #21)
+- [x] `build_rootfs.sh` bundles xterm terminfo (so ncurses-linked binaries find their terminal description files inside the container)
 
 ### 📋 Phase 8: Inspector + Hardening + OCI Bundles
 - [ ] **8a:** Static `libprocfs.a` extracted as a sibling project; cgroup read-side + `/proc` parsing reused by container `inspect` / `stats` / `top` / `netstat` subcommands
