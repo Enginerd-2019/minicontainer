@@ -1,15 +1,18 @@
 # Build artifacts
 build/
 *.o
-*.d              # Auto-generated header dependencies (-MMD -MP)
-minicontainer
-test_spawn
-test_namespace
-test_mount
-test_overlay     # Phase 3
-test_uts         # Phase 4/4b/4c
-test_cgroup      # Phase 5
-test_*           # Future-proof: test_net (Phase 6), test_cli (Phase 7), etc.
+# Auto-generated header dependencies (-MMD -MP)
+*.d
+# Main binary (anchored: only the repo-root binary, not anything
+# named `minicontainer` inside a subdirectory).
+/minicontainer
+# Compiled test binaries at the repo root.  Anchored with a leading
+# slash so the pattern does NOT match source files under tests/
+# (which would silently hide test_*.c from `git add`).  Covers
+# test_core, test_mount, test_overlay, test_uts, test_cgroup,
+# test_net, test_state, test_bind, test_cli, and any future test
+# binary that lands here.
+/test_*
 
 # Generated rootfs (built from host binaries, not source)
 rootfs/
