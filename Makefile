@@ -38,6 +38,9 @@ TEST_OVERLAY   = test_overlay
 TEST_UTS       = test_uts
 TEST_CGROUP    = test_cgroup
 TEST_NET       = test_net
+TEST_STATE     = test_state
+TEST_BIND      = test_bind
+TEST_CLI       = test_cli
 
 # Default target
 .PHONY: all
@@ -93,9 +96,23 @@ $(TEST_NET): $(BUILD_DIR)/test_net.o $(HELPER_OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_NET) successfully!"
 
+# Phase 7b new tests
+$(TEST_STATE): $(BUILD_DIR)/test_state.o $(HELPER_OBJS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_STATE) successfully!"
+
+$(TEST_BIND): $(BUILD_DIR)/test_bind.o $(HELPER_OBJS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_BIND) successfully!"
+
+$(TEST_CLI): $(BUILD_DIR)/test_cli.o $(HELPER_OBJS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_CLI) successfully!"
+
 # Build and run all tests
 .PHONY: test
-test: $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET)
+test: $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
+      $(TEST_STATE) $(TEST_BIND) $(TEST_CLI)
 	@echo "=== Running Phase 7a core tests (bare_exec + pid_only, requires root) ==="
 	sudo ./$(TEST_CORE)
 	@echo ""
@@ -118,6 +135,15 @@ test: $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TE
 	@echo ""
 	@echo "=== Running Phase 6 network tests (requires root + iproute2) ==="
 	sudo ./$(TEST_NET)
+	@echo ""
+	@echo "=== Running Phase 7b CLI tests (no root required) ==="
+	./$(TEST_CLI)
+	@echo ""
+	@echo "=== Running Phase 7b state tests (requires root for /run) ==="
+	sudo ./$(TEST_STATE)
+	@echo ""
+	@echo "=== Running Phase 7b bind-mount tests (requires root for unshare+mount) ==="
+	sudo ./$(TEST_BIND)
 
 # Build with debug symbols
 .PHONY: debug
@@ -184,7 +210,8 @@ uninstall-apparmor:
 .PHONY: clean
 clean:
 	@rm -rf $(BUILD_DIR)
-	@rm -f $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET)
+	@rm -f $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
+	       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI)
 	@echo "Cleaned build artifacts"
 
 # Run example commands

@@ -72,7 +72,16 @@ int mkdir_p(const char *path, mode_t mode) {
             *p = '/';
         }
     }
-    return mkdir(tmp, mode);
+    /* Idempotent leaf: succeed if the final mkdir works OR the path
+     * already exists as a directory.  Without this, the second call to
+     * mkdir_p on the same path (and the first call when the leaf is
+     * present from a prior run) returns -1 with errno=EEXIST. */
+    if (mkdir(tmp, mode) == 0) return 0;
+    if (errno == EEXIST) {
+        struct stat st;
+        if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+    }
+    return -1;
 }
 
 int state_save(const container_state_t *s) {
@@ -112,13 +121,17 @@ int state_save(const container_state_t *s) {
         "  \"rootfs\":      \"%s\",\n"
         "  \"hostname\":    \"%s\",\n"
         "  \"cgroup_path\": \"%s\",\n"
+        /* Phase 7b bug fix: namespace bool keys are suffixed _ns to
+         * avoid colliding with top-level "pid" (the integer PID).
+         * find_key uses naive strstr, so the "pid" bool would
+         * otherwise shadow-match the int field. */
         "  \"namespaces\": {\n"
-        "    \"pid\":     %s,\n"
-        "    \"mount\":   %s,\n"
-        "    \"uts\":     %s,\n"
-        "    \"user\":    %s,\n"
-        "    \"ipc\":     %s,\n"
-        "    \"network\": %s\n"
+        "    \"pid_ns\":     %s,\n"
+        "    \"mount_ns\":   %s,\n"
+        "    \"uts_ns\":     %s,\n"
+        "    \"user_ns\":    %s,\n"
+        "    \"ipc_ns\":     %s,\n"
+        "    \"network_ns\": %s\n"
         "  },\n",
         s->id, s->pid, s->started_at,
         s->command, s->argv_str,
@@ -254,12 +267,14 @@ int state_load(const char *id, container_state_t *out) {
     extract_string(buf, "cgroup_path", out->cgroup_path, sizeof(out->cgroup_path));
 
     /* Namespaces block — each is "key": true/false inside "namespaces": {...}. */
-    extract_bool(buf, "pid",     &out->enable_pid_namespace);
-    extract_bool(buf, "mount",   &out->enable_mount_namespace);
-    extract_bool(buf, "uts",     &out->enable_uts_namespace);
-    extract_bool(buf, "user",    &out->enable_user_namespace);
-    extract_bool(buf, "ipc",     &out->enable_ipc_namespace);
-    extract_bool(buf, "network", &out->enable_network);
+    /* Phase 7b bug fix: read the disambiguated *_ns keys, not the
+     * collision-prone bare names.  See the serializer above. */
+    extract_bool(buf, "pid_ns",     &out->enable_pid_namespace);
+    extract_bool(buf, "mount_ns",   &out->enable_mount_namespace);
+    extract_bool(buf, "uts_ns",     &out->enable_uts_namespace);
+    extract_bool(buf, "user_ns",    &out->enable_user_namespace);
+    extract_bool(buf, "ipc_ns",     &out->enable_ipc_namespace);
+    extract_bool(buf, "network_ns", &out->enable_network);
 
     /* Veth block — present only when network is active. */
     out->has_veth = false;

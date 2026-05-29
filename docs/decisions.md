@@ -2543,6 +2543,226 @@ mode) — each LSM has its own knobs that can produce identical
 
 ---
 
+### Error #20: `state.json` Key Collision — `extract_bool("pid", ...)` Matched the Integer PID Field (Phase 7b)
+
+**Background — what was there.** Phase 7b's `state.c` writes a
+JSON-shaped state file per container at `/run/minicontainer/<id>/state.json`
+and reads it back via `state_load`.  The hand-rolled parser (the
+project explicitly avoids `jansson`/`cJSON`/etc. for educational
+clarity) uses three field-extractors — `extract_string`, `extract_int`,
+`extract_bool` — that all share a single key-lookup helper:
+
+```c
+static const char *find_key(const char *buf, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    return strstr(buf, pat);
+}
+```
+
+`strstr` returns the **first** occurrence.  The function works
+correctly whenever a key appears at most once in the file.
+
+The state file's namespace flags were originally serialized inside a
+nested `"namespaces": { ... }` object, with the bool keys chosen to
+match the namespace's short name:
+
+```json
+{
+  "id":   "abc123def456",
+  "pid":  12345,
+  ...
+  "namespaces": {
+    "pid":     true,
+    "mount":   true,
+    "uts":     false,
+    "user":    false,
+    "ipc":     true,
+    "network": true
+  },
+  ...
+}
+```
+
+**The bug.** `state_load` called `extract_bool(buf, "pid", &out->enable_pid_namespace)`.
+`find_key` returned a pointer to the FIRST `"pid"` — the top-level
+integer field — and `extract_bool` then scanned forward for `true` or
+`false` after the colon.  It found `12345`, matched neither literal,
+and returned -1.  `out->enable_pid_namespace` was left at its
+zero-initialized default of `false` regardless of what was saved.
+
+Detection: `tests/test_state.c::test_round_trip` (introduced as part
+of the Phase 7b unit-test pass) seeded `enable_pid_namespace = true`,
+saved, loaded, and asserted equality.  Failed with `pid_ns mismatch`
+on the first run.
+
+Why the integration suite missed it.  Every Phase 0–7a test invokes
+`container_exec` directly with a hand-built `container_config_t` — no
+test ever writes a state file, no test ever reads one back.  The bug
+was in the read path that only `cmd_list` / `cmd_inspect` / `cmd_stop`
+/ `cmd_cleanup` exercise, and those subcommands only matter once
+state files exist on disk, which only `cmd_run` / `cmd_start` produce.
+The integration suite covered none of that surface.
+
+**Resolution.** Disambiguate the namespace bool keys with a `_ns`
+suffix so no top-level integer field can shadow them.  Both the
+serializer (`state_save`) and the loader (`state_load`) updated:
+
+```diff
+-  "namespaces": { "pid": ..., "mount": ..., "uts": ..., ... }
++  "namespaces": { "pid_ns": ..., "mount_ns": ..., "uts_ns": ..., ... }
+```
+
+```diff
+- extract_bool(buf, "pid",     &out->enable_pid_namespace);
+- extract_bool(buf, "mount",   &out->enable_mount_namespace);
+- extract_bool(buf, "uts",     &out->enable_uts_namespace);
+- extract_bool(buf, "user",    &out->enable_user_namespace);
+- extract_bool(buf, "ipc",     &out->enable_ipc_namespace);
+- extract_bool(buf, "network", &out->enable_network);
++ extract_bool(buf, "pid_ns",     &out->enable_pid_namespace);
++ extract_bool(buf, "mount_ns",   &out->enable_mount_namespace);
++ extract_bool(buf, "uts_ns",     &out->enable_uts_namespace);
++ extract_bool(buf, "user_ns",    &out->enable_user_namespace);
++ extract_bool(buf, "ipc_ns",     &out->enable_ipc_namespace);
++ extract_bool(buf, "network_ns", &out->enable_network);
+```
+
+The fix is in the *schema* of state.json rather than in the parser
+because the parser's naive `strstr` is correct behavior for a
+single-occurrence-per-key file; the constraint the schema violated was
+"each key occurs at most once across the entire document, including
+nested objects."  Renaming the bool keys re-establishes that
+constraint and means no future top-level field can re-trigger the
+same class of bug.
+
+**Considered and rejected.** Making `find_key` section-aware (parse
+into nested objects before searching) would be the principled fix but
+brings the parser closer to a real JSON parser without the
+correctness guarantees of one.  The educational point of the
+hand-rolled parser is "you can carry a project a long way on flat-key
+JSON if you keep your schema flat."  This fix preserves that property.
+
+**Lesson.** Hand-rolled JSON parsers that search by string-matching
+the quoted key trade flexibility for simplicity — and the price is
+that the schema MUST keep every key globally unique.  Mixing a
+top-level `"pid": <int>` with a nested `"pid": <bool>` reads
+naturally to a JSON-literate human (the nesting disambiguates) but
+breaks the parser's contract.  Any future field added to
+`container_state_t` must check that its serialized name doesn't
+shadow an existing one anywhere in the file, including inside
+existing nested objects.
+
+Generalizable beyond this codebase: whenever a parser uses naive
+substring search, the input format's invariant "every key is unique
+across the whole document" becomes load-bearing for correctness.
+Documenting that invariant alongside the parser is cheaper than
+discovering it through a regression.
+
+**Fix Applied:** 2026-05-28
+
+---
+
+### Error #21: `mkdir_p` Was Not Idempotent — Returned `-1` When the Leaf Already Existed (Phase 7b)
+
+**Background — what was there.** `state.c::mkdir_p` walks a path,
+creating each intermediate directory as it goes, then issues a final
+`mkdir` on the full path.  The Phase 7b version (before this fix):
+
+```c
+int mkdir_p(const char *path, mode_t mode) {
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, mode);   /* ignore EEXIST */
+            *p = '/';
+        }
+    }
+    return mkdir(tmp, mode);   /* <-- raw return */
+}
+```
+
+Inside the loop, the per-component `mkdir` calls deliberately ignore
+their return value — that's how the function handles the "parent
+already exists" case while still creating any missing parents.  The
+final `mkdir` on the full path, however, returns its raw result.
+
+**The bug.** When the leaf already exists (because a prior invocation
+created it, or because the caller is asking for an idempotent ensure-
+exists semantic), the final `mkdir` returns `-1` with `errno = EEXIST`
+and the function reports failure.  The semantic implied by the
+function name `mkdir_p` (with `-p` standing for "parents," matching
+`mkdir(1) -p`'s behavior) is that the call succeeds when the path
+exists as a directory at the end — whether the call created it or not.
+The implementation violated that contract on the leaf.
+
+The two visible failure modes:
+
+1. **Second call on the same path fails.**  After a successful first
+   `mkdir_p("/foo/bar/baz")`, a second identical call returns -1.
+2. **First call fails if the leaf survived a crashed prior run.**  If
+   the leaf directory is present on disk from a previous test run, an
+   external command, or stale state, the first call returns -1.
+
+Detection: `tests/test_state.c::test_mkdir_p_nested_and_idempotent`
+called `mkdir_p` twice in succession on the same path and asserted
+both returns were 0.  Failed with "first mkdir_p failed" on a run
+that had stale `/tmp/.minicontainer_test_state/a/b/c` left over from
+the previous (failed-via-other-bug) `sudo make test` invocation.
+
+The bug was latent for `cmd_run` and `cmd_start` because both
+allocate a fresh 12-hex container ID via `/dev/urandom` before
+calling `mkdir_p` — the leaf is statistically guaranteed to not exist
+on the first call.  The bug surfaced as soon as a caller invoked
+`mkdir_p` deterministically.
+
+**Resolution.** After the final `mkdir`, treat `EEXIST` as success
+when the path is already a directory:
+
+```c
+if (mkdir(tmp, mode) == 0) return 0;
+if (errno == EEXIST) {
+    struct stat st;
+    if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+}
+return -1;
+```
+
+The `S_ISDIR` check matters because `EEXIST` is also returned when
+the path exists as a *file* (or any non-directory) — the contract is
+"directory exists at the end," not just "the open syscall returned a
+non-error errno."  Returning 0 when the path is a regular file would
+silently bless an incorrect filesystem state.
+
+**Considered and rejected.** Looping over all path components in a
+single pass and special-casing `EEXIST` everywhere would simplify the
+mental model but reads less idiomatically than the current "trust
+the loop, check the leaf" split.  The leaf check is the only place
+where the function's success/failure is decided, so concentrating the
+idempotency logic there matches the function's existing structure.
+
+**Lesson.** A function named `_p`, `_safe`, or `ensure_*` implies an
+idempotency contract its name carries to the caller.  Implementations
+that pass through the raw return of an underlying syscall — even when
+that syscall is "the right one" for the happy path — risk breaking
+that contract on the unhappy paths the name doesn't visibly cover.
+The fix isn't to abandon delegation but to translate the underlying
+syscall's failure modes into the function's contract: here, EEXIST
+on a directory is success, EEXIST on anything else is failure, every
+other errno is failure.
+
+Same shape as Error #15's `snprintf`-truncation pattern: the syscall
+or library call returns a value that contains both the success case
+and one or more degenerate cases the wrapper has to disambiguate.
+Silently passing the raw result through propagates the ambiguity to
+the caller, who is the wrong layer to resolve it.
+
+**Fix Applied:** 2026-05-28
+
+---
+
 ---
 
 ## Known Limitations
