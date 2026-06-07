@@ -131,24 +131,15 @@ static int child_func(void *arg) {
         }
     }
 
-    /* 3+4. Rootfs + /proc. */
+    /* 3+4. Rootfs + bind mounts + /proc.  Bind mounts are applied
+     * INSIDE setup_rootfs, before pivot_root, because the host source
+     * paths stop resolving once the old root is detached (Error #22).
+     * /proc is mounted afterward so it can't be shadowed by a bind. */
     if (args->rootfs_path) {
-        if (setup_rootfs(args->rootfs_path, args->enable_debug) < 0) {
+        if (setup_rootfs(args->rootfs_path, args->mounts,
+                         args->mount_count, args->enable_debug) < 0) {
             fprintf(stderr, "[child] Failed to setup rootfs\n");
             return 1;
-        }
-
-        /* Apply bind mounts AFTER pivot_root, BEFORE mount_proc (so
-         * our /proc setup wins over any bind-mounted /proc). */
-        for (int i = 0; i < args->mount_count; i++) {
-            if (bind_mount_apply(&args->mounts[i],
-                                 args->enable_debug) < 0) {
-                fprintf(stderr,
-                    "[child] Failed to apply bind mount %s -> %s\n",
-                    args->mounts[i].host_path,
-                    args->mounts[i].container_path);
-                return 1;
-            }
         }
 
         if (mount_proc(args->enable_debug) < 0) {

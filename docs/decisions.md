@@ -2763,6 +2763,165 @@ the caller, who is the wrong layer to resolve it.
 
 ---
 
+### Error #22: Bind Mounts Applied After `pivot_root` — Host Source Unreachable (Phase 7b)
+
+**Background — what was there.** `--volume host:container[:ro]` bind
+mounts were applied by a loop in `child_func` that ran *after*
+`setup_rootfs`:
+
+```c
+if (args->rootfs_path) {
+    if (setup_rootfs(args->rootfs_path, args->enable_debug) < 0) { ... }
+
+    /* Apply bind mounts AFTER pivot_root, BEFORE mount_proc */
+    for (int i = 0; i < args->mount_count; i++) {
+        if (bind_mount_apply(&args->mounts[i], args->enable_debug) < 0) { ... }
+    }
+    ...
+}
+```
+
+`bind_mount_apply` resolved the source via `stat(m->host_path)` on the
+absolute host path captured by `realpath()` at parse time (e.g.
+`/tmp/voltest`).
+
+**The bug.** `setup_rootfs` performs the full `pivot_root` dance and
+then `umount2("/old_root", MNT_DETACH)` + `rmdir("/old_root")` — it
+detaches the old (host) root from the child's mount namespace before
+returning. By the time the bind loop runs, the absolute host source
+path no longer resolves in the namespace, so `stat` returns `ENOENT`,
+`bind_mount_apply` returns -1, and the child aborts with `[child]
+Failed to apply bind mount …` before ever `execve`-ing the target.
+Every `--volume` whose source is not also present inside the rootfs
+failed; the container produced no output.
+
+A `--debug` trace shows it exactly:
+
+```
+[child] pivot_root successful
+[child] Unmounted old root
+[bind] host_path /tmp/voltest: No such file or directory
+[child] Failed to apply bind mount /tmp/voltest -> /mnt
+[parent] Child exited: 1
+```
+
+**Why it looked like it worked.** If the source path also exists
+*inside* the rootfs (e.g. `--volume /tmp:/mnt`, and the rootfs ships a
+`/tmp`), the post-pivot `stat` succeeds against the rootfs's own inode,
+`mount` returns 0, and no error surfaces — but it has bind-mounted the
+*container's* empty directory onto the target, not the host's. Wrong
+source, silently. Manual tests that happened to use a path present in
+both trees (`/tmp`, `/etc`, `/home`) read as "worked, dir was empty."
+
+Detection: a host-only scratch path (`/tmp/voltest`, created on the
+host, absent from the rootfs) made the `ENOENT` deterministic. The
+unit test `tests/test_bind.c` never caught it because it exercises
+`bind_mount_apply` directly inside an `unshare(CLONE_NEWNS)` child
+*without* `pivot_root` — the host source is always reachable there.
+The seam between `pivot_root` and the bind helper was covered by
+neither the unit test nor the integration suite.
+
+**Resolution.** Apply bind mounts inside `setup_rootfs`, **before**
+`pivot_root`, while the host source paths are still reachable. The
+target is composed under the new root directory (`<abs_rootfs>` +
+`container_path`) so the bind lands inside the future container root
+and the pivot carries it along. `setup_rootfs` gained `mounts` +
+`mount_count` parameters; `bind_mount_apply` gained a `root_prefix`
+parameter (the new-root path at the runtime call site; `NULL` in the
+unit tests, which still use bare `container_path`). The `child_func`
+post-pivot loop was removed. `/proc` is still mounted after
+`setup_rootfs`, so a bind cannot shadow it.
+
+**Lesson.** An absolute path string is only meaningful in the mount
+namespace that was current when it was produced. `pivot_root` +
+`MNT_DETACH` is a namespace transition that silently invalidates any
+host path captured before it. This is the mount-side twin of the
+Phase 7b PTY slave-path hazard (Error context: the fix there was to
+pass an fd, not a path, across the boundary). For mounts the analogous
+rule is: establish the bind while the source still resolves — before
+the old root is severed — not after.
+
+**Fix Applied:** 2026-06-07
+
+---
+
+### Error #23: `exec` Unconditionally Joined the User Namespace — `setns(CLONE_NEWUSER)` Returns `EINVAL` for Your Own (Phase 7b)
+
+**Background — what was there.** `cmd_exec` joins a running
+container's namespaces by iterating a fixed list and `setns`-ing into
+each `/proc/<pid>/ns/<type>`, treating any non-`ENOENT` failure as
+fatal:
+
+```c
+static const struct ns_entry NS[] = {
+    { "user", CLONE_NEWUSER },   /* tried first */
+    { "pid",  CLONE_NEWPID  }, { "uts", CLONE_NEWUTS },
+    { "ipc",  CLONE_NEWIPC  }, { "net", CLONE_NEWNET },
+    { "mnt",  CLONE_NEWNS   },
+};
+for (...) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { if (errno == ENOENT) continue; ... return 1; }
+    if (setns(fd, NS[i].flag) < 0) { /* fatal */ return 1; }
+}
+```
+
+The `ENOENT` skip was intended to mean "the container didn't create
+this namespace, so don't join it."
+
+**The bug.** `/proc/<pid>/ns/<type>` *always* exists for every
+namespace type — every process belongs to some namespace of each kind,
+including the initial one. So file-presence does not distinguish "the
+container created a distinct namespace" from "the container shares the
+caller's namespace." A container started without `--user` shares the
+**init user namespace** with the `exec` caller, and the kernel's
+`userns_install()` rejects joining a user namespace you are already in:
+`setns(fd, CLONE_NEWUSER)` returns `EINVAL` when `user_ns ==
+current_user_ns()`. Because `user` is first in the list and the loop
+treats the failure as fatal, `exec` aborts with `setns(user): Invalid
+argument` for *every* ordinary (non-`--user`) container — the common
+case — on every host. Confirmed with a 15-line repro: `setns` on
+`/proc/self/ns/user` → `errno 22`.
+
+It stayed invisible because no test reaches `cmd_exec` (it is pure CLI
+plumbing that only has meaning against a live, externally-started
+container — the integration suite constructs `container_config_t`
+directly and never invokes it), and because the one configuration
+where it *does* work (`--user`, which has a distinct user ns to join)
+is a plausible thing to test with.
+
+**Resolution.** Before `setns`, compare the target namespace's identity
+to the caller's own and skip on a match — joining a namespace you are
+already in is a no-op at best and `EINVAL` (for user) at worst:
+
+```c
+struct stat ns_st, self_st;
+char self_path[PATH_MAX];
+snprintf(self_path, sizeof(self_path), "/proc/self/ns/%s", NS[i].name);
+if (fstat(fd, &ns_st) == 0 && stat(self_path, &self_st) == 0 &&
+    ns_st.st_dev == self_st.st_dev && ns_st.st_ino == self_st.st_ino) {
+    close(fd);
+    continue;   /* already in this namespace */
+}
+```
+
+This mirrors the existing `ENOENT` skip but keys on the correct
+signal — namespace *identity* (`st_dev`/`st_ino`), the canonical way to
+test whether two `nsfs` references name the same namespace — rather
+than file existence. `exec` now works against the common non-`--user`
+container without needing `--user` at all.
+
+**Lesson.** `/proc/<pid>/ns/*` entries are not optional per process;
+their presence says nothing about whether a namespace was newly
+created. "Did this container get its own namespace of type T?" is an
+identity question (compare inodes), not an existence question. The
+original `ENOENT`-only skip answered the wrong question and worked only
+by accident on the one configuration that was tested.
+
+**Fix Applied:** 2026-06-07
+
+---
+
 ---
 
 ## Known Limitations

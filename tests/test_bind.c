@@ -92,7 +92,7 @@ static int run_test_bind_directory(void) {
     strncpy(m.container_path, "/tmp/.bind_tgt", sizeof(m.container_path) - 1);
     m.readonly = false;
 
-    CHECK(bind_mount_apply(&m, false) == 0, "bind_mount_apply failed");
+    CHECK(bind_mount_apply(&m, NULL, false) == 0, "bind_mount_apply failed");
 
     /* Read the marker through the target.  Should be the source content. */
     char buf[64];
@@ -124,7 +124,7 @@ static int run_test_bind_readonly(void) {
     strncpy(m.container_path, "/tmp/.bind_tgt_ro", sizeof(m.container_path) - 1);
     m.readonly = true;
 
-    CHECK(bind_mount_apply(&m, false) == 0, "bind_mount_apply (ro) failed");
+    CHECK(bind_mount_apply(&m, NULL, false) == 0, "bind_mount_apply (ro) failed");
 
     /* Reads still work. */
     char buf[64];
@@ -171,7 +171,7 @@ static int run_test_bind_file(void) {
     strncpy(m.container_path, "/tmp/.bind_tgt_file.txt", sizeof(m.container_path) - 1);
     m.readonly = false;
 
-    CHECK(bind_mount_apply(&m, false) == 0, "bind_mount_apply on file failed");
+    CHECK(bind_mount_apply(&m, NULL, false) == 0, "bind_mount_apply on file failed");
 
     char buf[64];
     CHECK(read_file("/tmp/.bind_tgt_file.txt", buf, sizeof(buf)) == 0,

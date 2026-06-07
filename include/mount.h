@@ -16,14 +16,24 @@ typedef struct {
 
 
 /**
- * Setup rootfs using pivot_root.
- * Called by child process before execve.
+ * Setup rootfs using pivot_root, applying any user bind mounts onto
+ * the new root BEFORE the pivot.  Called by child process before
+ * execve.
+ *
+ * The bind mounts MUST be applied here, while the host source paths
+ * are still reachable in the child's mount namespace: pivot_root
+ * detaches the old (host) root, after which an absolute host source
+ * path no longer resolves.  Each mount lands under the new root so the
+ * pivot carries it along.  (See decisions.md Error #22.)
  *
  * @param rootfs_path  Path to new root filesystem
+ * @param mounts       Array of bind mounts to apply (may be NULL)
+ * @param mount_count  Number of entries in `mounts` (0 = none)
  * @param enable_debug Enable debug output
  * @return             0 on success, -1 on failure
  */
-int setup_rootfs(const char *rootfs_path, bool enable_debug);
+int setup_rootfs(const char *rootfs_path, const bind_mount_t *mounts,
+                 int mount_count, bool enable_debug);
 
 /**
  * Mount /proc filesystem inside container.
@@ -35,13 +45,24 @@ int mount_proc(bool enable_debug);
 
 /**
  * Apply one bind mount inside the container's mount namespace.
- * Called by child_func after setup_rootfs, before mount_proc.
+ * Called by setup_rootfs before pivot_root (so the host source is
+ * still reachable).
+ *
+ * The on-disk target is `root_prefix` + `m->container_path`.  At the
+ * normal call site the bind runs before pivot_root, so `root_prefix`
+ * is the absolute path of the new root (e.g. "/path/to/rootfs") and
+ * the target resolves inside the future container root rather than
+ * against the still-current host root.  Pass NULL/empty to use
+ * `m->container_path` verbatim — the form the unit tests use, since
+ * they fork into a private mount namespace without pivot_root.
  *
  * @param m             Bind mount specification (host_path absolute)
+ * @param root_prefix   Path prepended to container_path (may be NULL)
  * @param enable_debug  Verbose
  * @return  0 on success, -1 on failure
  */
-int bind_mount_apply(const bind_mount_t *m, bool enable_debug);
+int bind_mount_apply(const bind_mount_t *m, const char *root_prefix,
+                     bool enable_debug);
 
 /**
  * Mount a private devpts instance on /dev/pts inside the container's

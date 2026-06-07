@@ -672,6 +672,26 @@ int cmd_exec(int argc, char *argv[]) {
             for (int j = 0; j < nfds; j++) close(nsfds[j]);
             return 1;
         }
+        /* Skip namespaces we're already in.  /proc/<pid>/ns/<type>
+         * always exists for every type, so file-presence does NOT mean
+         * the container created a distinct namespace — a container
+         * started without --user shares our (init) user namespace, and
+         * setns(CLONE_NEWUSER) into your own user ns returns EINVAL,
+         * which would abort exec for the common case.  Compare the
+         * target ns identity (st_dev/st_ino) against our own and skip
+         * on a match — joining a namespace you're already in is a
+         * no-op at best and EINVAL at worst.  (decisions.md Error #23) */
+        struct stat ns_st, self_st;
+        char self_path[PATH_MAX];
+        snprintf(self_path, sizeof(self_path), "/proc/self/ns/%s", NS[i].name);
+        if (fstat(fd, &ns_st) == 0 && stat(self_path, &self_st) == 0 &&
+            ns_st.st_dev == self_st.st_dev && ns_st.st_ino == self_st.st_ino) {
+            if (enable_debug)
+                fprintf(stderr, "[exec] already in %s namespace, skipping\n",
+                        NS[i].name);
+            close(fd);
+            continue;
+        }
         if (setns(fd, NS[i].flag) < 0) {
             fprintf(stderr, "setns(%s): %s\n", NS[i].name, strerror(errno));
             close(fd);

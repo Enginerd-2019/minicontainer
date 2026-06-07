@@ -5,6 +5,7 @@
 #include <sys/syscall.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <string.h>
 #include <limits.h>
@@ -16,7 +17,8 @@
  * child exits, and the kernel tears down the mount namespace — no explicit
  * error-path cleanup is needed here.
  */
-int setup_rootfs(const char *rootfs_path, bool enable_debug){
+int setup_rootfs(const char *rootfs_path, const bind_mount_t *mounts,
+                 int mount_count, bool enable_debug){
 
     if(!rootfs_path){
         return 0;
@@ -54,6 +56,19 @@ int setup_rootfs(const char *rootfs_path, bool enable_debug){
 
     if (enable_debug) {
         printf("[child] Bind mounted %s\n", abs_path);
+    }
+
+    /* Apply user bind mounts onto the new root BEFORE pivot_root.  The
+     * host source paths are still reachable in this mount namespace
+     * here; after the pivot + old-root detach below they are not.  Each
+     * target is composed under abs_path so the bind lands inside the
+     * future container root and the pivot carries it along.  (Error #22) */
+    for (int i = 0; i < mount_count; i++) {
+        if (bind_mount_apply(&mounts[i], abs_path, enable_debug) < 0) {
+            fprintf(stderr, "[child] Failed to apply bind mount %s -> %s\n",
+                    mounts[i].host_path, mounts[i].container_path);
+            return -1;
+        }
     }
 
     if(chdir(abs_path) < 0){
@@ -124,9 +139,29 @@ int mount_proc(bool enable_debug){
     return 0;
 }
 
-int bind_mount_apply(const bind_mount_t *m, bool enable_debug) {
+int bind_mount_apply(const bind_mount_t *m, const char *root_prefix,
+                     bool enable_debug) {
     if (!m || !m->host_path[0] || !m->container_path[0]) {
         fprintf(stderr, "[bind] invalid bind mount spec\n");
+        return -1;
+    }
+
+    /* Compose the on-disk target.  With a root_prefix (the runtime
+     * path: bind applied before pivot_root) the target must resolve
+     * under the new root rather than against the still-current host
+     * root.  Without one (the unit tests) container_path is used
+     * verbatim.  (decisions.md Error #22) */
+    char target[PATH_MAX];
+    int n;
+    if (root_prefix && root_prefix[0]) {
+        n = snprintf(target, sizeof(target), "%s%s",
+                     root_prefix, m->container_path);
+    } else {
+        n = snprintf(target, sizeof(target), "%s", m->container_path);
+    }
+    if (n < 0 || (size_t)n >= sizeof(target)) {
+        fprintf(stderr, "[bind] target path too long for %s\n",
+                m->container_path);
         return -1;
     }
 
@@ -142,34 +177,34 @@ int bind_mount_apply(const bind_mount_t *m, bool enable_debug) {
 
     if (S_ISDIR(st.st_mode)) {
         /* mkdir -p the target. */
-        mkdir(m->container_path, 0755);  /* ignore EEXIST */
+        mkdir(target, 0755);  /* ignore EEXIST */
     } else {
         /* Ensure parent dir exists, then touch the file. */
-        int fd = open(m->container_path, O_WRONLY | O_CREAT, 0644);
+        int fd = open(target, O_WRONLY | O_CREAT, 0644);
         if (fd >= 0) close(fd);
     }
 
     if (enable_debug) {
         printf("[bind] %s -> %s%s\n",
-               m->host_path, m->container_path,
+               m->host_path, target,
                m->readonly ? " (ro)" : "");
     }
 
-    if (mount(m->host_path, m->container_path, NULL,
+    if (mount(m->host_path, target, NULL,
               MS_BIND, NULL) < 0) {
         fprintf(stderr, "[bind] mount(MS_BIND) %s -> %s: %s\n",
-                m->host_path, m->container_path, strerror(errno));
+                m->host_path, target, strerror(errno));
         return -1;
     }
 
     /* Read-only: kernel ignores MS_RDONLY on the initial MS_BIND.
      * Need a separate remount to actually enforce. */
     if (m->readonly) {
-        if (mount(NULL, m->container_path, NULL,
+        if (mount(NULL, target, NULL,
                   MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) {
             fprintf(stderr,
                 "[bind] remount-ro %s: %s\n",
-                m->container_path, strerror(errno));
+                target, strerror(errno));
             return -1;
         }
     }
