@@ -25,7 +25,7 @@ Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `insp
 - ✅ **Subcommand CLI** — `run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`. `parse_subcommand` lives in `cli.c`; `main.c` is a ~60-line dispatcher.
 - ✅ **Implicit-run backwards compatibility** — every Phase 0–7a invocation pattern (`./minicontainer --pid /bin/sh`, `./minicontainer /bin/echo hi`) still routes to `cmd_run` without a subcommand keyword. Heuristic: `argv[1]` starts with `-` OR is an executable path.
 - ✅ **Container state files** at `/run/minicontainer/<id>/` (root) or `$XDG_RUNTIME_DIR/minicontainer/<id>/` (rootless): `state.json` + `pidfile` + `logs/{stdout,stderr}.log` for detached. Hand-rolled JSON (no jansson/cJSON dependency).
-- ✅ **`container_exec()` split** into `container_start()` (parent-side setup through `clone` + sync + `add_pid_to_cgroup`) + `container_wait()` (waitpid + teardown). `cmd_run` writes the state file between the two; `cmd_start` exits after `container_start` and the child reparents to init. `container_exec()` is retained as a thin wrapper for backwards compatibility.
+- ✅ **`container_exec()` split** into `container_start()` (parent-side setup: `clone`, user-ns map, **`add_pid_to_cgroup` — then** the sync write that unblocks the child) + `container_wait()` (waitpid + teardown). The cgroup placement happens *before* the child is signaled, so the child is a cgroup member before it runs a single instruction (otherwise pids/memory limits silently don't apply — see "Resource Control" below). The sync pipe is created for `--user`, `--net`, **or** any cgroup limit. `cmd_run` writes the state file between the two halves; `cmd_start` exits after `container_start` and the child reparents to init. `container_exec()` is retained as a thin wrapper for backwards compatibility.
 - ✅ **`start` — detached containers** — writes `state.json`, opens `logs/{stdout,stderr}.log`, calls `container_start`, prints the 12-hex-char container ID, exits.
 - ✅ **`stop <id>`** — SIGTERM then SIGKILL after a configurable timeout (default 10 s).
 - ✅ **`exec <id> <cmd>`** — `setns(2)` into the existing container's namespaces, then `clone(SIGCHLD, …)` with **no `CLONE_NEW*` flags** so the new child inherits the joined namespaces rather than creating fresh ones. Namespaces the caller already shares with the container are skipped (identity compared via `st_dev`/`st_ino` of `/proc/<pid>/ns/<type>` vs `/proc/self/ns/<type>`) — without that skip, joining your own user namespace returns `EINVAL` and breaks `exec` for any container not started with `--user`.
@@ -36,7 +36,7 @@ Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `insp
 - ✅ **`--interactive` / `-i` PTY** — newinstance `devpts` mounted inside the container with `mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666,mode=0620,gid=5")`; `/dev/ptmx` symlinked to `/dev/pts/ptmx`; PTY pair allocated *inside* the child after `mount_devpts`; master fd handed back to the parent via `SCM_RIGHTS` on a pre-clone `socketpair(AF_UNIX, SOCK_STREAM, 0, sv)`; parent drives `pty_forward`. Line editing, Ctrl-C forwarding, and curses-based tools (`nano`, `vim`, `less`, `top`) all work.
 - ✅ **`--detach` / `-D`** — same as the `start` subcommand surface; `cmd_run` redirects to `cmd_start` when this flag is set.
 - ✅ **`mount_devpts` runs unconditionally when a rootfs is set** — not gated on `--interactive`. Apt's "Is /dev/pts mounted?" warning and nano's silent exit (both surfacing whenever a curses-linked or pty-allocating program runs inside the container) require devpts even for non-interactive workloads.
-- ✅ **Canonical container ID** — generated once per container by `state.h::generate_container_id()` (12 hex chars from `/dev/urandom`); threaded through every downstream module via `container_config_t.container_id`. The Phase 3 `static generate_container_id` inside `overlay.c` is removed — overlay, cgroup, state file, and veth naming all share the one canonical ID. See decisions.md #34.
+- ✅ **Canonical container ID** — generated once per container by `state.h::generate_container_id()` (12 hex chars from `/dev/urandom`); `cmd_run`/`cmd_start` copy it into `container_config_t.container_id`, which threads it through every downstream module. The Phase 3 `static generate_container_id` inside `overlay.c` is removed — overlay, cgroup, state file, and veth naming all share the one canonical ID. See decisions.md #34. (The copy into `cfg.container_id` is load-bearing: without it `setup_overlay` aborts with "container_id is required" — decisions.md Error #24.)
 - ✅ **Five new modules** — `cli.h`/`cli.c` (dispatcher + handlers), `state.h`/`state.c` (state file I/O), `pty.h`/`pty.c` (PTY + SCM_RIGHTS handoff), `cleanup.h`/`cleanup.c` (stale-resource sweeper). All link via Phase 7a's `HELPER_OBJS` aggregate — adding a module is one row in the Makefile.
 - ✅ **Three new test suites** — `test_state` (round-trip, missing-ID, list-with-liveness, mkdir_p idempotency), `test_bind` (directory + file + read-only bind mounts in isolated mount namespaces via `unshare(CLONE_NEWNS)`), `test_cli` (`parse_subcommand` over every known subcommand + 9 negative cases). Plus two latent state.c bugs (decisions.md Errors #20, #21) caught by the new suites that the Phase 0–7a integration tests never exercised.
 - ✅ **build_rootfs.sh additions** — bundles xterm terminfo (so `nano` and other ncurses-linked binaries find their terminal description files); `sleep` added to `BINS`.
@@ -68,11 +68,11 @@ Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `insp
 
 ### Phase 5
 
-- ✅ **cgroups v2 Resource Control** - Limit memory, CPU, and process count per container
-- ✅ **`--memory <limit>`** - Memory ceiling (e.g., `100M`, `1G`); OOM-killed if exceeded
+- ✅ **cgroups v2 Resource Control** - Limit memory, CPU, and process count per container, enforced by the kernel (the container's process is placed in its cgroup **before it runs**, so limits actually apply and `memory.current` accounts correctly — decisions.md Error #25)
+- ✅ **`--memory <limit>`** - Memory ceiling (e.g., `100M`, `1G`). Sets `memory.max` only (not `memory.swap.max`), so on a host with swap the cap throttles RAM and overflow swaps rather than OOM-killing — same as `docker run --memory` without `--memory-swap`. Observe it via `memory.current`; a swap-less host (or `memory.swap.max=0`) is required to force a kill.
 - ✅ **`--cpus <fraction>`** - CPU bandwidth limit (e.g., `0.5` = 50% of one core)
-- ✅ **`--pids <max>`** - Maximum process count; defends against fork bombs
-- ✅ **Three-Phase Lifecycle** - Create cgroup before clone, add PID after clone, remove after exit
+- ✅ **`--pids <max>`** - Maximum process count; defends against fork bombs (forks past the cap are denied — visible in `pids.events`)
+- ✅ **Lifecycle** - Create cgroup before clone, add the PID after clone but **before the child is unblocked**, remove after exit. The "before unblocked" ordering is what makes enforcement real; adding it after the child started let it fork/fault in the parent's cgroup first.
 - ✅ **Auto-Enable Cgroup** - Any cgroup flag (`--memory`/`--cpus`/`--pids`) enables the cgroup subsystem
 - ✅ **`build_container_env()` Defensive Refactor** - `calloc` + bounds check, preparing for Phase 7 extraction (see decisions.md #21)
 
@@ -943,9 +943,12 @@ the intermediate state.
 
 ```bash
 # Memory limit: container OOM-killed when it exceeds 100MB
+# NOTE: minicontainer sets memory.max only, so this OOM-kills only on a
+# swap-less host. With swap, the overflow swaps instead (the cap still
+# throttles RAM — verify via memory.current). See the --memory note above.
 $ sudo ./minicontainer --pid --memory 100M /bin/sh -c \
     'head -c 200M /dev/zero | wc -c'
-# Killed
+# Killed   (swap-less host)
 $ echo $?
 137                          # 128 + SIGKILL(9) = OOM kill
 
@@ -1761,8 +1764,11 @@ Phase 7 will add a `minicontainer cleanup` subcommand to handle this.
 
 **Problem:** Container terminated unexpectedly with exit code 137.
 
-**Cause:** Exit code 137 = 128 + signal 9 (SIGKILL). The OOM killer fired —
-the container exceeded `--memory` and the kernel killed it.
+**Cause:** Exit code 137 = 128 + signal 9 (SIGKILL). Most often the OOM
+killer fired — the container exceeded `--memory` and the kernel killed it
+(on a swap-less host; with swap the overflow swaps instead of OOM-killing).
+137 is also what `stop` produces when its SIGTERM grace period elapses and
+it escalates to SIGKILL — check whether you `stop`ped the container.
 
 **This is correct behavior.** It's how `--memory` enforcement works. Either
 raise the limit or check what the container is allocating:
