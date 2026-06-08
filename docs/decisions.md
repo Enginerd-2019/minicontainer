@@ -2922,6 +2922,132 @@ by accident on the one configuration that was tested.
 
 ---
 
+### Error #24: `--overlay` Always Failed — `cfg.container_id` Never Populated (Phase 7b)
+
+**Background — what was there.** Phase 7b made the 12-hex container ID
+the canonical identifier threaded into overlay, cgroup, and veth naming
+(Architecture #34). `setup_overlay` requires it and rejects an empty
+value: `setup_overlay: container_id is required`. `core.h` documents
+`container_config_t.container_id` as "set in `cmd_run` … and threaded."
+
+**The bug.** `cmd_run` and `cmd_start` generated the ID into the
+**state** struct only:
+
+```c
+container_state_t state = {0};
+generate_container_id(state.id);     /* state.id set... */
+state_from_config(&cfg, &state);     /* ...but cfg.container_id never set */
+container_result_t r = container_start(&cfg);   /* setup_overlay sees "" */
+```
+
+`cfg` was zero-initialized, so `cfg.container_id` stayed `""`. Every
+`--overlay --rootfs` invocation aborted at startup with
+`setup_overlay: container_id is required` → `[parent] Failed to setup
+overlay` → `Failed to start container`. The copy-on-write overlay
+feature was unusable.
+
+Why the smoke suite missed it: its only `--overlay` case is
+`run --overlay /bin/echo` *without* `--rootfs`, which is rejected by the
+"`--overlay` requires `--rootfs`" parse check before `setup_overlay`
+ever runs. No test exercised a working overlay path. A live
+walk-through (`run --overlay --rootfs ./ubuntu-root …`) surfaced it
+immediately.
+
+**Resolution.** Copy the canonical ID into `cfg` before
+`container_start`, in both `cmd_run` and `cmd_start`:
+
+```c
+generate_container_id(state.id);
+strncpy(cfg.container_id, state.id, sizeof(cfg.container_id) - 1);
+cfg.container_id[sizeof(cfg.container_id) - 1] = '\0';
+state_from_config(&cfg, &state);
+```
+
+Verified: `run --overlay --rootfs ./ubuntu-root /bin/bash -c 'echo
+scratch > /root/note.txt; cat /root/note.txt'` now prints `scratch`
+and the host rootfs is untouched.
+
+**Lesson.** A field documented as "set by the caller and threaded
+through" needs a test that actually exercises the path that consumes
+it. `container_id` was wired end-to-end *except* for the one assignment
+in the CLI handlers, and nothing downstream of an empty value was ever
+run.
+
+**Fix Applied:** 2026-06-07
+
+---
+
+### Error #25: cgroup Limits Silently Unenforced — Child Placed in the cgroup AFTER It Started Running (Phase 7b)
+
+**Background — what was there.** `container_start` creates the cgroup,
+writes `memory.max`/`pids.max`, clones the child, and adds the child to
+the cgroup via `add_pid_to_cgroup` (writing the host PID to
+`cgroup.procs`). The original ordering placed that call **last**, after
+the child had already been signaled to proceed:
+
+```c
+bool needs_sync = enable_user_namespace || enable_network;   /* NOT cgroup */
+...
+/* Step 11 */ if (needs_sync) write(sync_pipe[1], "1", 1);   /* unblock child */
+/* Step 12 */ if (enable_cgroup) add_pid_to_cgroup(pid);     /* too late */
+```
+
+For a `--memory`/`--pids` container with neither `--user` nor `--net`,
+`needs_sync` was **false**, so there was no sync pipe at all — the child
+ran the instant `clone()` returned, long before the parent reached
+`add_pid_to_cgroup`.
+
+**The bug.** The child therefore did its work — forking, faulting
+memory — while still a member of the **parent's** cgroup, not the
+container's. Limits silently didn't apply. Symptoms from a live run:
+
+- `--pids 15` + a 50-process fork loop → all 50 succeeded (cap ignored).
+- `--memory 64M` + a 200 MB allocation → survived.
+- `memory.current` of the container's cgroup read `0` for a running
+  container (pages charged to the old cgroup; cgroup v2 does not
+  re-charge on migration).
+
+`/proc/<child>/cgroup` read from inside confirmed it: the container's
+process was still in the launching shell's scope
+(`…/app-…Chromium….scope`), not `minicontainer_<id>`. The placement
+*did* eventually happen — but after the workload had already raced
+ahead. The outcome was timing-dependent (occasionally a late fork was
+denied), which is why it looked intermittent.
+
+Why the suite missed it: `test_cgroup` only asserts the limited shell
+*exited normally* (not that forks were denied), and the smoke suite
+only checks that `memory.max`/`pids.max` **files** hold the right
+values — never that a process is actually constrained.
+
+**Resolution.** Place the child in the cgroup **before** it is allowed
+to run:
+
+- Widen the sync gate to include cgroups:
+  `needs_sync = enable_user_namespace || enable_network || enable_cgroup;`
+  so a sync pipe always exists for a cgroup container and the child
+  blocks until signaled.
+- Move `add_pid_to_cgroup` to **before** the sync write (still after the
+  user-ns mapping, so a delegated/rootless `cgroup.procs` write sees the
+  mapped UID). The child only proceeds once it is a cgroup member.
+
+Verified after the fix: `pids.current` caps at 15 with `pids.events:
+max` incrementing (forks denied); `memory.current` is non-zero and
+accurate; the 200 MB-over-64 MB allocation is constrained (it survives
+only to the extent host swap absorbs the overflow, exactly like
+`docker run --memory` without `--memory-swap`).
+
+**Lesson.** Creating a cgroup and writing a PID into `cgroup.procs` is
+not enough — the *ordering* relative to the workload is the whole game.
+A process must be a cgroup member before it executes anything you intend
+to constrain. "The limit file has the right value" and "the limit is
+enforced" are different claims; only the latter requires the placement
+to win the race, and the deterministic way to win it is to gate the
+child until placement is done.
+
+**Fix Applied:** 2026-06-07
+
+---
+
 ---
 
 ## Known Limitations

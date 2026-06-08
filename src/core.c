@@ -322,8 +322,16 @@ container_result_t container_start(const container_config_t *config) {
         }
     }
 
-    /* Step 2: sync pipe if user-ns OR network */
-    bool needs_sync = config->enable_user_namespace || config->enable_network;
+    /* Step 2: sync pipe if user-ns OR network OR cgroup.  cgroup is
+     * included so the parent can place the child in the cgroup BEFORE
+     * the child runs a single instruction — otherwise the child races
+     * ahead and forks/faults while still in the PARENT's cgroup, so
+     * pids/memory limits silently don't apply and memory.current
+     * under-counts (charge-at-fault to the parent cgroup).
+     * (decisions.md Error #25) */
+    bool needs_sync = config->enable_user_namespace ||
+                      config->enable_network ||
+                      config->enable_cgroup;
     if (needs_sync) {
         if (pipe(sync_pipe) < 0) {
             perror("pipe");
@@ -531,21 +539,19 @@ container_result_t container_start(const container_config_t *config) {
         }
     }
 
-    /* Step 11: signal child */
-    if (needs_sync) {
-        if (write(sync_pipe[1], "1", 1) < 0) {
-            perror("write(sync_pipe)");
-        }
-        close(sync_pipe[1]);
-        sync_pipe[1] = -1;
-        if (config->enable_debug) printf("[parent] Signaled child to proceed\n");
-    }
-
-    /* Step 12: add_pid_to_cgroup AFTER sync (cgroup checks mapped UID) */
+    /* Step 11: add_pid_to_cgroup BEFORE signaling the child.  The child
+     * blocks on the sync pipe (needs_sync includes enable_cgroup), so
+     * adding it here — before the sync write below — guarantees it is a
+     * cgroup member before it runs any workload, which is what makes
+     * pids/memory limits actually apply and memory.current account
+     * correctly.  This runs AFTER the user-ns mapping (step 9) so a
+     * delegated (rootless) cgroup.procs write still sees the mapped UID.
+     * (decisions.md Error #25) */
     if (config->enable_cgroup) {
         if (add_pid_to_cgroup(&result.ctx.cgroup_ctx, pid,
                               config->enable_debug) < 0) {
             fprintf(stderr, "[parent] Failed to add PID to cgroup\n");
+            if (sync_pipe[1] >= 0) close(sync_pipe[1]);
             if (pty_sock[0] >= 0) close(pty_sock[0]);
             kill(pid, SIGKILL);
             waitpid(pid, NULL, 0);
@@ -557,6 +563,16 @@ container_result_t container_start(const container_config_t *config) {
             result.ctx.stack_ptr = NULL;
             return result;
         }
+    }
+
+    /* Step 12: signal child to proceed (now that it is in the cgroup). */
+    if (needs_sync) {
+        if (write(sync_pipe[1], "1", 1) < 0) {
+            perror("write(sync_pipe)");
+        }
+        close(sync_pipe[1]);
+        sync_pipe[1] = -1;
+        if (config->enable_debug) printf("[parent] Signaled child to proceed\n");
     }
 
     /* Step 12b (Phase 7b): receive PTY master fd from child via

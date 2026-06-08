@@ -342,9 +342,14 @@ int cmd_run(int argc, char *argv[]) {
     }
     cfg.envp = container_env;
 
-    /* Allocate the container ID and partial state. */
+    /* Allocate the container ID and partial state.  The ID is the
+     * canonical container_id: it must be copied into cfg so overlay,
+     * cgroup, and veth naming all agree on it.  (Without this,
+     * setup_overlay aborts with "container_id is required" — Error #24.) */
     container_state_t state = {0};
     generate_container_id(state.id);
+    strncpy(cfg.container_id, state.id, sizeof(cfg.container_id) - 1);
+    cfg.container_id[sizeof(cfg.container_id) - 1] = '\0';
     state_from_config(&cfg, &state);
 
     /* Phase 7b split: container_start does parent-side setup +
@@ -492,9 +497,13 @@ int cmd_start(int argc, char *argv[]) {
     if (!container_env) return 1;
     cfg.envp = container_env;
 
-    /* Allocate ID and prepare state. */
+    /* Allocate ID and prepare state.  Copy the canonical ID into cfg so
+     * overlay/cgroup/veth naming agree (Error #24 — setup_overlay needs
+     * cfg.container_id). */
     container_state_t state = {0};
     generate_container_id(state.id);
+    strncpy(cfg.container_id, state.id, sizeof(cfg.container_id) - 1);
+    cfg.container_id[sizeof(cfg.container_id) - 1] = '\0';
     state_from_config(&cfg, &state);
 
     /* Open log files for the detached child's stdout/stderr. We
