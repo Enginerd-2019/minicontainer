@@ -75,21 +75,47 @@ void test_memory_limit(void) {
 
 void test_pid_limit(void) {
     char **env = build_container_env(NULL, false);
-    // Try to spawn more processes than allowed
+    // Spawn far more processes than allowed so the cap denies some forks.
+    // Pure sh builtins + sleep (no `seq` dependency).
     char *argv[] = {"/bin/sh", "-c",
-        "for i in $(seq 1 20); do sleep 0.1 & done; wait", NULL};
+        "i=0; while [ $i -lt 30 ]; do sleep 1 & i=$((i+1)); done; wait", NULL};
     container_config_t cfg = make_cfg(env, argv);
     cfg.enable_pid_namespace = true;
     cfg.enable_cgroup        = true;
     cfg.cgroup_limits.pid_limit = 5;
 
     container_result_t result = container_exec(&cfg);
+
+    /* ENFORCEMENT assertion (Error #25 regression). Read pids.events
+     * BEFORE container_cleanup removes the cgroup. The child has already
+     * exited (container_wait reaped it), but pids.events "max" — the
+     * cumulative count of forks the kernel DENIED because of pids.max —
+     * persists until the cgroup is rmdir'd. A nonzero value proves the
+     * child was placed in its cgroup before it forked; the pre-fix race
+     * let it fork freely in the parent cgroup, leaving max == 0. Earlier
+     * this test only checked that the shell exited, so it never actually
+     * verified the limit was enforced. */
+    unsigned long long denied = 0;
+    char ev_path[512];
+    snprintf(ev_path, sizeof(ev_path), "%s/pids.events",
+             result.ctx.cgroup_ctx.cgroup_path);
+    FILE *evf = fopen(ev_path, "r");
+    if (evf) {
+        char line[128];
+        while (fgets(line, sizeof(line), evf)) {
+            if (sscanf(line, "max %llu", &denied) == 1) break;
+        }
+        fclose(evf);
+    }
+
     container_cleanup(&result);
     free(env);
 
-    // The shell should still exit (fork failures don't kill the shell)
+    // The shell should still exit (fork failures don't kill the shell)...
     assert(result.exited_normally);
-    printf("PASS: test_pid_limit\n");
+    // ...and the cap must have actually denied forks.
+    assert(denied > 0);
+    printf("PASS: test_pid_limit (cap 5 denied %llu forks)\n", denied);
 }
 
 void test_no_cgroup_backward_compat(void) {

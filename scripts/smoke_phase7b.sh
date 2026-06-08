@@ -17,10 +17,20 @@
 #   * Detached logging           start → logs/{stdout,stderr}.log
 #   * Namespaces                 --pid / --hostname(uts) / mount(rootfs)
 #   * cgroup limits              --memory / --pids reflected host-side
+#   * cgroup ENFORCEMENT         child placed before it runs; pids.events
+#                                records denials; memory.current accounts
+#                                (Error #25 regression)
+#   * overlay --overlay          end-to-end COW write (Error #24 regression)
 #   * Network state serialization --net veth block in state.json
 #   * cleanup sweeper            dead-PID state dirs (dry-run + real)
 #   * exit-code propagation      normal exit + signal death
 #   * negative / parse-error paths
+#
+# Regression coverage for the post-test corrections (decisions.md):
+#   #22 bind-after-pivot   §11 (host-only source path)
+#   #23 exec self-userns   §14 (exec into a plain non-user container)
+#   #24 overlay id         §16 (run --overlay --rootfs end-to-end)
+#   #25 cgroup placement   §12 + §15 (placement, accounting, fork denial)
 #
 # Tests that need real namespaces require root; run with sudo for the
 # full suite.  Without root, the privileged tests SKIP (not FAIL) and
@@ -428,10 +438,29 @@ else
             ck_eq "memory.max == 64M (67108864)"      "$MMAX" "67108864"
             PMAX="$(cat "$CGP/pids.max" 2>/dev/null)"
             ck_eq "pids.max == 20"                      "$PMAX" "20"
+
+            # ENFORCEMENT, not just file values (Error #25 regression).
+            # The child must be placed in its cgroup BEFORE it runs, so:
+            #  (a) /proc/<pid>/cgroup names minicontainer_<id>, not the
+            #      launcher's cgroup, and
+            #  (b) memory.current accounts the process (was 0 pre-fix,
+            #      because pages faulted in the parent cgroup).
+            sleep 1
+            CPID="$(cat "$STATE_ROOT/$CID/pidfile" 2>/dev/null)"
+            PCG="$(cat /proc/$CPID/cgroup 2>/dev/null)"
+            ck_contains "child placed in its own cgroup (Error #25)" "$PCG" "minicontainer_"
+            MCUR="$(cat "$CGP/memory.current" 2>/dev/null)"
+            if [ "${MCUR:-0}" -gt 0 ]; then
+                pass "memory.current accounts the placed process (Error #25): ${MCUR}B"
+            else
+                fail "memory.current accounts the placed process (Error #25)" "memory.current=${MCUR:-<unset>} (0 ⇒ child ran outside its cgroup)"
+            fi
         else
             fail "cgroup_path recorded and exists" "path=[$CGP]"
             skip "memory.max check" "no cgroup path"
             skip "pids.max check"   "no cgroup path"
+            skip "cgroup placement (Error #25)" "no cgroup path"
+            skip "memory.current accounting (Error #25)" "no cgroup path"
         fi
         "$BIN" stop "$CID" >/dev/null 2>&1
     else
@@ -487,6 +516,67 @@ else
     else
         skip "exec joins namespaces" "start failed: $ERR"
     fi
+fi
+
+# ===========================================================================
+section "15. cgroup pids ENFORCEMENT — forks actually denied (Error #25)"
+# ===========================================================================
+# The pre-fix bug placed the child in its cgroup only AFTER it started,
+# so a fork loop escaped the cap. This asserts the limit is *enforced*,
+# not merely that pids.max holds the right number.
+if [ "$IS_ROOT" != "1" ] || [ "$ROOTFS_OK" != "1" ]; then
+    skip "pids enforcement (fork denial)" "$([ "$IS_ROOT" = 1 ] && echo 'rootfs missing' || echo 'needs root')"
+elif [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then
+    skip "pids enforcement (fork denial)" "no cgroup v2"
+else
+    # PID 1 forks far more than the cap, then exits.  start() does not
+    # reap the cgroup, so pids.events (cumulative denied forks) survives
+    # for us to read.  Pure sh builtins + sleep — no `seq` (absent from
+    # the minimal rootfs).
+    _run "$BIN" start --pids 8 --rootfs "$ROOTFS" \
+        "$C_SH" -c 'i=0; while [ $i -lt 40 ]; do sleep 30 & i=$((i+1)); done'
+    FID="$OUT"
+    if printf '%s' "$FID" | grep -Eq '^[0-9a-f]{12}$'; then
+        track "$FID"
+        sleep 1
+        FCG="$(grep -oE '"cgroup_path":[[:space:]]*"[^"]*"' "$STATE_ROOT/$FID/state.json" \
+               | sed -E 's/.*"([^"]*)"$/\1/')"
+        PEV="$(cat "$FCG/pids.events" 2>/dev/null | tr '\n' ' ')"
+        MAXEV="$(printf '%s' "$PEV" | grep -oE 'max [0-9]+' | grep -oE '[0-9]+' | head -1)"
+        # pids.events 'max' is cumulative and survives PID 1's exit, so it
+        # is the robust signal that a fork was actually denied (>0 ⇒ the
+        # child was in the capped cgroup when it forked). A live
+        # pids.current/placement check is in §12 instead, since PID 1
+        # here exits right after the loop and the namespace is reaped.
+        if [ "${MAXEV:-0}" -ge 1 ]; then
+            pass "pids.events records denied forks (max=$MAXEV, cap=8)"
+        else
+            fail "pids.events records denied forks" "pids.events=[$PEV] (max=0 ⇒ forks escaped the cap)"
+        fi
+        # Kill any sleeps still in the cgroup so cleanup can rmdir it.
+        for p in $(cat "$FCG/cgroup.procs" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+        "$BIN" stop "$FID" >/dev/null 2>&1
+    else
+        skip "pids enforcement (fork denial)" "start failed: $ERR"
+    fi
+fi
+
+# ===========================================================================
+section "16. Overlay --overlay end-to-end (Error #24)"
+# ===========================================================================
+# Pre-fix, every --overlay run aborted with "container_id is required"
+# because cmd_run/cmd_start never copied the ID into cfg.container_id.
+# The unit test_overlay can't catch this (it sets cfg.container_id
+# directly) — only an end-to-end CLI run does.
+if [ "$IS_ROOT" != "1" ] || [ "$ROOTFS_OK" != "1" ]; then
+    skip "overlay end-to-end" "$([ "$IS_ROOT" = 1 ] && echo 'rootfs missing' || echo 'needs root')"
+else
+    _run_to 30 "$BIN" run --overlay --rootfs "$ROOTFS" \
+        "$C_SH" -c 'echo cow-marker > /ovtest.txt; cat /ovtest.txt'
+    ck_eq       "overlay run exit 0"                         "$RC" "0"
+    ck_contains "overlay: write+read inside works"           "$OUT" "cow-marker"
+    ck_lacks    "overlay: no 'container_id is required' (Error #24)" "$ERR" "container_id is required"
+    ck_nofile   "overlay: host rootfs untouched (COW)"       "$ROOTFS/ovtest.txt"
 fi
 
 # ===========================================================================
