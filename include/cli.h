@@ -16,6 +16,9 @@ typedef enum {
     SUBCMD_INSPECT,
     SUBCMD_LIST,
     SUBCMD_CLEANUP,
+    SUBCMD_STATS,       /* NEW in 8a */
+    SUBCMD_TOP,         /* NEW in 8a */
+    SUBCMD_NETSTAT,     /* NEW in 8a */
 } subcommand_t;
 
 /**
@@ -38,6 +41,12 @@ int cmd_exec(int argc, char *argv[]);
 int cmd_inspect(int argc, char *argv[]);
 int cmd_list(int argc, char *argv[]);
 int cmd_cleanup(int argc, char *argv[]);
+
+/* New in 8a: introspection subcommand handlers. Each wraps a
+ * show_container_* primitive from inspector.c. */
+int cmd_stats(int argc, char *argv[]);
+int cmd_top(int argc, char *argv[]);
+int cmd_netstat(int argc, char *argv[]);
 
 /**
  * Print top-level usage (subcommand list + flag summary) to stderr.

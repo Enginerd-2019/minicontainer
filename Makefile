@@ -1,12 +1,20 @@
 # Makefile for minicontainer - Minimal Container Runtime
-# Phase 7a: Execution-Core Consolidation
-# (builds on Phase 6 network, Phase 5 cgroups, 4c IPC, 4b User, 4 UTS)
+# Phase 8a: Process Inspector Integration (libprocfs submodule)
+# (builds on Phase 7b CLI/lifecycle, 7a core, 6 network, 5 cgroups, 4/4b/4c namespaces)
 
 CC       = gcc
 CFLAGS   = -Wall -Wextra -std=c11 -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 INCLUDES = -I./include
 LDFLAGS  =
 DEPFLAGS = -MMD -MP
+
+# Phase 8a: libprocfs static library, vendored as a git submodule at
+# third_party/libprocfs and built by its own Makefile. Clone the repo with
+# `git clone --recursive`, or run `git submodule update --init` after cloning,
+# so this path is populated before building.
+LIBPROCFS_DIR = third_party/libprocfs
+CFLAGS       += -I$(LIBPROCFS_DIR)/include
+LIBPROCFS     = $(LIBPROCFS_DIR)/libprocfs.a
 
 # Directories
 SRC_DIR   = src
@@ -28,7 +36,8 @@ HELPER_OBJS = $(BUILD_DIR)/core.o $(BUILD_DIR)/env.o \
               $(BUILD_DIR)/uts.o $(BUILD_DIR)/overlay.o \
               $(BUILD_DIR)/mount.o $(BUILD_DIR)/state.o \
               $(BUILD_DIR)/pty.o $(BUILD_DIR)/cli.o \
-              $(BUILD_DIR)/cleanup.o
+              $(BUILD_DIR)/cleanup.o \
+              $(BUILD_DIR)/inspector.o    # NEW in 8a
 
 # Executables
 MINICONTAINER  = minicontainer
@@ -57,8 +66,15 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
-# Phase 7a: link main.o + the unified helper chain.
-$(MINICONTAINER): $(BUILD_DIR)/main.o $(HELPER_OBJS)
+# Phase 8a: build libprocfs.a by re-entering its own Makefile, so a
+# change to libprocfs/src/*.c rebuilds the archive automatically.
+$(LIBPROCFS):
+	$(MAKE) -C $(LIBPROCFS_DIR)
+
+# Phase 8a: link main.o + the unified helper chain + libprocfs.a.
+# $(LIBPROCFS) is LAST: static archives must follow the .o files that
+# reference their symbols (inspector.o -> read_cgroup_stats etc.).
+$(MINICONTAINER): $(BUILD_DIR)/main.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(MINICONTAINER) successfully!"
 
@@ -67,45 +83,45 @@ $(MINICONTAINER): $(BUILD_DIR)/main.o $(HELPER_OBJS)
 # six per-phase variations.
 
 # Link test_core (Phase 7a: bare_exec + pid_only, replaces test_spawn + test_namespace)
-$(TEST_CORE): $(BUILD_DIR)/test_core.o $(HELPER_OBJS)
+$(TEST_CORE): $(BUILD_DIR)/test_core.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_CORE) successfully!"
 
 # Link test_mount (Phase 2 retained, calls container_exec since Phase 7a)
-$(TEST_MOUNT): $(BUILD_DIR)/test_mount.o $(HELPER_OBJS)
+$(TEST_MOUNT): $(BUILD_DIR)/test_mount.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_MOUNT) successfully!"
 
 # Link test_overlay (Phase 3 retained, calls container_exec since Phase 7a)
-$(TEST_OVERLAY): $(BUILD_DIR)/test_overlay.o $(HELPER_OBJS)
+$(TEST_OVERLAY): $(BUILD_DIR)/test_overlay.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_OVERLAY) successfully!"
 
 # Link test_uts (Phase 4/4b/4c retained, calls container_exec since Phase 7a)
-$(TEST_UTS): $(BUILD_DIR)/test_uts.o $(HELPER_OBJS)
+$(TEST_UTS): $(BUILD_DIR)/test_uts.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_UTS) successfully!"
 
 # Link test_cgroup (Phase 5 retained, calls container_exec since Phase 7a)
-$(TEST_CGROUP): $(BUILD_DIR)/test_cgroup.o $(HELPER_OBJS)
+$(TEST_CGROUP): $(BUILD_DIR)/test_cgroup.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_CGROUP) successfully!"
 
 # Link test_net (Phase 6 retained, calls container_exec since Phase 7a)
-$(TEST_NET): $(BUILD_DIR)/test_net.o $(HELPER_OBJS)
+$(TEST_NET): $(BUILD_DIR)/test_net.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_NET) successfully!"
 
 # Phase 7b new tests
-$(TEST_STATE): $(BUILD_DIR)/test_state.o $(HELPER_OBJS)
+$(TEST_STATE): $(BUILD_DIR)/test_state.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_STATE) successfully!"
 
-$(TEST_BIND): $(BUILD_DIR)/test_bind.o $(HELPER_OBJS)
+$(TEST_BIND): $(BUILD_DIR)/test_bind.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_BIND) successfully!"
 
-$(TEST_CLI): $(BUILD_DIR)/test_cli.o $(HELPER_OBJS)
+$(TEST_CLI): $(BUILD_DIR)/test_cli.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_CLI) successfully!"
 
@@ -144,6 +160,9 @@ test: $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TE
 	@echo ""
 	@echo "=== Running Phase 7b bind-mount tests (requires root for unshare+mount) ==="
 	sudo ./$(TEST_BIND)
+	@echo ""
+	@echo "=== Running Phase 8a inspector integration test (requires root + ./rootfs) ==="
+	sudo bash tests/test_inspector.sh
 
 # Build with debug symbols
 .PHONY: debug
@@ -286,11 +305,11 @@ examples: $(MINICONTAINER)
 # Help target
 .PHONY: help
 help:
-	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 6)"
+	@echo "Makefile for minicontainer - Minimal Container Runtime (Phase 8a)"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  all                 - Build minicontainer (default)"
-	@echo "  test                - Build and run all tests (Phase 0 through Phase 6)"
+	@echo "  test                - Build and run all tests (Phase 0 through Phase 8a)"
 	@echo "  debug               - Build with debug symbols (-g)"
 	@echo "  valgrind            - Run with valgrind memory checker"
 	@echo "  examples            - Run example commands"

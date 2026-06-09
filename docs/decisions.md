@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 6 - Network Namespace (veth pair + optional NAT)
-**Last Updated:** 2026-05-13
+**Phase:** 8a - Process Inspector Integration (libprocfs)
+**Last Updated:** 2026-06-09
 
 ---
 
@@ -1634,6 +1634,85 @@ one for the same container.
 
 ---
 
+### 35. libprocfs Extraction — Read-Side /proc + cgroup Library (Phase 8a)
+
+**Context.** Earlier phases could write cgroup limits but never read them
+back beyond a crude two-field snapshot in `list`, and there was no way to
+see a running container's process, fd, thread, socket, or full cgroup
+state. The `/proc`-reading logic required for that already existed in a
+sibling process-inspection tool; copying it into minicontainer would
+couple the two codebases and let them drift.
+
+**Decision.** Extract the `/proc`-reading code into a standalone static
+library, **libprocfs**, linked into minicontainer (and reusable by the
+original tool). Design points:
+
+- **Static-only.** `libprocfs.a` is archived and linked directly into the
+  `minicontainer` binary — no shared object, no `LD_LIBRARY_PATH`, no
+  runtime dependency. Two consumers gain nothing from memory sharing, and
+  static linking keeps deployment a single binary.
+- **Two-header API.** Consumers include `procfs.h` (process / fd / thread /
+  socket readers) and `cgroups.h` (`cgroup_stats_t` plus
+  `read_cgroup_stats` and `get_pid_cgroup`). The tool's six per-area
+  headers are merged into one `procfs.h`.
+- **Write/read cgroup split.** minicontainer's `cgroup.c` stays write-side
+  only (`setup_cgroup` / `add_pid_to_cgroup` / `remove_cgroup`). The cgroup
+  v2 *read* side — `memory.current/peak/max`, `cpu.stat`,
+  `pids.current/max`, with the literal `"max"` mapping to `UINT64_MAX`
+  (memory) or `-1` (pids) — is new code in libprocfs. Reading is pure
+  (path in, struct out) and reusable; writing is bound to the clone
+  lifecycle and is not.
+- **Typed bundle.** `cgroup_stats_t` is one struct; consumers gain new
+  fields automatically instead of tracking a growing set of scalars.
+- **Bridge stays in minicontainer.** `inspector.c` maps a container ID →
+  PID (`state_load`) → cgroup path (state.json's `cgroup_path`, else
+  `get_pid_cgroup`) and bundles libprocfs results into
+  `container_inspect_info_t` for the `inspect` / `stats` / `top` /
+  `netstat` subcommands. The pure readers live in libprocfs; the
+  container-aware glue lives in minicontainer.
+
+**Integration.** libprocfs is vendored as a git submodule under
+`third_party/libprocfs`; the Makefile builds the archive via the
+submodule's own Makefile and links `libprocfs.a` **last** on every link
+line (a static archive must follow the `.o` files that reference its
+symbols — here `inspector.o` → `read_cgroup_stats` / `get_pid_cgroup`).
+The lightweight two-field cgroup reader already in `state.c::state_list`
+is intentionally left unchanged so `list` stays dependency-light and fast;
+`inspect` / `stats` use the full libprocfs reader. The duplication is
+deliberate.
+
+**Build hygiene.** The library builds under
+`-Wall -Wextra -Werror -pedantic -std=c11` with no command-line
+feature-test macros; sources that use POSIX.1-2008 interfaces carry their
+own `#define _POSIX_C_SOURCE 200809L`. `procfs.h` includes
+`<linux/limits.h>` rather than `<limits.h>` so `PATH_MAX` is defined in
+every translation unit regardless of feature-test macros. Address/UB
+sanitizers are confined to libprocfs's own test target; the shipped
+archive is sanitizer-free so it links cleanly into the non-sanitized
+`minicontainer` binary.
+
+**Trade-offs.** A second build artifact and a submodule to fetch
+(`git clone --recursive`). In return the reading logic has one home, both
+consumers stay in sync, and the inspection feature is a clean library
+boundary rather than copy-pasted parsers.
+
+**Files affected:**
+- `third_party/libprocfs/` — submodule: `procfs.h`, `cgroups.h`,
+  `procfs_*.c`, `cgroups.c`, tests, Makefile.
+- `include/inspector.h`, `src/inspector.c` — bridge + CLI front-ends.
+- `src/cli.c` — `cmd_inspect` upgraded to a live report; new `cmd_stats` /
+  `cmd_top` / `cmd_netstat`; three `parse_subcommand` rows; `inspector.h`
+  include.
+- `include/cli.h` — `SUBCMD_STATS` / `SUBCMD_TOP` / `SUBCMD_NETSTAT` plus
+  the three handler declarations.
+- `src/main.c` — three dispatch rows.
+- `Makefile` — libprocfs include path, archive build rule, `inspector.o`
+  in `HELPER_OBJS`, `libprocfs.a` appended last to every link rule.
+
+**Implemented:** 2026-06-09
+
+---
+
 ## Errors Found and Fixed
 
 ### Error #1: Typo in WEXITSTATUS Macro
@@ -3084,7 +3163,11 @@ child until placement is done.
 
 ---
 
-### 2. No File Descriptor Management (Security — CVE-2024-21626, CVE-2016-9962)
+### 2. No File Descriptor Management (Security — CVE-2024-21626, CVE-2016-9962) — RESOLVED in Phase 3
+
+> **Status:** RESOLVED. Retained for the security rationale and history; the
+> fix (`close_inherited_fds()` in `core.c`) has shipped since Phase 3 and is
+> a load-bearing invariant of every later phase.
 
 **Limitation (Phase 2):** Child inherits all open file descriptors from parent.
 
@@ -3102,17 +3185,20 @@ accidental protection — see Error #12 for full analysis.
 
 ---
 
-### 3. Single Command Execution
+### 3. Single Command Execution — RESOLVED in Phase 7b
 
-**Limitation:** Can only run one command, then exits.
+> **Status:** RESOLVED. The "Future" work described below shipped in Phase 7b.
 
-**Rationale:** Deliberately simple — lifecycle management comes in Phase 7
-(split into 7a: execution-core refactor, and 7b: CLI / `start` / `stop` /
-`exec` / `inspect` / bind mounts / PTY).
+**Former limitation:** Early phases ran a single foreground command and then
+exited, with no way to manage a container's lifecycle.
 
-**Future:** Phase 7b will add start/stop/exec container lifecycle
-management via subcommand dispatch and a `/run/minicontainer/<id>/`
-state-file convention.
+**Phase 7b fix:** Subcommand dispatch (`cli.c::parse_subcommand`) added
+`run` / `start` (detached) / `stop` (SIGTERM → 10 s → SIGKILL) / `exec`
+(join a running container via `setns`) / `inspect` / `list` / `cleanup`,
+backed by a `/run/minicontainer/<id>/` state-file convention (`state.json`
++ `pidfile` + `logs/` for detached containers). A container still runs one
+entrypoint program, but its lifecycle is now fully managed and further
+commands can be run inside a live container via `exec`.
 
 ---
 
@@ -3126,17 +3212,35 @@ state-file convention.
 
 ---
 
-### 5. No tmpfs or Device Mounts
+### 5. No Automatic tmpfs, /sys, or /dev Device Nodes
 
-**Limitation:** Only `/proc` is automatically mounted inside the container. `/tmp`, `/dev`, `/sys`, and other standard mounts are not set up.
+> **Status:** Partially addressed since this was written. `/dev/pts` (devpts)
+> is now auto-mounted and arbitrary host paths can be bind-mounted with
+> `--volume`; the remaining gaps (tmpfs, sysfs, `/dev` device nodes) are
+> below.
 
-**Impact:** Programs that expect `/dev/null`, `/dev/urandom`, or `/tmp` will fail inside the container unless the rootfs includes them as regular files/directories.
+**What is set up automatically:** `/proc` (always) and a private `/dev/pts`
+devpts instance with a `/dev/ptmx` symlink (mounted whenever a rootfs is
+set — Phase 7b, required by PTY-using tools like nano/less). Arbitrary host
+paths can be mounted with `--volume host:container[:ro]` (Phase 7b bind
+mounts, applied inside `setup_rootfs` before `pivot_root`).
 
-**Future:** Add `/dev` (minimal device nodes), `/tmp` (tmpfs), and `/sys` (sysfs) mounts in the child setup.
+**Still not automatic:** `/tmp` (tmpfs), `/sys` (sysfs), and standard `/dev`
+device nodes (`/dev/null`, `/dev/zero`, `/dev/urandom`).
+
+**Impact:** Programs that expect `/dev/null`, `/dev/urandom`, `/tmp`, or
+`/sys` fail unless the rootfs ships them as regular files/directories or
+they are supplied via `--volume`.
+
+**Future:** Auto-mount a minimal `/dev` (device nodes), `/tmp` (tmpfs), and
+`/sys` (sysfs) in the child setup.
 
 ---
 
-### 6. Environment Variable Leak After pivot_root (Security)
+### 6. Environment Variable Leak After pivot_root (Security) — RESOLVED in Phase 3
+
+> **Status:** RESOLVED. Retained for history; `build_container_env()`
+> (`env.c`) and the restored `--env` flag have shipped since Phase 3.
 
 **Limitation:** After `pivot_root()` into the container rootfs, the child process still inherits the host's full `environ`. Variables like `PATH=/home/tcrumb/.local/bin:/usr/local/bin:/usr/bin`, `HOME=/home/tcrumb`, and `SHELL=/bin/bash` reference paths that do not exist inside the container rootfs.
 
@@ -3150,7 +3254,10 @@ state-file convention.
 
 ---
 
-### 7. No Copy-on-Write Filesystem
+### 7. No Copy-on-Write Filesystem — RESOLVED in Phase 3 (OverlayFS via `--overlay`)
+
+> **Status:** RESOLVED. Retained for history; `setup_overlay()` (`overlay.c`)
+> and the `--overlay` flag have shipped since Phase 3.
 
 **Limitation:** Container writes modify the base rootfs directory directly on the host. There is no isolation between container runs.
 
@@ -3289,6 +3396,29 @@ FORWARD policy, warn loudly when DROP is in effect and no
 container-subnet ACCEPT exists, and offer to install the two rules
 above with explicit user confirmation. That is distinct from
 unconditional auto-insertion.
+
+---
+
+### 9. `top` Requires a Private /proc (Container Mount Namespace)
+
+**Limitation:** `minicontainer top <id>` shows the container's isolated
+process tree (PID 1 = container init) **only** for containers started with
+`--rootfs`. For a `--pid`-only container (no `--rootfs`, hence no private
+mount namespace), `top` prints the **host's** process list instead.
+
+**Why:** `top` runs `nsenter --target <pid> --pid --mount ps aux`. `ps`
+reads `/proc`, and a procfs instance reflects the PID namespace of whoever
+*mounted* it, not the namespace the reader currently sits in. A `--rootfs`
+container has a private mount namespace in which a fresh `/proc` was mounted
+from inside the new PID namespace, so `ps` there sees only container PIDs. A
+`--pid`-only container shares the host mount namespace and never gets its
+own `/proc`, so `nsenter --mount` lands back in the host mount namespace and
+`ps` reads the host procfs. There is no error; `top` silently degrades to a
+host `ps`.
+
+**Workaround:** Use `--rootfs` for containers you intend to inspect with
+`top`. `inspect` / `stats` are unaffected (they read `/proc/<pid>/...` for
+the specific PID, not a namespace-wide listing).
 
 ---
 

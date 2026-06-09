@@ -34,6 +34,9 @@ int main(int argc, char *argv[]) {
         case SUBCMD_INSPECT: return cmd_inspect(argc - 1, argv + 1);
         case SUBCMD_LIST:    return cmd_list   (argc - 1, argv + 1);
         case SUBCMD_CLEANUP: return cmd_cleanup(argc - 1, argv + 1);
+        case SUBCMD_STATS:   return cmd_stats  (argc - 1, argv + 1);  /* NEW in 8a */
+        case SUBCMD_TOP:     return cmd_top    (argc - 1, argv + 1);  /* NEW in 8a */
+        case SUBCMD_NETSTAT: return cmd_netstat(argc - 1, argv + 1);  /* NEW in 8a */
         case SUBCMD_UNKNOWN:
             break;  /* fall through to implicit-run logic below */
     }

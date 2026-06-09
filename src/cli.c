@@ -5,6 +5,7 @@
 #include "state.h"
 #include "cleanup.h"
 #include "pty.h"
+#include "inspector.h"   /* Phase 8a: show_container_* live reports */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,9 @@ subcommand_t parse_subcommand(const char *arg) {
     if (strcmp(arg, "inspect") == 0) return SUBCMD_INSPECT;
     if (strcmp(arg, "list") == 0)    return SUBCMD_LIST;
     if (strcmp(arg, "cleanup") == 0) return SUBCMD_CLEANUP;
+    if (strcmp(arg, "stats") == 0)   return SUBCMD_STATS;    /* NEW in 8a */
+    if (strcmp(arg, "top") == 0)     return SUBCMD_TOP;      /* NEW in 8a */
+    if (strcmp(arg, "netstat") == 0) return SUBCMD_NETSTAT;  /* NEW in 8a */
     return SUBCMD_UNKNOWN;
 }
 
@@ -746,53 +750,60 @@ int cmd_exec(int argc, char *argv[]) {
     return 1;
 }
 
+/* Phase 8a: replaces Phase 7b's state-only JSON dump. show_container_inspect
+ * lives in inspector.c and reads /proc + cgroup data via libprocfs. */
 int cmd_inspect(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: minicontainer inspect <id>\n");
         return 1;
     }
-    const char *id = argv[1];
+    return show_container_inspect(argv[1]) < 0 ? 1 : 0;
+}
 
-    container_state_t s = {0};
-    if (state_load(id, &s) < 0) {
-        fprintf(stderr, "No such container: %s\n", id);
+int cmd_stats(int argc, char *argv[]) {
+    bool continuous = false;
+    optind = 1;
+    static struct option opts[] = {
+        {"continuous", no_argument, NULL, 'c'},
+        {0,0,0,0}
+    };
+    int opt;
+    while ((opt = getopt_long(argc, argv, "+c", opts, NULL)) != -1) {
+        if (opt == 'c') continuous = true;
+        else return 1;
+    }
+    if (optind >= argc) {
+        fprintf(stderr, "Usage: minicontainer stats [-c] <id>\n");
         return 1;
     }
-    bool alive = (kill(s.pid, 0) == 0);
+    return show_container_stats(argv[optind], continuous) < 0 ? 1 : 0;
+}
 
-    /* Pretty-print as JSON to stdout. Mostly mirrors state.json but
-     * adds a live "status" field. */
-    printf("{\n");
-    printf("  \"id\":          \"%s\",\n", s.id);
-    printf("  \"pid\":         %d,\n", s.pid);
-    printf("  \"status\":      \"%s\",\n", alive ? "running" : "exited");
-    printf("  \"started_at\":  \"%s\",\n", s.started_at);
-    printf("  \"command\":     \"%s\",\n", s.command);
-    if (s.argv_str[0]) {
-        printf("  \"argv\":        \"%s\",\n", s.argv_str);
+int cmd_top(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: minicontainer top <id>\n");
+        return 1;
     }
-    if (s.rootfs[0])      printf("  \"rootfs\":      \"%s\",\n", s.rootfs);
-    if (s.hostname[0])    printf("  \"hostname\":    \"%s\",\n", s.hostname);
-    if (s.cgroup_path[0]) printf("  \"cgroup_path\": \"%s\",\n", s.cgroup_path);
-    printf("  \"namespaces\": {\n");
-    printf("    \"pid\":     %s,\n", s.enable_pid_namespace   ? "true" : "false");
-    printf("    \"mount\":   %s,\n", s.enable_mount_namespace ? "true" : "false");
-    printf("    \"uts\":     %s,\n", s.enable_uts_namespace   ? "true" : "false");
-    printf("    \"user\":    %s,\n", s.enable_user_namespace  ? "true" : "false");
-    printf("    \"ipc\":     %s,\n", s.enable_ipc_namespace   ? "true" : "false");
-    printf("    \"network\": %s\n",  s.enable_network         ? "true" : "false");
-    printf("  }%s\n", s.has_veth ? "," : "");
-    if (s.has_veth) {
-        printf("  \"veth\": {\n");
-        printf("    \"host\":         \"%s\",\n", s.veth_host);
-        printf("    \"container\":    \"%s\",\n", s.veth_container);
-        printf("    \"host_ip\":      \"%s\",\n", s.veth_host_ip);
-        printf("    \"container_ip\": \"%s\",\n", s.veth_container_ip);
-        printf("    \"netmask\":      \"%s\"\n",  s.veth_netmask);
-        printf("  }\n");
+    return show_container_top(argv[1]) < 0 ? 1 : 0;
+}
+
+int cmd_netstat(int argc, char *argv[]) {
+    bool verbose = false;
+    optind = 1;
+    static struct option opts[] = {
+        {"verbose", no_argument, NULL, 'v'},
+        {0,0,0,0}
+    };
+    int opt;
+    while ((opt = getopt_long(argc, argv, "+v", opts, NULL)) != -1) {
+        if (opt == 'v') verbose = true;
+        else return 1;
     }
-    printf("}\n");
-    return alive ? 0 : 1;
+    if (optind >= argc) {
+        fprintf(stderr, "Usage: minicontainer netstat [-v] <id>\n");
+        return 1;
+    }
+    return show_container_netstat(argv[optind], verbose) < 0 ? 1 : 0;
 }
 
 int cmd_cleanup(int argc, char *argv[]) {
@@ -827,7 +838,10 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  start    Run a container detached (background)\n");
     fprintf(stderr, "  stop     Stop a running container by ID\n");
     fprintf(stderr, "  exec     Run a command in an existing container\n");
-    fprintf(stderr, "  inspect  Show container details by ID\n");
+    fprintf(stderr, "  inspect  Show a container's live /proc + cgroup report by ID\n");
+    fprintf(stderr, "  stats    Show live resource usage (-c to refresh each second)\n");
+    fprintf(stderr, "  top      Show the container's process tree (via nsenter)\n");
+    fprintf(stderr, "  netstat  Show the container's network connections (-v for the table)\n");
     fprintf(stderr, "  list     List running containers\n");
     fprintf(stderr, "  cleanup  Remove stale state from crashed containers\n\n");
     fprintf(stderr, "Run-mode options (run | start):\n");

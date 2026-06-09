@@ -20,7 +20,13 @@ Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `insp
 
 ## Features
 
-### Phase 7b (Current)
+### Phase 8a (Current)
+
+- ✅ **Process inspection via libprocfs** — `inspect` is now a full live report (`/proc` status + fds/threads/sockets + cgroup stats); new `stats` (one-shot, `-c` for a refresh loop), `top` (process tree via `nsenter`), and `netstat` (`-v` for the per-socket table) subcommands. The container-aware glue is `inspector.c`.
+- ✅ **cgroup v2 read side** — `read_cgroup_stats` parses `memory.current/peak/max`, `cpu.stat`, and `pids.current/max` (literal `"max"` → unlimited), complementing the existing write-side `cgroup.c`.
+- ✅ **libprocfs static library** — the `/proc` + cgroup reading code is a standalone static library (two-header API: `procfs.h` + `cgroups.h`), vendored as a git submodule at `third_party/libprocfs` and linked into the `minicontainer` binary. Reusable, no runtime dependency. See Architecture Decision #35 in `docs/decisions.md`.
+
+### Phase 7b
 
 - ✅ **Subcommand CLI** — `run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`. `parse_subcommand` lives in `cli.c`; `main.c` is a ~60-line dispatcher.
 - ✅ **Implicit-run backwards compatibility** — every Phase 0–7a invocation pattern (`./minicontainer --pid /bin/sh`, `./minicontainer /bin/echo hi`) still routes to `cmd_run` without a subcommand keyword. Heuristic: `argv[1]` starts with `-` OR is an executable path.
@@ -138,11 +144,25 @@ Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `insp
 
 ### Build
 
+minicontainer depends on **[libprocfs](https://github.com/Enginerd-2019/libprocfs)**
+(its `/proc` + cgroup reader, used by `inspect`/`stats`/`top`/`netstat`),
+vendored as a git submodule at `third_party/libprocfs`. Clone recursively so
+the submodule is present:
+
+```bash
+git clone --recursive <repo-url>
+# already cloned without --recursive?
+git submodule update --init
+```
+
+Then:
+
 ```bash
 make
 ```
 
-This compiles the `minicontainer` executable in the current directory.
+This builds `third_party/libprocfs/libprocfs.a` and compiles the
+`minicontainer` executable in the current directory.
 
 #### Ubuntu 24.04+ rootless users — one-time AppArmor setup
 
@@ -184,7 +204,10 @@ echo "$CID"   # e.g. a1b2c3d4e5f6
 
 # Find / introspect / stop / sweep
 sudo ./minicontainer list                       # table: ID, PID, started_at, command
-sudo ./minicontainer inspect "$CID"             # state.json pretty-printed
+sudo ./minicontainer inspect "$CID"             # live report: /proc status + fds/threads/sockets + cgroup stats
+sudo ./minicontainer stats "$CID"               # one-shot resource snapshot (add -c for a 1s refresh loop)
+sudo ./minicontainer top "$CID"                 # container process tree via nsenter (needs --rootfs; see Limitation #9 in docs/decisions.md)
+sudo ./minicontainer netstat "$CID"             # connection count (add -v for the per-socket table)
 sudo ./minicontainer exec "$CID" /bin/ps aux    # run a command inside the existing container
 sudo ./minicontainer stop "$CID"                # SIGTERM → 10s timeout → SIGKILL
 sudo ./minicontainer cleanup                    # sweep stale state/cgroups/veth/iptables/overlay
