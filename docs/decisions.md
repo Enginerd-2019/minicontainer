@@ -2977,7 +2977,25 @@ run.
 
 ---
 
-### Error #25: cgroup Limits Silently Unenforced — Child Placed in the cgroup AFTER It Started Running (Phase 7b)
+### Error #25: cgroup Limits Silently Unenforced — Child Placed in the cgroup AFTER It Started Running (origin: Phase 5; observed and fixed: Phase 7b)
+
+**Origin (corrected attribution).** This was *observed* during Phase 7b
+live testing, but it is **not** a Phase 7b regression — it dates to
+Phase 5, where the two-step cgroup pattern (create in parent, add the
+child PID after `clone()`) was introduced with an explicit rationale
+that it "closes the window … where the child is running without limits."
+That rationale is false unless the child is *blocked* until placement is
+done. Phase 5 created the sync pipe only for user namespaces (and wrote
+the sync before `add_pid_to_cgroup` even there), so a plain
+`--memory`/`--pids` container had no gate at all and the window stayed
+open. Phase 6 widened the sync condition to network but not cgroup and
+preserved the post-sync `add_pid` ordering (it cites "Phase 5 §3.2
+ordering"); Phase 7a, a behavior-preserving consolidation, copied it
+into `core.c` byte-identically. The bug was therefore latent across
+Phases 5–7b and invisible because every cgroup test checked limit-file
+values or "the shell exited," never that a fork was actually denied. The
+remaining sub-sections describe the code as it stood when the bug was
+fixed; the root cause is the Phase 5 design, not a Phase 7b change.
 
 **Background — what was there.** `container_start` creates the cgroup,
 writes `memory.max`/`pids.max`, clones the child, and adds the child to
