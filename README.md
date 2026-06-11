@@ -1535,6 +1535,37 @@ man 7 pid_namespaces  # PID namespace details
 
 ## Troubleshooting
 
+### "Cannot set tty process group (No such process)" from a container shell
+
+**Problem:** Running an interactive shell without `--interactive`, e.g.
+`sudo ./minicontainer run --pid --rootfs ./rootfs /bin/sh`, prints
+`/bin/sh: ...: Cannot set tty process group (No such process)` (typically
+on exit). The command still runs.
+
+**Cause:** Without `--interactive` no PTY is allocated, so the container's
+shell runs on the *host's* controlling terminal while living in a *new PID
+namespace*. The terminal's foreground process-group ID is a host-side PID
+that doesn't resolve inside the new namespace, so the shell's job-control
+`tcsetpgrp()` fails with `ESRCH`. This is cosmetic — exactly the same way
+`docker run alpine sh` (without `-it`) behaves. (`mount_devpts` runs
+unconditionally and provides the devpts *filesystem* so programs can
+allocate their own ptys, but it does not give the shell a controlling
+terminal — that is the `--interactive` path's job, via `setsid()` +
+`TIOCSCTTY`.)
+
+When stdin is a terminal but `--interactive` was not passed, minicontainer
+prints a one-line `note:` to stderr pointing at `-i`.
+
+**Solution:** Pass `--interactive` (`-i`) for an interactive shell — it
+allocates a PTY inside the container and makes the shell its own session
+leader with its own controlling terminal, so job control works and the
+warning disappears:
+```bash
+sudo ./minicontainer run --interactive --pid --rootfs ./rootfs /bin/sh
+```
+
+---
+
 ### "find_ip_binary: not found" (Phase 6)
 
 **Problem:** `net.c` cannot locate the `ip` binary at any of `/sbin/ip`,

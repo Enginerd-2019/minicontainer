@@ -334,6 +334,22 @@ int cmd_run(int argc, char *argv[]) {
         return cmd_start(argc, argv);
     }
 
+    /* Discoverability hint.  An interactive program run as PID 1 on the
+     * host's controlling terminal (no --interactive => no PTY) emits
+     * job-control warnings like "Cannot set tty process group" because
+     * the terminal's foreground pgid is a host-side PID that doesn't
+     * resolve inside the new PID namespace.  When stdin is a terminal
+     * but no PTY was requested, point the user at -i.  Gated on stderr
+     * also being a terminal so the note never lands in a redirected
+     * stderr log, and on stdin being a tty so piped / scripted runs
+     * (and headless CI) never see it. */
+    if (!cfg.enable_pty && isatty(STDIN_FILENO) && isatty(STDERR_FILENO)) {
+        fprintf(stderr,
+                "note: stdin is a terminal but no PTY was allocated; "
+                "pass --interactive (-i) for a controlling terminal "
+                "(avoids 'Cannot set tty process group' warnings)\n");
+    }
+
     /* PTY allocation now happens INSIDE the child after mount_devpts;
      * container_start handles the socketpair handoff and returns the
      * master fd on result.pty_master_fd.  cmd_run just sets the flag. */
