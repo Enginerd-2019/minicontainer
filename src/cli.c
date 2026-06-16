@@ -398,6 +398,9 @@ int cmd_run(int argc, char *argv[]) {
     container_result_t r = container_start(&cfg);
     if (r.child_pid < 0) {
         fprintf(stderr, "Failed to start container\n");
+        /* Release the state dir claimed by state_claim_id; it has no
+         * state.json yet, so cleanup's state_load sweep would miss it. */
+        state_remove(state.id);
         free(container_env);
         return 1;
     }
@@ -562,12 +565,14 @@ int cmd_start(int argc, char *argv[]) {
     pn = snprintf(logs_dir, sizeof(logs_dir), "%s/logs", state_dir);
     if (pn < 0 || (size_t)pn >= sizeof(logs_dir)) {
         fprintf(stderr, "cmd_start: logs_dir path truncated for id %s\n", state.id);
+        state_remove(state.id);   /* release the claimed state dir */
         free(container_env);
         return 1;
     }
 
     if (mkdir_p(logs_dir, 0755) < 0 && errno != EEXIST) {
         perror("mkdir(logs)");
+        state_remove(state.id);   /* release the claimed state dir */
         free(container_env);
         return 1;
     }
@@ -575,12 +580,14 @@ int cmd_start(int argc, char *argv[]) {
     pn = snprintf(stdout_path, sizeof(stdout_path), "%s/stdout.log", logs_dir);
     if (pn < 0 || (size_t)pn >= sizeof(stdout_path)) {
         fprintf(stderr, "cmd_start: stdout_path truncated for id %s\n", state.id);
+        state_remove(state.id);   /* release the claimed state dir */
         free(container_env);
         return 1;
     }
     pn = snprintf(stderr_path, sizeof(stderr_path), "%s/stderr.log", logs_dir);
     if (pn < 0 || (size_t)pn >= sizeof(stderr_path)) {
         fprintf(stderr, "cmd_start: stderr_path truncated for id %s\n", state.id);
+        state_remove(state.id);   /* release the claimed state dir */
         free(container_env);
         return 1;
     }
@@ -591,6 +598,7 @@ int cmd_start(int argc, char *argv[]) {
         perror("open(log)");
         if (cfg.stdout_fd >= 0) close(cfg.stdout_fd);
         if (cfg.stderr_fd >= 0) close(cfg.stderr_fd);
+        state_remove(state.id);   /* release the claimed state dir */
         free(container_env);
         return 1;
     }
@@ -604,6 +612,7 @@ int cmd_start(int argc, char *argv[]) {
 
     if (r.child_pid < 0) {
         fprintf(stderr, "Failed to start container\n");
+        state_remove(state.id);   /* release the claimed state dir */
         free(container_env);
         return 1;
     }

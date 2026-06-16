@@ -283,7 +283,7 @@ int apply_seccomp_filter(bool enable_debug)
      *   + 2 * N_ALLOWED             (JEQ + ALLOW per syscall)
      *   + 2  clone3 special case    (JEQ + ENOSYS)
      *   + 1  final DENY
-     *   = 7 + 2 * N_ALLOWED   (~340 instructions for ~165 syscalls)
+     *   = 7 + 2 * N_ALLOWED   (427 instructions for 210 syscalls)
      */
 
     size_t n_inst = 3 + 1 + 2 * N_ALLOWED + 2 + 1;
