@@ -1713,6 +1713,120 @@ boundary rather than copy-pasted parsers.
 
 ---
 
+### 36. Production Hardening via Raw Syscalls — Opt-In `--secure` (Phase 8b)
+
+**Decision:** Add an opt-in `--secure` flag that layers four defenses onto
+a container, every one hand-rolled from raw syscalls with no external
+library:
+
+1. **Capability drop** — keep only a 14-capability set matching Docker's
+   default profile; drop everything else from the bounding set
+   (`prctl(PR_CAPBSET_DROP)`) and clear it from permitted/effective/
+   inheritable (`capset(2)` with `_LINUX_CAPABILITY_VERSION_3`). No libcap.
+2. **`NO_NEW_PRIVS`** — `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
+3. **Seccomp BPF allow-list** — a hand-assembled `struct sock_filter`
+   program (~165 allow-listed syscalls) installed via
+   `prctl(PR_SET_SECCOMP)`. No libseccomp.
+4. **Read-only `/sys`** — `mount_sys_ro` mounts sysfs `MS_RDONLY`.
+
+Default behavior is unchanged when `--secure` is absent.
+
+**Rationale:**
+- **Educational signal.** The whole point is to show the kernel interface.
+  `capset(2)` is ~30 lines; libcap is ~10,000. A hand-assembled BPF
+  program shows exactly what is filtered, which `seccomp_rule_add()` hides.
+- **No runtime dependency.** The binary stays self-contained.
+- **Defense in depth.** The three process-level layers are independently
+  defeatable but rarely all at once; a kernel bug that escapes one is
+  unlikely to escape the next.
+- **Opt-in preserves zero regression.** Every prior-phase test and
+  invocation is byte-for-byte unaffected; production callers pass
+  `--secure` explicitly.
+
+**Key specifics (each chosen deliberately):**
+- **Cap-vs-seccomp asymmetry.** `CAP_SYS_CHROOT` and `CAP_MKNOD` are
+  *kept* (Docker-profile parity) but `chroot`/`mknod`/`mknodat` are
+  *denied* by the seccomp allow-list anyway. `chroot` is a classic escape
+  primitive (open an fd, `chroot` deeper, `fchdir` back out); `mknod` mints
+  raw device nodes and this runtime has no device-cgroup controller to
+  mitigate them. When two defense layers disagree, the stricter wins — do
+  not "reconcile" by allowing the syscalls.
+- **`clone3` → `ENOSYS`, not the `EPERM` default.** glibc ≥ 2.34's
+  `pthread_create` tries `clone3` first and falls back to `clone` only on
+  `ENOSYS`; returning `EPERM` would break every threaded program. A
+  dedicated BPF rule returns `ENOSYS` for `clone3`.
+- **`clone(CLONE_NEW*)` is blocked by the capability drop, not by BPF
+  argument inspection.** `CAP_SYS_ADMIN` is dropped before the filter is
+  installed, so the kernel's capability check rejects namespace creation.
+  Simpler than arg-filtering; weaker by exactly one layer.
+- **`NO_NEW_PRIVS` precedes seccomp** — the kernel requires it (or
+  `CAP_SYS_ADMIN`, which is dropped) to install an unprivileged filter.
+- **Hardening runs last in `child_func`** (after all cap-needing setup —
+  mounts, network — and before `execve`), gated on `enable_hardening`.
+- **Default seccomp action is `ERRNO(EPERM)`, not `KILL`.** A blocked
+  syscall returns an error and the process survives, which is friendlier
+  to probing programs; arch mismatch (`AUDIT_ARCH_X86_64`) does kill.
+
+**Trade-offs:**
+- **x86_64 only** — the filter is architecture-locked. Porting needs a
+  per-arch syscall map and an `AUDIT_ARCH` switch.
+- **`--secure` requires `--rootfs`** (hardening only makes sense with its
+  own mount namespace). Under `--user` it additionally requires `--net`,
+  because the kernel only permits a sysfs mount when the user namespace
+  owns the network namespace; `mount_sys_ro` fails closed rather than
+  degrading, so a hardening step is never silently skipped.
+
+**Files affected:** `include/hardening.h`, `src/hardening.c` (new);
+`src/mount.c` + `include/mount.h` (`mount_sys_ro`); `src/core.c`
+(`child_func` hardening block + `child_args_t.enable_hardening`);
+`include/core.h` (`container_config_t.enable_hardening`); `src/cli.c`
+(`--secure` flag + validation); `tests/test_hardening.c` (new);
+`Makefile` (`hardening.o` in `HELPER_OBJS`, `test_hardening` target + run).
+
+**Verified:** 2026-06-16 against an Ubuntu 22.04 rootfs — glibc coreutils
+and `python3` run under the filter (exercising `statx`/`rseq`/`getrandom`/
+`futex`), while `mount`/`chroot`/`unshare` are denied.
+
+**Implemented:** 2026-06-16
+
+---
+
+### 37. Atomic State Writes + Container-ID Collision Retry (Phase 8b)
+
+**Decision:** Two internal robustness fixes, no new flags, no API change:
+1. **`state_save` is atomic** — write `.state.json.tmp`, `fflush` +
+   `fsync(fileno)`, then `rename(2)` over `state.json`.
+2. **`state_claim_id()`** generates an ID, `mkdir`s its state directory,
+   and retries up to 3× on `EEXIST` before failing. `cmd_run`/`cmd_start`
+   call it before `state_save` and copy the claimed ID into
+   `container_config_t.container_id`.
+
+**Rationale:**
+- A concurrent `list`/`inspect` could previously `open` `state.json`
+  mid-write and read a truncated or empty file. `rename(2)` is atomic on
+  the same filesystem, so a reader sees either the complete old contents
+  or the complete new contents — never a partial one. Both the temp file
+  and the final file live in the same per-container directory, so the
+  same-filesystem precondition always holds.
+- The 12-hex-char IDs are drawn from `/dev/urandom`; collisions are
+  astronomically unlikely but not impossible, and the prior code crashed
+  on `mkdir` `EEXIST`. Retry-then-give-up turns a coincidence into a
+  no-op and a genuine bug (3 collisions) into a clean error.
+
+**Trade-offs:** `rename(2)` fails with `EXDEV` across filesystems — not a
+concern here since both paths are inside the per-container directory. The
+`state_save` signature is unchanged; the leading idempotent `mkdir_p` and
+the trailing `pidfile` write are preserved so direct callers (the unit
+tests) and the on-disk contract are unaffected.
+
+**Files affected:** `src/state.c` (`state_save` rewrite, `state_claim_id`);
+`include/state.h` (`state_claim_id` declaration); `src/cli.c`
+(`cmd_run`/`cmd_start` call `state_claim_id`).
+
+**Implemented:** 2026-06-16
+
+---
+
 ## Errors Found and Fixed
 
 ### Error #1: Typo in WEXITSTATUS Macro
@@ -3145,6 +3259,44 @@ child until placement is done.
 
 ---
 
+### Error #26: `--secure` Rejected Every Run — Validation Read `out_cfg->rootfs_path` Before It Was Assigned (Phase 8b)
+
+**Symptom:** `minicontainer run --secure --pid --rootfs ./rootfs …` exited
+with `Error: --secure requires --rootfs` — even though `--rootfs` was on
+the command line. The identical command *without* `--secure` ran fine, so
+`--rootfs` parsing itself was not broken. In effect, `--secure` was inert:
+it rejected every invocation.
+
+**Cause:** The requires-`--rootfs` guard in `parse_run_flags` tested
+`out_cfg->rootfs_path`:
+
+```c
+if (out_cfg->enable_hardening && !out_cfg->rootfs_path) { ...reject... }
+```
+
+But `parse_run_flags` collects flags into local variables during the
+getopt loop and only assigns `out_cfg->rootfs_path = rootfs_path;` in the
+config-build block ~18 lines *below* this check. At the check,
+`out_cfg->rootfs_path` is still `NULL` (the caller zero-initializes the
+struct with `= {0}`), so `!out_cfg->rootfs_path` is *always* true whenever
+`--secure` is set. The flag rejected itself unconditionally, from the
+first build. The adjacent `--overlay` guard had it right all along by
+testing the **local** `rootfs_path`.
+
+**Why the tests missed it:** every `test_*.c` builds a `container_config_t`
+in code and calls `container_start`/`container_exec` directly — none of
+them invokes `parse_run_flags`, so the entire CLI-validation layer was
+untested. The bug surfaced only on a live `run --secure` against a real
+rootfs, not from the unit suite (which stayed green).
+
+**Fix Applied:** 2026-06-16 — test the local `rootfs_path` (matching the
+`--overlay` guard immediately above), not `out_cfg->rootfs_path`. Lesson:
+a validation that reads a destination field is fragile when that field is
+populated later in the same function; check the source local, and route
+CLI-layer logic through at least one end-to-end test.
+
+---
+
 ---
 
 ## Known Limitations
@@ -3575,15 +3727,19 @@ the specific PID, not a namespace-wide listing).
 
 ---
 
-### Phase 8: OCI / Inspector (Designed, Not Yet Implemented — Split into 8a/8b/8c)
+### Phase 8: Inspector / Hardening / OCI — Split into 8a/8b/8c (8a + 8b implemented; 8c designed)
 
-- **8a:** `libprocfs` extracted into a sibling shared library — read-side
-  of cgroups (`memory.current`, `cpu.stat`, `pids.current`) and
-  `/proc/<pid>/...` parsing. `minicontainer inspect <id>` consumes it.
-- **8b:** Hardening — capability set (`capset`), seccomp BPF filter,
-  no-new-privileges.
-- **8c:** OCI runtime spec compliance (`config.json`, bundle format),
-  minimal image extraction from tarballs.
+- **8a (IMPLEMENTED 2026-06-09):** `libprocfs` extracted into a sibling
+  static library — read-side of cgroups (`memory.current`, `cpu.stat`,
+  `pids.current`) and `/proc/<pid>/...` parsing. Consumed by
+  `inspect` / `stats` / `top` / `netstat`. See Decision #35.
+- **8b (IMPLEMENTED 2026-06-16):** opt-in `--secure` hardening — capability
+  drop (`capset`, no libcap), `NO_NEW_PRIVS`, seccomp BPF allow-list
+  (`prctl(PR_SET_SECCOMP)`, no libseccomp), read-only `/sys`; plus atomic
+  state writes and container-ID collision retry. See Decisions #36 and
+  #37, and Error #26.
+- **8c (designed, not yet implemented):** OCI runtime-spec compliance
+  (`config.json`, bundle format), minimal image extraction from tarballs.
 
 ---
 

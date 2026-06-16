@@ -84,9 +84,32 @@ int mkdir_p(const char *path, mode_t mode) {
     return -1;
 }
 
+/*
+ * Replace Phase 7b's state_save body with this atomic version.
+ * Signature unchanged — callers see no difference.
+ *
+ * The JSON-emit block ("fprintf(f, ...)" lines) is byte-for-byte the
+ * shipped state.c serializer — INCLUDING the *_ns namespace key names.
+ * (Phase 7b bug fix: find_key() is naive strstr, so a bare "pid" bool
+ * key shadow-matches the top-level integer "pid".  Do not regress
+ * this by "simplifying" the keys back.)  Only the surrounding I/O
+ * changes: write to a hidden tempfile, fflush + fsync, then rename(2).
+ *
+ * Deliberately KEPT from the Phase 7b version:
+ *   - the leading idempotent mkdir_p.  test_state.c calls state_save
+ *     directly without state_claim_id; after a claim it is a no-op.
+ *   - the trailing pidfile write (state.h contract: "state.json +
+ *     pidfile").  Best-effort plain write, unchanged — it is one
+ *     short line; the partial-read race lives in the multi-line JSON.
+ */
 int state_save(const container_state_t *s) {
-    char dir[PATH_MAX], state_path[PATH_MAX], pidfile[PATH_MAX];
+    if (s == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
 
+    char dir[PATH_MAX], tmp_path[PATH_MAX], final_path[PATH_MAX];
+    char pidfile[PATH_MAX];
     state_dir_path(s->id, dir, sizeof(dir));
     mkdir_p(dir, 0755);
 
@@ -94,8 +117,13 @@ int state_save(const container_state_t *s) {
      * state_dir_root() + id exceeded PATH_MAX, which the runtime can't
      * recover from — bail and let the caller treat as save failure. */
     int n;
-    n = snprintf(state_path, sizeof(state_path), "%s/state.json", dir);
-    if (n < 0 || (size_t)n >= sizeof(state_path)) {
+    n = snprintf(tmp_path, sizeof(tmp_path), "%s/.state.json.tmp", dir);
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        fprintf(stderr, "state_save: tmp_path truncated for id %s\n", s->id);
+        return -1;
+    }
+    n = snprintf(final_path, sizeof(final_path), "%s/state.json", dir);
+    if (n < 0 || (size_t)n >= sizeof(final_path)) {
         fprintf(stderr, "state_save: state_path truncated for id %s\n", s->id);
         return -1;
     }
@@ -105,12 +133,13 @@ int state_save(const container_state_t *s) {
         return -1;
     }
 
-    FILE *f = fopen(state_path, "w");
+    FILE *f = fopen(tmp_path, "w");
     if (!f) {
-        perror("fopen(state.json)");
+        perror("fopen(.state.json.tmp)");
         return -1;
     }
 
+    /* === BEGIN: byte-for-byte the shipped Phase 7b/8a JSON emit === */
     fprintf(f,
         "{\n"
         "  \"id\":          \"%s\",\n"
@@ -158,8 +187,25 @@ int state_save(const container_state_t *s) {
         fprintf(f, "  \"veth\": null\n");
     }
     fprintf(f, "}\n");
+    /* === END: byte-for-byte JSON emit === */
+
+    if (fflush(f) != 0 || fsync(fileno(f)) < 0) {
+        perror("fflush/fsync(.state.json.tmp)");
+        fclose(f);
+        unlink(tmp_path);
+        return -1;
+    }
     fclose(f);
 
+    /* The atomic step: rename(2) is atomic on the same filesystem. */
+    if (rename(tmp_path, final_path) < 0) {
+        perror("rename(.state.json.tmp -> state.json)");
+        unlink(tmp_path);
+        return -1;
+    }
+    /* /run is tmpfs — no need to fsync the directory for durability. */
+
+    /* pidfile — unchanged from Phase 7b (best-effort plain write). */
     FILE *pf = fopen(pidfile, "w");
     if (pf) {
         fprintf(pf, "%d\n", s->pid);
@@ -167,6 +213,43 @@ int state_save(const container_state_t *s) {
     }
 
     return 0;
+}
+
+/*
+ * NEW Phase 8b. Generate a container ID and create its state directory
+ * atomically. Retries up to 3 times on EEXIST.
+ *
+ * Calls mkdir_p for the parent (state_dir_root() may be a nested path
+ * like /run/user/<uid>/minicontainer), then a plain mkdir for the per-
+ * container leaf — the leaf mkdir is the one that surfaces EEXIST as
+ * a collision signal.
+ */
+int state_claim_id(char id_out[CONTAINER_ID_LEN+1]) {
+    /* mkdir_p the root once (idempotent). */
+    if (mkdir_p(state_dir_root(), 0755) < 0 && errno != EEXIST) {
+        perror("mkdir_p(state_dir_root)");
+        return -1;
+    }
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        generate_container_id(id_out);
+
+        char dir[PATH_MAX];
+        state_dir_path(id_out, dir, sizeof(dir));
+
+        /* mkdir() the per-container leaf. EEXIST = collision; retry. */
+        if (mkdir(dir, 0755) == 0) {
+            return 0;
+        }
+        if (errno != EEXIST) {
+            perror("mkdir(state_dir/<id>)");
+            return -1;
+        }
+        /* Collision — regenerate and try again. */
+    }
+
+    errno = EEXIST;
+    return -1;
 }
 
 /* Hand-rolled JSON parser. We don't link jansson/cJSON — the schema

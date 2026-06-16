@@ -20,7 +20,20 @@ Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `insp
 
 ## Features
 
-### Phase 8a (Current)
+### Phase 8b (Current)
+
+- ✅ **Opt-in `--secure` hardening** — a single flag layers capability dropping, `NO_NEW_PRIVS`, a seccomp BPF allow-list, and a read-only `/sys` onto a container. **Default behavior is unchanged** when `--secure` is absent — every prior-phase invocation and test is byte-for-byte unaffected. `--secure` requires `--rootfs`.
+- ✅ **Capability dropping — raw syscalls, no libcap** — drops every capability except a 14-entry set matching Docker's default profile, via `prctl(PR_CAPBSET_DROP)` for the bounding set plus `capset(2)` (`_LINUX_CAPABILITY_VERSION_3`) for permitted/effective/inheritable. A dropped bounding-set cap can never be reacquired, even by a setuid binary.
+- ✅ **Seccomp BPF allow-list — raw syscalls, no libseccomp** — a hand-assembled `struct sock_filter` program (~165 allow-listed syscalls) installed via `prctl(PR_SET_SECCOMP)`. Architecture-locked to x86_64 (`AUDIT_ARCH_X86_64`); default action is `EPERM` (the process survives a blocked call rather than being killed). `clone3` gets a dedicated `ENOSYS` return so glibc's `pthread_create` falls back to `clone` instead of breaking; `unshare`/`setns` are excluded.
+- ✅ **Deliberate cap-vs-seccomp asymmetry** — `CAP_SYS_CHROOT` and `CAP_MKNOD` are kept for Docker-profile parity, but `chroot`/`mknod` are denied by the seccomp layer anyway (chroot is a classic escape primitive; minicontainer has no device-cgroup controller to mitigate raw device nodes). When two defense layers disagree, the stricter wins. See decisions.md #36.
+- ✅ **`NO_NEW_PRIVS` before seccomp** — `prctl(PR_SET_NO_NEW_PRIVS, 1)` is set first because the kernel requires it (or `CAP_SYS_ADMIN`, which is dropped) to install an unprivileged seccomp filter.
+- ✅ **Read-only `/sys`** — `mount_sys_ro` mounts sysfs `MS_RDONLY` under `--secure` (mkdir's `/sys` first since the minimal rootfs has none). Fails closed: no user-namespace graceful degradation, because silently skipping a hardening step would deliver less security than promised.
+- ✅ **Atomic state-file writes** — `state_save` now writes `.state.json.tmp`, `fflush`+`fsync`, then `rename(2)` (atomic on the same filesystem), eliminating the partial-read race a concurrent `list`/`inspect` could hit. Same signature; `pidfile` write and `mkdir_p` preserved.
+- ✅ **Container-ID collision retry** — `state_claim_id()` generates an ID, `mkdir`s its state dir, and retries up to 3× on `EEXIST` (the birthday-paradox case Phase 7b crashed on). `cmd_run`/`cmd_start` call it before `state_save`.
+- ✅ **New `hardening` module** (`hardening.h`/`hardening.c`) — `drop_capabilities`, `apply_no_new_privs`, `apply_seccomp_filter`, applied last in `child_func` (after all cap-needing setup, before `execve`), gated on `enable_hardening`. Plus `test_hardening` (forked-child cap/seccomp/clone3 checks + `state_claim_id` uniqueness), wired into `make test`.
+- ✅ **Verified against a real userland** — under `--secure`, an Ubuntu 22.04 rootfs runs glibc coreutils and `python3` (exercising `statx`/`rseq`/`getrandom`/`futex`) cleanly, while `mount`/`chroot`/`unshare` are denied — confirming the allow-list is broad enough for real software yet still blocks escape primitives.
+
+### Phase 8a
 
 - ✅ **Process inspection via libprocfs** — `inspect` is now a full live report (`/proc` status + fds/threads/sockets + cgroup stats); new `stats` (one-shot, `-c` for a refresh loop), `top` (process tree via `nsenter`), and `netstat` (`-v` for the per-socket table) subcommands. The container-aware glue is `inspector.c`.
 - ✅ **cgroup v2 read side** — `read_cgroup_stats` parses `memory.current/peak/max`, `cpu.stat`, and `pids.current/max` (literal `"max"` → unlimited), complementing the existing write-side `cgroup.c`.
@@ -223,6 +236,31 @@ sudo ./minicontainer run --interactive --pid --rootfs ./ubuntu-root /bin/sh
 # inside: nano /tmp/test.txt   # opens cleanly, save/exit Ctrl-O / Ctrl-X
 #         sleep 100; ^C; echo $?   # 130 (= 128 + SIGINT 2) — signals reach the container
 ```
+
+#### Phase 8b — hardening (`--secure`, opt-in)
+
+```bash
+# Drop caps + NO_NEW_PRIVS + seccomp + read-only /sys. Requires --rootfs.
+sudo ./minicontainer run --secure --pid --rootfs ./rootfs /bin/sh -c \
+    'grep -E "^(CapEff|NoNewPrivs|Seccomp):" /proc/self/status'
+# CapEff:    00000000a80425fb   (reduced 14-cap set, NOT the all-ones 000001ffffffffff)
+# NoNewPrivs: 1
+# Seccomp:    2                 (filter mode)
+
+# Dangerous syscalls are denied even though the container is "root":
+sudo ./minicontainer run --secure --pid --rootfs ./rootfs /bin/sh -c \
+    'mount -t tmpfs none /mnt 2>&1; chroot / /bin/true 2>&1'
+# mount: ... Operation not permitted     (seccomp: mount excluded)
+# chroot: ... Operation not permitted     (seccomp denies it despite kept CAP_SYS_CHROOT)
+
+# Without --secure, behavior is exactly as in prior phases (no regression):
+sudo ./minicontainer run --pid --rootfs ./rootfs /bin/sh -c \
+    'grep CapEff /proc/self/status'   # CapEff: 000001ffffffffff (full set)
+```
+> `--secure` requires `--rootfs` (hardening only makes sense with its own
+> mount namespace). Under `--user`, `--secure` also needs `--net`, because
+> the kernel only permits a read-only `/sys` mount when the user namespace
+> owns the network namespace.
 
 #### Phase 0–7a flag examples (still work via implicit-run)
 
@@ -1453,8 +1491,8 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] `build_rootfs.sh` bundles xterm terminfo (so ncurses-linked binaries find their terminal description files inside the container)
 
 ### 📋 Phase 8: Inspector + Hardening + OCI Bundles
-- [ ] **8a:** Static `libprocfs.a` extracted as a sibling project; cgroup read-side + `/proc` parsing reused by container `inspect` / `stats` / `top` / `netstat` subcommands
-- [ ] **8b:** Production hardening — opt-in `--secure` flag: capability dropping (raw `capset(2)`, no libcap), `PR_SET_NO_NEW_PRIVS`, seccomp BPF allow-list (raw `prctl(PR_SET_SECCOMP)`, no libseccomp), read-only `/sys`, atomic state-file writes, container ID collision retry
+- [x] **8a:** Static `libprocfs.a` extracted as a sibling project; cgroup read-side + `/proc` parsing reused by container `inspect` / `stats` / `top` / `netstat` subcommands
+- [x] **8b:** Production hardening — opt-in `--secure` flag: capability dropping (raw `capset(2)`, no libcap), `PR_SET_NO_NEW_PRIVS`, seccomp BPF allow-list (raw `prctl(PR_SET_SECCOMP)`, no libseccomp), read-only `/sys`, atomic state-file writes, container ID collision retry
 - [ ] **8c:** OCI Runtime Spec compliance — hand-rolled `config.json` parser, `--bundle <dir>` flag, minimal `pull <tag>` whitelist (alpine/ubuntu, explicitly not a registry client), `oci-state.json` round-trip with runc-compatible tools
 
 ---
@@ -1465,7 +1503,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 
 ```bash
 make              # Build minicontainer
-make test         # Build and run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5 + 6)
+make test         # Build and run all tests (Phase 0 through 8b: core/mount/overlay/uts/cgroup/net/state/bind/cli/hardening + 8a inspector)
 make clean        # Remove build artifacts
 make debug        # Build with debug symbols (-g)
 make valgrind     # Run memory leak detection

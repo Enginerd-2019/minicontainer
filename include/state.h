@@ -103,4 +103,20 @@ int state_remove(const char *id);
  */
 int mkdir_p(const char *path, mode_t mode);
 
+/*
+ * Claim a container ID by generating one and creating the state
+ * directory atomically. Retries up to 3 times on EEXIST collisions
+ * before giving up.
+ *
+ * id_out  Output buffer of at least CONTAINER_ID_LEN+1 bytes.
+ *         On success, contains the claimed ID.
+ *
+ * Returns 0 on success, -1 on failure (errno=EEXIST after 3
+ * retries, or whatever errno mkdir set on a real error).
+ *
+ * After this call returns, state_save() can write into the directory
+ * without needing to mkdir.
+ */
+int state_claim_id(char id_out[CONTAINER_ID_LEN+1]);
+
 #endif // STATE_H

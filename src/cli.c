@@ -142,13 +142,14 @@ static int parse_run_flags(int argc, char *argv[],
         {"volume",           required_argument, NULL, 'v'},      /* Phase 7b */
         {"interactive",      no_argument,       NULL, 'i'},      /* Phase 7b */
         {"detach",           no_argument,       NULL, 'D'},      /* Phase 7b */
+        {"secure",           no_argument,       NULL, 'S'},      /* Phase 8b */
         {"env",              required_argument, NULL, 'e'},
         {"help",             no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:uIm:C:P:Nv:iDe:h",
+    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:uIm:C:P:Nv:iDSe:h",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': enable_debug = true; break;
@@ -191,6 +192,9 @@ static int parse_run_flags(int argc, char *argv[],
                 break;
             case 'i': enable_pty = true; break;
             case 'D': detach = true; break;
+            case 'S':
+                out_cfg->enable_hardening = true;
+                break;
             case 'e':
                 if (*env_count >= MAX_ENV_ENTRIES - 1) {
                     fprintf(stderr, "Too many --env entries\n");
@@ -226,6 +230,17 @@ static int parse_run_flags(int argc, char *argv[],
      * Detached container has no terminal to connect a PTY to. */
     if (enable_pty && detach) {
         fprintf(stderr, "Error: --interactive and --detach are mutually exclusive\n");
+        return 1;
+    }
+
+    // Phase 8b invariant: --secure requires --rootfs.  Use the LOCAL
+    // rootfs_path (like the --overlay check above): out_cfg->rootfs_path
+    // is not assigned until the config-build block below, so checking it
+    // here would always read NULL and reject every --secure run.
+    if (out_cfg->enable_hardening && !rootfs_path) {
+        fprintf(stderr,
+            "Error: --secure requires --rootfs "
+            "(hardening only makes sense with its own mount namespace)\n");
         return 1;
     }
 
@@ -367,7 +382,11 @@ int cmd_run(int argc, char *argv[]) {
      * cgroup, and veth naming all agree on it.  (Without this,
      * setup_overlay aborts with "container_id is required" — Error #24.) */
     container_state_t state = {0};
-    generate_container_id(state.id);
+    if (state_claim_id(state.id) < 0) {
+        fprintf(stderr, "Failed to claim container ID: %s\n", strerror(errno));
+        free(container_env);
+        return 1;
+    }
     strncpy(cfg.container_id, state.id, sizeof(cfg.container_id) - 1);
     cfg.container_id[sizeof(cfg.container_id) - 1] = '\0';
     state_from_config(&cfg, &state);
@@ -521,7 +540,11 @@ int cmd_start(int argc, char *argv[]) {
      * overlay/cgroup/veth naming agree (Error #24 — setup_overlay needs
      * cfg.container_id). */
     container_state_t state = {0};
-    generate_container_id(state.id);
+    if (state_claim_id(state.id) < 0) {
+        fprintf(stderr, "Failed to claim container ID: %s\n", strerror(errno));
+        free(container_env);
+        return 1;
+    }
     strncpy(cfg.container_id, state.id, sizeof(cfg.container_id) - 1);
     cfg.container_id[sizeof(cfg.container_id) - 1] = '\0';
     state_from_config(&cfg, &state);
@@ -879,6 +902,7 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  --no-nat                 Disable iptables MASQUERADE\n");
     fprintf(stderr, "  --volume host:cont[:ro]  Bind mount (Phase 7b)\n");
     fprintf(stderr, "  --interactive            Allocate PTY (run only)\n");
+    fprintf(stderr, "  --secure                 Drop caps + NO_NEW_PRIVS + seccomp + RO /sys (Phase 8b)\n");
     fprintf(stderr, "  --env KEY=VALUE          Set environment variable\n");
     fprintf(stderr, "  --help                   Show this help\n\n");
     fprintf(stderr, "Backwards compat: %s [options] <command> [args]\n", progname);

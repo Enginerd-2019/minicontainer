@@ -87,4 +87,19 @@ int bind_mount_apply(const bind_mount_t *m, const char *root_prefix,
  */
 int mount_devpts(bool enable_debug, bool user_namespace_active);
 
+/*
+ * Mount /sys as read-only inside the container's mount namespace.
+ * Called AFTER mount_proc but BEFORE configure_container_net.
+ *
+ * Creates /sys first (idempotent mkdir) — the build_rootfs.sh
+ * minimal rootfs has no /sys directory.  If sysfs is already
+ * mounted (EBUSY), remounts it read-only instead.
+ *
+ * Phase 8b — used only when enable_hardening is true.  Fails closed:
+ * no user-namespace graceful degradation (see §11.10).
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int mount_sys_ro(bool enable_debug);
+
 #endif // MOUNT_H

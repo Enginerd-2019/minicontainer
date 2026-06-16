@@ -37,7 +37,8 @@ HELPER_OBJS = $(BUILD_DIR)/core.o $(BUILD_DIR)/env.o \
               $(BUILD_DIR)/mount.o $(BUILD_DIR)/state.o \
               $(BUILD_DIR)/pty.o $(BUILD_DIR)/cli.o \
               $(BUILD_DIR)/cleanup.o \
-              $(BUILD_DIR)/inspector.o    # NEW in 8a
+              $(BUILD_DIR)/inspector.o \
+              $(BUILD_DIR)/hardening.o
 
 # Executables
 MINICONTAINER  = minicontainer
@@ -50,6 +51,7 @@ TEST_NET       = test_net
 TEST_STATE     = test_state
 TEST_BIND      = test_bind
 TEST_CLI       = test_cli
+TEST_HARDENING = test_hardening
 
 # Default target
 .PHONY: all
@@ -125,10 +127,14 @@ $(TEST_CLI): $(BUILD_DIR)/test_cli.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_CLI) successfully!"
 
+$(TEST_HARDENING): $(BUILD_DIR)/test_hardening.o $(HELPER_OBJS) $(LIBPROCFS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_HARDENING) successfully!"
+
 # Build and run all tests
 .PHONY: test
 test: $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
-      $(TEST_STATE) $(TEST_BIND) $(TEST_CLI)
+      $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING)
 	@echo "=== Running Phase 7a core tests (bare_exec + pid_only, requires root) ==="
 	sudo ./$(TEST_CORE)
 	@echo ""
@@ -163,6 +169,9 @@ test: $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TE
 	@echo ""
 	@echo "=== Running Phase 8a inspector integration test (requires root + ./rootfs) ==="
 	sudo bash tests/test_inspector.sh
+	@echo ""
+	@echo "=== Running Phase 8b hardening tests (caps/seccomp; root runs the cap cases, unprivileged subset SKIPs them) ==="
+	sudo ./$(TEST_HARDENING)
 
 # Build with debug symbols
 .PHONY: debug
@@ -230,7 +239,7 @@ uninstall-apparmor:
 clean:
 	@rm -rf $(BUILD_DIR)
 	@rm -f $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
-	       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI)
+	       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING)
 	@echo "Cleaned build artifacts"
 
 # Run example commands

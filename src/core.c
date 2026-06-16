@@ -17,6 +17,7 @@
 #include <sys/resource.h>
 #include <dirent.h>
 #include "pty.h"
+#include "hardening.h"   // Phase 8b: drop_capabilities / apply_no_new_privs / apply_seccomp_filter
 
 #define STACK_SIZE (1024 * 1024)
 
@@ -45,6 +46,7 @@ typedef struct {
     int  pty_sock_fd;         // Child's end of socketpair; -1 if no PTY
     int  stdout_fd;           // -1 = leave alone
     int  stderr_fd;           // -1 = leave alone
+    bool enable_hardening;    // Phase 8b: gates cap drop / NO_NEW_PRIVS / seccomp (and mount_sys_ro)
 } child_args_t;
 
 /**
@@ -98,7 +100,8 @@ static void close_inherited_fds(bool enable_debug) {
  *   6. close_inherited_fds() — CVE-2024-21626/CVE-2016-9962 mitigation
  *   7. execve(program, argv, envp)
  */
-static int child_func(void *arg) {
+static int child_func(void *arg)
+{
     child_args_t *args = (child_args_t *)arg;
 
     /* 1. Sync wait (parent signals when UID/GID maps + veth setup done). */
@@ -123,7 +126,7 @@ static int child_func(void *arg) {
                getpid(), getuid(), getgid());
     }
 
-    /* 2. Hostname. */
+    /* 2. Hostname (Phase 4). */
     if (args->hostname) {
         if (setup_uts(args->hostname, args->enable_debug) < 0) {
             fprintf(stderr, "[child] Failed to setup UTS\n");
@@ -131,10 +134,10 @@ static int child_func(void *arg) {
         }
     }
 
-    /* 3+4. Rootfs + bind mounts + /proc.  Bind mounts are applied
-     * INSIDE setup_rootfs, before pivot_root, because the host source
-     * paths stop resolving once the old root is detached (Error #22).
-     * /proc is mounted afterward so it can't be shadowed by a bind. */
+    /* 3. Rootfs + bind mounts + /proc + (8b NEW) /sys-ro.  Bind mounts
+     * are applied INSIDE setup_rootfs, before pivot_root — the host
+     * source path stops resolving once the old root is detached
+     * (Phase 7b, decisions.md Error #22). */
     if (args->rootfs_path) {
         if (setup_rootfs(args->rootfs_path, args->mounts,
                          args->mount_count, args->enable_debug) < 0) {
@@ -142,6 +145,7 @@ static int child_func(void *arg) {
             return 1;
         }
 
+        /* 4. /proc with Phase 4b graceful degradation. */
         if (mount_proc(args->enable_debug) < 0) {
             if (args->user_namespace_active) {
                 fprintf(stderr,
@@ -153,24 +157,33 @@ static int child_func(void *arg) {
             }
         }
 
-        /* Mount a private devpts instance.  Runs whenever a rootfs is
-         * set, regardless of --interactive — every container with its
-         * own mount namespace gets a working pty subsystem so
-         * curses-based and pty-allocating programs (apt, nano, less)
-         * work even non-interactively.  Graceful degradation under
-         * user namespace, same shape as mount_proc. */
+        /* 4b. Private devpts instance (Phase 7b §7.2.2).  Runs whenever a
+         * rootfs is set, regardless of --interactive — every container
+         * gets a working pty subsystem so curses-based / pty-allocating
+         * programs (apt, nano, less) work even non-interactively.
+         * Graceful degradation under user namespace, same shape as
+         * mount_proc. */
         if (mount_devpts(args->enable_debug,
                          args->user_namespace_active) < 0) {
             fprintf(stderr, "[child] Failed to mount devpts\n");
             return 1;
         }
+
+        /* 5 (Phase 8b — NEW): /sys read-only when hardening.
+         * Sits between the mount block and configure_container_net. */
+        if (args->enable_hardening) {
+            if (mount_sys_ro(args->enable_debug) < 0) {
+                fprintf(stderr, "[child] Failed to mount /sys read-only\n");
+                return 1;
+            }
+        }
     }
 
-    /* Allocate a PTY inside the container (--interactive).  Must run
-     * after mount_devpts so /dev/ptmx points at the newinstance
-     * master multiplexer.  Master fd is sent back to the parent via
-     * SCM_RIGHTS on the pre-clone socketpair; child keeps slave fd
-     * for pty_set_ctty. */
+    /* 6. PTY / log fd wiring (Phase 7b §7.3).  The pair is allocated
+     * child-side after mount_devpts and the master fd is handed back to
+     * the parent via SCM_RIGHTS — there is NO pty_slave_path field on
+     * container_config_t (the cycle-0 path-passing design was broken;
+     * see Phase 7b guide §2.4). */
     pty_pair_t pty = { .master_fd = -1, .slave_fd = -1, .slave_path = {0} };
     if (args->enable_pty) {
         if (pty_open_in_child(&pty, args->enable_debug) < 0) {
@@ -179,47 +192,53 @@ static int child_func(void *arg) {
         }
         if (pty_send_master(args->pty_sock_fd, pty.master_fd) < 0) {
             fprintf(stderr, "[child] Failed to send PTY master to parent\n");
-            close(pty.master_fd);
-            close(pty.slave_fd);
+            close(pty.master_fd); close(pty.slave_fd);
             return 1;
         }
-        /* Parent now owns a duplicate of master_fd; child has no
-         * further need for its copy.  slave_fd stays open until
-         * pty_set_ctty dup2s it over stdio. */
-        close(pty.master_fd);
-        pty.master_fd = -1;
-
-        /* Done with the socketpair endpoint.  Close before
-         * close_inherited_fds runs so the latter doesn't try to
-         * close it twice. */
-        close(args->pty_sock_fd);
-        args->pty_sock_fd = -1;
-
+        close(pty.master_fd); pty.master_fd = -1;
+        close(args->pty_sock_fd); args->pty_sock_fd = -1;
         if (pty_set_ctty(pty.slave_fd) < 0) {
             fprintf(stderr, "[child] Failed to set PTY as ctty\n");
             return 1;
         }
-        /* pty_set_ctty dup2'd slave_fd over stdio and closed it. */
     } else {
-        /* Detached mode: dup the log fds over stdout/stderr.  PTY
-         * mode already replaced stdio via pty_set_ctty. */
         if (args->stdout_fd >= 0) dup2(args->stdout_fd, STDOUT_FILENO);
         if (args->stderr_fd >= 0) dup2(args->stderr_fd, STDERR_FILENO);
     }
 
-    /* 5. Network configuration (Phase 6). */
+    /* 7. Network configuration (Phase 6 / Phase 7a). */
     if (args->network_active) {
         if (configure_container_net(&args->net_ctx, &args->veth,
                                     args->enable_debug) < 0) {
-            fprintf(stderr, "[child] Failed to configure container network\n");
+            fprintf(stderr,
+                "[child] Failed to configure container network\n");
             return 1;
         }
     }
 
-    /* 6. Close inherited fds. */
+    /* 8. Close inherited fds — CVE-2024-21626 / CVE-2016-9962. */
     close_inherited_fds(args->enable_debug);
 
-    /* 7. Execute target program. */
+    /* 9-11 (Phase 8b — NEW): hardening, conditional on --secure.
+     * Order is fixed by kernel rules:
+     *   drop_capabilities BEFORE no_new_privs (just convention here)
+     *   no_new_privs      BEFORE seccomp     (kernel requirement) */
+    if (args->enable_hardening) {
+        if (drop_capabilities(args->enable_debug) < 0) {
+            fprintf(stderr, "[child] Failed to drop capabilities\n");
+            return 1;
+        }
+        if (apply_no_new_privs(args->enable_debug) < 0) {
+            fprintf(stderr, "[child] Failed to set NO_NEW_PRIVS\n");
+            return 1;
+        }
+        if (apply_seccomp_filter(args->enable_debug) < 0) {
+            fprintf(stderr, "[child] Failed to install seccomp filter\n");
+            return 1;
+        }
+    }
+
+    /* 12. Execute target program. */
     execve(args->program, args->argv, args->envp);
     perror("execve");
     return 127;
@@ -433,7 +452,8 @@ container_result_t container_start(const container_config_t *config) {
         .enable_pty = config->enable_pty,
         .pty_sock_fd = pty_sock[1],            // -1 if !enable_pty (init value)
         .stdout_fd = config->stdout_fd,
-        .stderr_fd = config->stderr_fd
+        .stderr_fd = config->stderr_fd,
+        .enable_hardening = config->enable_hardening   // Phase 8b
     };
     if (config->mount_count > 0) {
         memcpy(child_args.mounts, config->mounts,

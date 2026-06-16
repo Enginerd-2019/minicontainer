@@ -283,3 +283,46 @@ int mount_devpts(bool enable_debug, bool user_namespace_active) {
     }
     return 0;
 }
+
+/*
+ * Mount /sys as read-only inside the container's mount namespace.
+ * Used by child_func when enable_hardening is true.
+ *
+ * Mounting /sys at all requires we're inside a new mount namespace
+ * (which we are — clone() with CLONE_NEWNS).
+ */
+int mount_sys_ro(bool enable_debug)
+{
+    /* The build_rootfs.sh minimal rootfs ships NO /sys directory at
+     * all (its mkdir list is bin/lib/lib64/proc/tmp/etc), so without
+     * this the mount below fails ENOENT before the EBUSY logic ever
+     * runs and the child aborts.  Same idempotent-mkdir move
+     * mount_devpts makes for /dev/pts. */
+    if (mkdir("/sys", 0755) < 0 && errno != EEXIST) {
+        perror("mkdir(/sys)");
+        return -1;
+    }
+
+    if (mount("sysfs", "/sys", "sysfs",
+              MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              NULL) < 0) {
+        if (errno == EBUSY) {
+            /* Already mounted (rootfs may have included it). Remount RO. */
+            if (mount(NULL, "/sys", NULL,
+                      MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID |
+                      MS_NODEV | MS_NOEXEC,
+                      NULL) < 0) {
+                perror("mount(/sys, remount-ro)");
+                return -1;
+            }
+        } else {
+            perror("mount(/sys, RO)");
+            return -1;
+        }
+    }
+
+    if (enable_debug) {
+        fprintf(stderr, "[mount] /sys mounted read-only\n");
+    }
+    return 0;
+}

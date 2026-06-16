@@ -79,6 +79,9 @@ typedef struct {
     bool detach;
     int  stdout_fd;            // -1 = inherit; cmd_start writes to log file
     int  stderr_fd;            // -1 = inherit; cmd_start writes to log file
+
+    /* Phase 8b — opt-in security hardening */
+    bool enable_hardening;
 } container_config_t;
 
 /**
