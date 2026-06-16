@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-7b%20CLI%20lifecycle-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-8b%2B%20hardening%20%2B%20init-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,19 +12,23 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current Phase:** Phase 7b — CLI Lifecycle, State Files, Bind Mounts, PTY
+**Current state:** Phases 0–8b shipped, plus the Phase 8b+ `--init` supervisor. The latest work is opt-in **production hardening** (`--secure`) and an opt-in **`--init`** PID-1 supervisor.
 
-Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`), runtime state files at `/run/minicontainer/<id>/` with `state.json`+`pidfile`+`logs/`, detached containers, bind mounts via `--volume`, full interactive PTY via `--interactive` (private newinstance devpts inside every container; master fd handed back from child to parent via SCM_RIGHTS), and a `cleanup` subcommand that sweeps stale state directories, cgroups, host veth interfaces, iptables MASQUERADE rules, and overlay debris. Phase 7a's monolithic `container_exec()` splits into `container_start()` + `container_wait()` so the CLI can write the state file between launch and reap (and so `cmd_start` can exit immediately after launch for detached mode). `main.c` drops from ~340 lines to ~60 — pure dispatcher over a `parse_subcommand` switch with an implicit-run fallback that keeps every Phase 0–7a invocation pattern (`./minicontainer --pid /bin/sh`) working unchanged.
+Built phase by phase, each adding one isolation or production concern: PID / mount / UTS / user / IPC / network namespaces (Phases 1–6); OverlayFS copy-on-write plus CVE-2024-21626-class fd hygiene (Phase 3); cgroup v2 resource limits (Phase 5); an execution-core refactor that collapsed the per-phase `*_exec()` duplication into one `container_start` / `container_wait` (7a); a full CLI and lifecycle surface — `run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`, runtime state files at `/run/minicontainer/<id>/`, bind mounts, and an interactive PTY (7b); live process introspection through the reusable `libprocfs` static library — `inspect` / `stats` / `top` / `netstat` (8a); opt-in security hardening via `--secure` — hand-rolled capability dropping, `NO_NEW_PRIVS`, a seccomp BPF allow-list, and a read-only `/sys`, all from raw syscalls with no libcap/libseccomp (8b); and an opt-in `--init` PID-1 supervisor that forwards signals and reaps zombies so `stop` is prompt instead of waiting out the 10 s grace timer (8b+). The opt-in flags change nothing when absent, and every earlier phase's tests still run as regression baselines.
 
 ---
 
 ## Features
 
-### Phase 8b (Current)
+### Phase 8b+ (Current)
+
+- ✅ **Opt-in `--init` PID-1 supervisor** — an in-process tini-style init (no bundled binary). With `--init`, the workload runs as PID 2 under a supervisor (PID 1) that forwards `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP`/`SIGUSR1`/`SIGUSR2` to it, reaps orphaned grandchildren via a blocking `waitpid(-1)` loop, and mirrors the workload's exit status (re-raising a terminating signal so the host sees the same `WIFSIGNALED`). Fixes the PID-1 signal-drop problem (`man 7 pid_namespaces`): a workload that is PID 1 and installs no `SIGTERM` handler silently ignores `stop`'s ancestor signal, so `stop` always elapses its 10 s grace timer then force-kills. Measured: `stop` of a `sleep 60` returns in **0.10 s** with `--init` vs **10.02 s** (then a forced `SIGKILL`) without. Opt-in and independent of `--secure`; the two compose (the supervisor's `fork` issues `clone`, which the seccomp allow-list permits). Module `init.h`/`init.c`; `test_init` covers exit-code propagation, signal-death mirroring, and signal forwarding — no root needed.
+
+### Phase 8b
 
 - ✅ **Opt-in `--secure` hardening** — a single flag layers capability dropping, `NO_NEW_PRIVS`, a seccomp BPF allow-list, and a read-only `/sys` onto a container. **Default behavior is unchanged** when `--secure` is absent — every prior-phase invocation and test is byte-for-byte unaffected. `--secure` requires `--rootfs`.
 - ✅ **Capability dropping — raw syscalls, no libcap** — drops every capability except a 14-entry set matching Docker's default profile, via `prctl(PR_CAPBSET_DROP)` for the bounding set plus `capset(2)` (`_LINUX_CAPABILITY_VERSION_3`) for permitted/effective/inheritable. A dropped bounding-set cap can never be reacquired, even by a setuid binary.
-- ✅ **Seccomp BPF allow-list — raw syscalls, no libseccomp** — a hand-assembled `struct sock_filter` program (~165 allow-listed syscalls) installed via `prctl(PR_SET_SECCOMP)`. Architecture-locked to x86_64 (`AUDIT_ARCH_X86_64`); default action is `EPERM` (the process survives a blocked call rather than being killed). `clone3` gets a dedicated `ENOSYS` return so glibc's `pthread_create` falls back to `clone` instead of breaking; `unshare`/`setns` are excluded.
+- ✅ **Seccomp BPF allow-list — raw syscalls, no libseccomp** — a hand-assembled `struct sock_filter` program (210 allow-listed syscalls → 427 instructions) installed via `prctl(PR_SET_SECCOMP)`. Architecture-locked to x86_64 (`AUDIT_ARCH_X86_64`); default action is `EPERM` (the process survives a blocked call rather than being killed). `clone3` gets a dedicated `ENOSYS` return so glibc's `pthread_create` falls back to `clone` instead of breaking; `unshare`/`setns` are excluded.
 - ✅ **Deliberate cap-vs-seccomp asymmetry** — `CAP_SYS_CHROOT` and `CAP_MKNOD` are kept for Docker-profile parity, but `chroot`/`mknod` are denied by the seccomp layer anyway (chroot is a classic escape primitive; minicontainer has no device-cgroup controller to mitigate raw device nodes). When two defense layers disagree, the stricter wins. See decisions.md #36.
 - ✅ **`NO_NEW_PRIVS` before seccomp** — `prctl(PR_SET_NO_NEW_PRIVS, 1)` is set first because the kernel requires it (or `CAP_SYS_ADMIN`, which is dropped) to install an unprivileged seccomp filter.
 - ✅ **Read-only `/sys`** — `mount_sys_ro` mounts sysfs `MS_RDONLY` under `--secure` (mkdir's `/sys` first since the minimal rootfs has none). Fails closed: no user-namespace graceful degradation, because silently skipping a hardening step would deliver less security than promised.
@@ -49,7 +53,7 @@ Phase 7b ships the subcommand surface (`run` / `start` / `stop` / `exec` / `insp
 - ✅ **`stop <id>`** — SIGTERM then SIGKILL after a configurable timeout (default 10 s).
 - ✅ **`exec <id> <cmd>`** — `setns(2)` into the existing container's namespaces, then `clone(SIGCHLD, …)` with **no `CLONE_NEW*` flags** so the new child inherits the joined namespaces rather than creating fresh ones. Namespaces the caller already shares with the container are skipped (identity compared via `st_dev`/`st_ino` of `/proc/<pid>/ns/<type>` vs `/proc/self/ns/<type>`) — without that skip, joining your own user namespace returns `EINVAL` and breaks `exec` for any container not started with `--user`.
 - ✅ **`list`** — walks `/run/minicontainer/`, prints ID / PID / started_at / command for every alive container.
-- ✅ **`inspect <id>`** — pretty-prints `state.json`. (Live runtime introspection lands in Phase 8a.)
+- ✅ **`inspect <id>`** — pretty-prints `state.json`. (Live runtime introspection landed in Phase 8a — see above.)
 - ✅ **`cleanup`** — sweeps stale state dirs, orphan cgroups (`/sys/fs/cgroup/minicontainer_*` with empty `cgroup.procs`), orphan `veth_h_*` interfaces, stale iptables MASQUERADE rules, and orphan overlay directories. Liveness via `kill(pid, 0) == 0`.
 - ✅ **`--volume host:container[:ro]`** bind mounts. Applied inside `setup_rootfs` **before `pivot_root`**, onto `<rootfs><container_path>` — the host source path stops resolving once the old root is detached, so the bind must happen while it's still reachable (the pivot then carries the mount into the container). `/proc` is mounted afterward so a bind can't shadow it. Read-only uses the two-call `mount(MS_BIND)` + `mount(MS_BIND|MS_REMOUNT|MS_RDONLY)` pattern — the kernel silently ignores `MS_RDONLY` on the initial MS_BIND.
 - ✅ **`--interactive` / `-i` PTY** — newinstance `devpts` mounted inside the container with `mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666,mode=0620,gid=5")`; `/dev/ptmx` symlinked to `/dev/pts/ptmx`; PTY pair allocated *inside* the child after `mount_devpts`; master fd handed back to the parent via `SCM_RIGHTS` on a pre-clone `socketpair(AF_UNIX, SOCK_STREAM, 0, sv)`; parent drives `pty_forward`. Line editing, Ctrl-C forwarding, and curses-based tools (`nano`, `vim`, `less`, `top`) all work.
@@ -395,6 +399,9 @@ make valgrind
 ```
 minicontainer/
 ├── include/
+│   ├── init.h                # Phase 8b+: run_init_supervisor (--init PID-1 shim)
+│   ├── hardening.h           # Phase 8b: drop_capabilities, apply_no_new_privs, apply_seccomp_filter
+│   ├── inspector.h           # Phase 8a: container inspect/stats/top/netstat (libprocfs glue)
 │   ├── cli.h                # Phase 7b: subcommand_t enum, parse_subcommand, cmd_* declarations
 │   ├── state.h              # Phase 7b: container_state_t, generate_container_id, state_save/load/list/remove, mkdir_p
 │   ├── pty.h                # Phase 7b: pty_pair_t, pty_open_in_child, pty_send_master, pty_recv_master, pty_set_ctty, pty_forward
@@ -407,6 +414,9 @@ minicontainer/
 │   ├── uts.h                # Phase 4/4b/4c: setup_uts(), setup_user_namespace_mapping(), user_ns_mapping_t (since 7a)
 │   └── overlay.h            # Phase 3 + 7b: setup_overlay() takes container_id (canonical ID threading), teardown_overlay()
 ├── src/
+│   ├── init.c               # Phase 8b+: PID-1 init supervisor (signal forward + reap + status mirror)
+│   ├── hardening.c          # Phase 8b: capability drop / NO_NEW_PRIVS / seccomp BPF (raw syscalls)
+│   ├── inspector.c          # Phase 8a: live inspect/stats/top/netstat via libprocfs
 │   ├── main.c               # Phase 7b: ~60-line subcommand dispatcher with implicit-run fallback
 │   ├── cli.c                # Phase 7b: parse_subcommand, cli_usage, parse_run_flags, parse_volume, state_from_config, cmd_run/start/stop/exec/inspect/list/cleanup
 │   ├── state.c              # Phase 7b: state file I/O (hand-rolled JSON), generate_container_id (/dev/urandom), mkdir_p (idempotent)
@@ -420,6 +430,9 @@ minicontainer/
 │   ├── uts.c                # Phase 4/4b: setup_uts, setup_user_namespace_mapping
 │   └── overlay.c            # Phase 3 + 7b: setup_overlay takes container_id param, teardown_overlay (+ static path/dir helpers)
 ├── tests/
+│   ├── test_init.c          # Phase 8b+: forked-supervisor exit-code / signal-death / signal-forwarding (no root)
+│   ├── test_hardening.c     # Phase 8b: forked-child cap/seccomp/clone3 + state_claim_id (root for the cap cases)
+│   ├── test_inspector.sh    # Phase 8a: inspect/stats/top/netstat integration (root + ./rootfs)
 │   ├── test_state.c         # Phase 7b: state file round-trip, missing-ID, list-with-liveness, mkdir_p idempotent (requires root for /run)
 │   ├── test_bind.c          # Phase 7b: directory/file/read-only bind mounts in isolated mount namespaces (unshare CLONE_NEWNS)
 │   ├── test_cli.c           # Phase 7b: parse_subcommand over every known subcommand + 9 negative cases (no root needed)
@@ -429,11 +442,13 @@ minicontainer/
 │   ├── test_uts.c           # Phase 4/4b/4c: UTS + user + IPC namespace tests
 │   ├── test_overlay.c       # Phase 3 + 7b: Overlay tests; base_overlay_config populates container_id (canonical ID)
 │   └── test_mount.c         # Phase 2: Mount/rootfs tests (requires root + rootfs)
+├── third_party/
+│   └── libprocfs/           # Phase 8a: vendored static library (git submodule) — /proc + cgroup v2 read API
 ├── scripts/
 │   └── build_rootfs.sh      # Builds minimal rootfs from host binaries (BINS includes `ip`, `curl`, `python3`, `nano`, `sleep`; bundles xterm terminfo for ncurses binaries; NSS modules + CA bundle for DNS/TLS)
 ├── docs/
-│   └── decisions.md         # Design decisions (now through #34: canonical container-ID source) and error log (Errors #1–#21)
-├── Makefile                 # Build system (HELPER_OBJS picks up state.o / pty.o / cli.o / cleanup.o automatically)
+│   └── decisions.md         # Design decisions (now through #37: hardening + atomic state/claim-id) and error log (Errors #1–#26)
+├── Makefile                 # Build system (HELPER_OBJS aggregates every helper .o — inspector.o / hardening.o / init.o included — and links libprocfs.a)
 └── README.md                # This file
 ```
 
@@ -1475,7 +1490,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] Makefile `HELPER_OBJS` unified link chain — every test links against the same helper set as `minicontainer` (minus `main.o`, plus the test's own `.o`)
 - [x] Zero new user-visible features — pure refactor; every Phase 0-6 test passes behaviorally identical
 
-### ✅ Phase 7b: CLI & Lifecycle + Bind Mounts + PTY (Current)
+### ✅ Phase 7b: CLI & Lifecycle + Bind Mounts + PTY
 - [x] Subcommand dispatch (`run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`) — `parse_subcommand` + `subcommand_t` enum in `cli.c`/`cli.h`; `main.c` is the ~60-line dispatcher
 - [x] Implicit-run fallback for Phase 0–7a invocation patterns (`./minicontainer --pid /bin/sh` still works)
 - [x] Container state files at `/run/minicontainer/<id>/` (root) or `$XDG_RUNTIME_DIR/minicontainer/<id>/` (rootless): `state.json` + `pidfile` + `logs/{stdout,stderr}.log` (detached only)
@@ -1493,6 +1508,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 ### 📋 Phase 8: Inspector + Hardening + OCI Bundles
 - [x] **8a:** Static `libprocfs.a` extracted as a sibling project; cgroup read-side + `/proc` parsing reused by container `inspect` / `stats` / `top` / `netstat` subcommands
 - [x] **8b:** Production hardening — opt-in `--secure` flag: capability dropping (raw `capset(2)`, no libcap), `PR_SET_NO_NEW_PRIVS`, seccomp BPF allow-list (raw `prctl(PR_SET_SECCOMP)`, no libseccomp), read-only `/sys`, atomic state-file writes, container ID collision retry
+- [x] **8b+:** `--init` PID-1 supervisor — in-process tini-style init: forwards signals to the workload and reaps orphaned zombies so `stop` is prompt (opt-in, independent of `--secure`)
 - [ ] **8c:** OCI Runtime Spec compliance — hand-rolled `config.json` parser, `--bundle <dir>` flag, minimal `pull <tag>` whitelist (alpine/ubuntu, explicitly not a registry client), `oci-state.json` round-trip with runc-compatible tools
 
 ---
@@ -1503,7 +1519,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 
 ```bash
 make              # Build minicontainer
-make test         # Build and run all tests (Phase 0 through 8b: core/mount/overlay/uts/cgroup/net/state/bind/cli/hardening + 8a inspector)
+make test         # Build and run all tests (Phase 0 through 8b+: core/mount/overlay/uts/cgroup/net/state/bind/cli/hardening/init + 8a inspector)
 make clean        # Remove build artifacts
 make debug        # Build with debug symbols (-g)
 make valgrind     # Run memory leak detection
