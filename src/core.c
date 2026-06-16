@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include "pty.h"
 #include "hardening.h"   // Phase 8b: drop_capabilities / apply_no_new_privs / apply_seccomp_filter
+#include "init.h"        // Phase 8b+: run_init_supervisor (--init PID-1 shim)
 
 #define STACK_SIZE (1024 * 1024)
 
@@ -47,6 +48,7 @@ typedef struct {
     int  stdout_fd;           // -1 = leave alone
     int  stderr_fd;           // -1 = leave alone
     bool enable_hardening;    // Phase 8b: gates cap drop / NO_NEW_PRIVS / seccomp (and mount_sys_ro)
+    bool enable_init;         // Phase 8b+: wrap workload in the PID-1 init supervisor
 } child_args_t;
 
 /**
@@ -238,7 +240,19 @@ static int child_func(void *arg)
         }
     }
 
-    /* 12. Execute target program. */
+    /* 12 (Phase 8b+): --init wraps the workload in a PID-1 supervisor
+     * (signal forwarding + zombie reaping + status mirroring) instead of
+     * exec'ing it directly.  Placed AFTER hardening so both the
+     * supervisor and the workload inherit the caps/NO_NEW_PRIVS/seccomp
+     * envelope.  run_init_supervisor only returns on a normal workload
+     * exit (with its code) or fork failure; on a signal death it
+     * re-raises and never returns. */
+    if (args->enable_init) {
+        return run_init_supervisor(args->program, args->argv, args->envp,
+                                   args->enable_debug);
+    }
+
+    /* 13. Execute target program. */
     execve(args->program, args->argv, args->envp);
     perror("execve");
     return 127;
@@ -453,7 +467,8 @@ container_result_t container_start(const container_config_t *config) {
         .pty_sock_fd = pty_sock[1],            // -1 if !enable_pty (init value)
         .stdout_fd = config->stdout_fd,
         .stderr_fd = config->stderr_fd,
-        .enable_hardening = config->enable_hardening   // Phase 8b
+        .enable_hardening = config->enable_hardening,  // Phase 8b
+        .enable_init = config->enable_init             // Phase 8b+
     };
     if (config->mount_count > 0) {
         memcpy(child_args.mounts, config->mounts,

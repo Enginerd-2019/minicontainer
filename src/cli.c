@@ -118,6 +118,7 @@ static int parse_run_flags(int argc, char *argv[],
 
     bool enable_pty = false;
     bool detach = false;
+    bool enable_init = false;
 
     *env_count = 0;
     out_cfg->mount_count = 0;
@@ -143,6 +144,7 @@ static int parse_run_flags(int argc, char *argv[],
         {"interactive",      no_argument,       NULL, 'i'},      /* Phase 7b */
         {"detach",           no_argument,       NULL, 'D'},      /* Phase 7b */
         {"secure",           no_argument,       NULL, 'S'},      /* Phase 8b */
+        {"init",             no_argument,       NULL,  5 },      /* Phase 8b+ (long-only) */
         {"env",              required_argument, NULL, 'e'},
         {"help",             no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
@@ -194,6 +196,9 @@ static int parse_run_flags(int argc, char *argv[],
             case 'D': detach = true; break;
             case 'S':
                 out_cfg->enable_hardening = true;
+                break;
+            case 5:   /* --init (long-only) */
+                enable_init = true;
                 break;
             case 'e':
                 if (*env_count >= MAX_ENV_ENTRIES - 1) {
@@ -284,6 +289,7 @@ static int parse_run_flags(int argc, char *argv[],
     }
 
     out_cfg->enable_pty = enable_pty;
+    out_cfg->enable_init = enable_init;
     out_cfg->stdout_fd = -1;
     out_cfg->stderr_fd = -1;
     out_cfg->detach = detach;
@@ -912,6 +918,7 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  --volume host:cont[:ro]  Bind mount (Phase 7b)\n");
     fprintf(stderr, "  --interactive            Allocate PTY (run only)\n");
     fprintf(stderr, "  --secure                 Drop caps + NO_NEW_PRIVS + seccomp + RO /sys (Phase 8b)\n");
+    fprintf(stderr, "  --init                   Run a PID-1 init shim (forward signals, reap zombies) (Phase 8b+)\n");
     fprintf(stderr, "  --env KEY=VALUE          Set environment variable\n");
     fprintf(stderr, "  --help                   Show this help\n\n");
     fprintf(stderr, "Backwards compat: %s [options] <command> [args]\n", progname);

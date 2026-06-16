@@ -82,6 +82,11 @@ typedef struct {
 
     /* Phase 8b — opt-in security hardening */
     bool enable_hardening;
+
+    /* Phase 8b+ — opt-in PID-1 init supervisor (--init). Wraps the
+     * workload in an in-process tini-style supervisor: forwards signals,
+     * reaps orphans, mirrors exit status. Default false. */
+    bool enable_init;
 } container_config_t;
 
 /**
