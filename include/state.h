@@ -33,6 +33,11 @@ typedef struct {
     char veth_host_ip[INET_ADDRSTRLEN];
     char veth_container_ip[INET_ADDRSTRLEN];
     char veth_netmask[8];
+
+    /* Phase 8c — set when the container started from --bundle; empty
+     * for flag-driven runs.  oci_state_save reads this to decide whether
+     * to emit oci-state.json. */
+    char bundle_path[PATH_MAX];
 } container_state_t;
 
 typedef struct {
@@ -91,6 +96,25 @@ int state_list(container_info_t *infos, int max_infos);
  * Remove a container's state directory.
  */
 int state_remove(const char *id);
+
+/*
+ * Phase 8c — Write a runc-compatible oci-state.json alongside the
+ * existing state.json.  Only emits a file when state->bundle_path is
+ * non-empty (a no-op returning 0 otherwise).  Atomic, like state_save
+ * (writes .oci-state.json.tmp + rename).  Reuses state->started_at for
+ * the "created" field so it never drifts on re-save.
+ *
+ * Returns 0 on success/no-op, -1 on failure.
+ */
+int oci_state_save(const container_state_t *s);
+
+/*
+ * Phase 8c — Remove oci-state.json if present.  Called from
+ * state_remove (which removes the whole per-container directory).
+ * No-op if the file doesn't exist.  Returns 0 on success/no-op, -1 on
+ * a real unlink error.
+ */
+int oci_state_remove(const char *id);
 
 /**
  * `mkdir -p` semantics on a single path.  Walks the path, creates any

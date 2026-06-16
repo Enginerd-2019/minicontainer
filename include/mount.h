@@ -5,6 +5,7 @@
 #include <sched.h>
 #include <stdbool.h>
 #include <sys/types.h>
+#include "oci.h"   // Phase 8c: oci_mount_t for apply_oci_mount (one-directional: mount.h -> oci.h)
 
 #define MAX_MOUNTS 32
 
@@ -101,5 +102,41 @@ int mount_devpts(bool enable_debug, bool user_namespace_active);
  * Returns 0 on success, -1 on failure.
  */
 int mount_sys_ro(bool enable_debug);
+
+/*
+ * Phase 8c — Apply a single NON-bind OCI mount entry from config.json's
+ * mounts[] array.  Dispatches by mount.type: "proc"/"devpts" defer to
+ * mount_proc/mount_devpts (skip), "tmpfs" → tmpfs mount (mkdir target
+ * first, EEXIST-tolerant), "sysfs" → sysfs RW (mount_sys_ro handles the
+ * --secure RO case separately).
+ *
+ * "bind"-type entries are NOT handled here: their host source is
+ * unreachable post-pivot_root (decisions.md Error #22), so they are
+ * converted to bind_mount_t at parse time and applied by setup_rootfs
+ * before the pivot — the same path as --volume.  Reaching this function
+ * with a bind entry is treated as a bug (returns -1, EINVAL).
+ *
+ * Called from child_func per non-bind OCI mount entry, AFTER pivot_root.
+ * Returns 0 on success, -1 on failure.
+ */
+int apply_oci_mount(const oci_mount_t *m, bool enable_debug);
+
+/*
+ * Phase 8c — Mask a path for OCI linux.maskedPaths[] entries.  A regular
+ * file is masked by bind-mounting /dev/null over it; a directory by
+ * mounting an empty read-only tmpfs over it.  Missing targets are
+ * skipped silently (OCI semantics).  Returns 0 on success/skip, -1 on
+ * failure.
+ */
+int apply_masked_path(const char *path, bool enable_debug);
+
+/*
+ * Phase 8c — Remount a path read-only for OCI linux.readonlyPaths[]
+ * entries via self-bind then MS_BIND | MS_REMOUNT | MS_RDONLY (the same
+ * kernel two-step quirk Phase 7b's read-only bind mounts use).  Missing
+ * targets are skipped silently.  Returns 0 on success/skip, -1 on
+ * failure.
+ */
+int apply_readonly_path(const char *path, bool enable_debug);
 
 #endif // MOUNT_H

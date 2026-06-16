@@ -2,7 +2,7 @@
 
 > A minimal container runtime built from scratch to understand the internals of Docker and Kubernetes
 
-[![Phase](https://img.shields.io/badge/Phase-8b%2B%20hardening%20%2B%20init-blue)]()
+[![Phase](https://img.shields.io/badge/Phase-8c%20OCI%20bundles-blue)]()
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 [![C Standard](https://img.shields.io/badge/C-C11-orange)]()
 
@@ -12,15 +12,23 @@
 
 **minicontainer** is an educational project that implements a container runtime from first principles. Instead of using Docker or other high-level tools, this project builds process isolation step-by-step using low-level Linux system calls.
 
-**Current state:** Phases 0–8b shipped, plus the Phase 8b+ `--init` supervisor. The latest work is opt-in **production hardening** (`--secure`) and an opt-in **`--init`** PID-1 supervisor.
+**Current state:** Phases 0–8c shipped. The latest work is **OCI bundle support** — a `--bundle <dir>` flag, a `pull <tag>` rootfs downloader, and a runc-compatible `oci-state.json` — layered on opt-in **production hardening** (`--secure`) and an opt-in **`--init`** PID-1 supervisor.
 
-Built phase by phase, each adding one isolation or production concern: PID / mount / UTS / user / IPC / network namespaces (Phases 1–6); OverlayFS copy-on-write plus CVE-2024-21626-class fd hygiene (Phase 3); cgroup v2 resource limits (Phase 5); an execution-core refactor that collapsed the per-phase `*_exec()` duplication into one `container_start` / `container_wait` (7a); a full CLI and lifecycle surface — `run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`, runtime state files at `/run/minicontainer/<id>/`, bind mounts, and an interactive PTY (7b); live process introspection through the reusable `libprocfs` static library — `inspect` / `stats` / `top` / `netstat` (8a); opt-in security hardening via `--secure` — hand-rolled capability dropping, `NO_NEW_PRIVS`, a seccomp BPF allow-list, and a read-only `/sys`, all from raw syscalls with no libcap/libseccomp (8b); and an opt-in `--init` PID-1 supervisor that forwards signals and reaps zombies so `stop` is prompt instead of waiting out the 10 s grace timer (8b+). The opt-in flags change nothing when absent, and every earlier phase's tests still run as regression baselines.
+Built phase by phase, each adding one isolation or production concern: PID / mount / UTS / user / IPC / network namespaces (Phases 1–6); OverlayFS copy-on-write plus CVE-2024-21626-class fd hygiene (Phase 3); cgroup v2 resource limits (Phase 5); an execution-core refactor that collapsed the per-phase `*_exec()` duplication into one `container_start` / `container_wait` (7a); a full CLI and lifecycle surface — `run` / `start` / `stop` / `exec` / `inspect` / `list` / `cleanup`, runtime state files at `/run/minicontainer/<id>/`, bind mounts, and an interactive PTY (7b); live process introspection through the reusable `libprocfs` static library — `inspect` / `stats` / `top` / `netstat` (8a); opt-in security hardening via `--secure` — hand-rolled capability dropping, `NO_NEW_PRIVS`, a seccomp BPF allow-list, and a read-only `/sys`, all from raw syscalls with no libcap/libseccomp (8b); and an opt-in `--init` PID-1 supervisor that forwards signals and reaps zombies so `stop` is prompt instead of waiting out the 10 s grace timer (8b+); and OCI bundle support — a hand-rolled OCI `config.json` parser, a `--bundle <dir>` flag, a whitelist `pull <tag>` rootfs downloader, and a runc-compatible `oci-state.json` (8c). The opt-in flags change nothing when absent, and every earlier phase's tests still run as regression baselines.
 
 ---
 
 ## Features
 
-### Phase 8b+ (Current)
+### Phase 8c (Current)
+
+- ✅ **OCI bundle support — `--bundle <dir>`** — runs an OCI bundle by parsing `<dir>/config.json` (an OCI Runtime Spec subset, ~22 of ~120 fields: `process.args`/`env`/`cwd`/`terminal`/`user`, `root.path`/`readonly`, `hostname`, `mounts`, `linux.namespaces`, `uid`/`gidMappings`, `resources.{memory,cpu,pids}`, `maskedPaths`, `readonlyPaths`) and using `<dir>/rootfs/`. Hand-rolled recursive-descent JSON parser — no jansson/cJSON. `--bundle` is mutually exclusive with `--rootfs`; CLI flags override bundle fields **regardless of argument order** (an argv pre-scan applies the bundle first, then every flag clobbers); a positional command overrides `process.args` (Docker-style). Modules `oci.h`/`oci.c`.
+- ✅ **`pull <tag>` subcommand** — downloads a whitelisted rootfs (`alpine`, `ubuntu`) into a ready-to-run bundle via `curl`/`wget` + `tar`, writing a default `config.json`. A deliberate toy, **not** a registry client — for arbitrary images use `skopeo` + `umoci`. Modules `pull.h`/`pull.c`.
+- ✅ **OCI mounts / masked / readonly / cwd** — bundle `mounts[]` of type `bind` are converted to bind mounts applied before `pivot_root` (so the host source still resolves); `tmpfs`/`sysfs`/`proc`/`devpts` entries are applied post-pivot. `apply_oci_mount` splits VFS flags (`nosuid`/`nodev`/…) from filesystem data (`mode=`/`size=`/…) the way `mount(8)` does — passing the raw option string as mount data fails `EINVAL` on the flag tokens (decisions.md Error #27). `linux.maskedPaths` are masked (`/dev/null` bind or RO `tmpfs`), `linux.readonlyPaths` are remounted read-only, `root.readonly` remounts the whole rootfs RO, and `process.cwd` sets the working directory.
+- ✅ **Runc-compatible `oci-state.json`** — for a bundle-started container, an OCI-schema state file (`ociVersion`, `id`, `pid`, `status`, `bundle`, `rootfs`, `created`, `owner`) is written atomically (`.tmp` + `rename`) alongside `state.json` and removed on `stop`/`cleanup`. It follows the documented `runc state` *output* schema, so monitors that read that format can consume it directly; it does **not** read runc's private on-disk layout.
+- ✅ **Hardening is never auto-enabled from a bundle** — `process.noNewPrivileges` / `linux.seccomp` in `config.json` are ignored; `--secure` remains the only way to harden (and now accepts a bundle-supplied rootfs). New suites `test_oci` (parser + translator) and `test_pull` (whitelist + argument validation).
+
+### Phase 8b+
 
 - ✅ **Opt-in `--init` PID-1 supervisor** — an in-process tini-style init (no bundled binary). With `--init`, the workload runs as PID 2 under a supervisor (PID 1) that forwards `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP`/`SIGUSR1`/`SIGUSR2` to it, reaps orphaned grandchildren via a blocking `waitpid(-1)` loop, and mirrors the workload's exit status (re-raising a terminating signal so the host sees the same `WIFSIGNALED`). Fixes the PID-1 signal-drop problem (`man 7 pid_namespaces`): a workload that is PID 1 and installs no `SIGTERM` handler silently ignores `stop`'s ancestor signal, so `stop` always elapses its 10 s grace timer then force-kills. Measured: `stop` of a `sleep 60` returns in **0.10 s** with `--init` vs **10.02 s** (then a forced `SIGKILL`) without. Opt-in and independent of `--secure`; the two compose (the supervisor's `fork` issues `clone`, which the seccomp allow-list permits). Module `init.h`/`init.c`; `test_init` covers exit-code propagation, signal-death mirroring, and signal forwarding — no root needed.
 
@@ -228,6 +236,7 @@ sudo ./minicontainer netstat "$CID"             # connection count (add -v for t
 sudo ./minicontainer exec "$CID" /bin/ps aux    # run a command inside the existing container
 sudo ./minicontainer stop "$CID"                # SIGTERM → 10s timeout → SIGKILL
 sudo ./minicontainer cleanup                    # sweep stale state/cgroups/veth/iptables/overlay
+sudo ./minicontainer pull alpine                # download a whitelisted rootfs into a bundle (Phase 8c)
 
 # Bind mounts — host:container[:ro]
 sudo ./minicontainer run --pid --rootfs ./rootfs \
@@ -265,6 +274,32 @@ sudo ./minicontainer run --pid --rootfs ./rootfs /bin/sh -c \
 > mount namespace). Under `--user`, `--secure` also needs `--net`, because
 > the kernel only permits a read-only `/sys` mount when the user namespace
 > owns the network namespace.
+
+#### Phase 8c — OCI bundles (`--bundle`, `pull`)
+
+```bash
+# Pull a whitelisted rootfs into a ready-to-run bundle (alpine or ubuntu)
+sudo ./minicontainer pull alpine
+# Pulled alpine.   Bundle at: ./alpine-bundle
+
+# Run the bundle — uses ./alpine-bundle/config.json + ./alpine-bundle/rootfs/
+sudo ./minicontainer run --bundle ./alpine-bundle /bin/sh -c 'cat /etc/os-release | head -1'
+# NAME="Alpine Linux"
+
+# CLI flags override bundle fields regardless of order; a positional command
+# overrides the bundle's process.args (Docker-style `run <image> CMD...`)
+sudo ./minicontainer run --bundle ./alpine-bundle --hostname web /bin/hostname
+# web
+
+# --bundle and --rootfs are mutually exclusive
+sudo ./minicontainer run --bundle ./alpine-bundle --rootfs ./rootfs
+# Error: --bundle and --rootfs are mutually exclusive
+```
+> `--bundle <dir>` reads `<dir>/config.json` (a ~22-field OCI Runtime Spec
+> subset) and `<dir>/rootfs/`. A bundle-started container also gets a
+> runc-schema `oci-state.json` next to its `state.json`. `pull` is a
+> whitelist downloader (alpine, ubuntu) — not a registry client; for
+> arbitrary images use `skopeo` + `umoci` and then `run --bundle`.
 
 #### Phase 0–7a flag examples (still work via implicit-run)
 
@@ -381,8 +416,8 @@ sudo setcap cap_sys_admin+ep ./minicontainer
 ### Test
 
 ```bash
-# Run all tests (Phase 0 + 1 + 2 + 3 + 4 + 4b + 4c + 5 + 6 + 7b)
-# 22 Phase 0–6 assertions + 10 Phase 7b assertions across test_cli/test_state/test_bind
+# Run all 14 test suites (Phases 0–8c): core, mount, overlay, uts, cgroup,
+# net, state, bind, cli, inspector, hardening, init, oci, pull
 make test
 
 # Run example commands
@@ -399,6 +434,8 @@ make valgrind
 ```
 minicontainer/
 ├── include/
+│   ├── oci.h                 # Phase 8c: oci_config_t, oci_parse_config + oci_to_container_config (recursive-descent JSON)
+│   ├── pull.h                # Phase 8c: cmd_pull (whitelisted alpine/ubuntu rootfs downloader)
 │   ├── init.h                # Phase 8b+: run_init_supervisor (--init PID-1 shim)
 │   ├── hardening.h           # Phase 8b: drop_capabilities, apply_no_new_privs, apply_seccomp_filter
 │   ├── inspector.h           # Phase 8a: container inspect/stats/top/netstat (libprocfs glue)
@@ -414,6 +451,8 @@ minicontainer/
 │   ├── uts.h                # Phase 4/4b/4c: setup_uts(), setup_user_namespace_mapping(), user_ns_mapping_t (since 7a)
 │   └── overlay.h            # Phase 3 + 7b: setup_overlay() takes container_id (canonical ID threading), teardown_overlay()
 ├── src/
+│   ├── oci.c                # Phase 8c: config.json recursive-descent JSON parser + OCI→container_config_t translator
+│   ├── pull.c               # Phase 8c: cmd_pull — whitelisted rootfs download (alpine, ubuntu) via curl/wget + tar
 │   ├── init.c               # Phase 8b+: PID-1 init supervisor (signal forward + reap + status mirror)
 │   ├── hardening.c          # Phase 8b: capability drop / NO_NEW_PRIVS / seccomp BPF (raw syscalls)
 │   ├── inspector.c          # Phase 8a: live inspect/stats/top/netstat via libprocfs
@@ -430,6 +469,8 @@ minicontainer/
 │   ├── uts.c                # Phase 4/4b: setup_uts, setup_user_namespace_mapping
 │   └── overlay.c            # Phase 3 + 7b: setup_overlay takes container_id param, teardown_overlay (+ static path/dir helpers)
 ├── tests/
+│   ├── test_oci.c           # Phase 8c: oci_parse_config (JSON) + oci_to_container_config translator (bind split, invariants) (no root)
+│   ├── test_pull.c          # Phase 8c: cmd_pull argument validation + whitelist lookup (hermetic, no network, no root)
 │   ├── test_init.c          # Phase 8b+: forked-supervisor exit-code / signal-death / signal-forwarding (no root)
 │   ├── test_hardening.c     # Phase 8b: forked-child cap/seccomp/clone3 + state_claim_id (root for the cap cases)
 │   ├── test_inspector.sh    # Phase 8a: inspect/stats/top/netstat integration (root + ./rootfs)
@@ -447,8 +488,8 @@ minicontainer/
 ├── scripts/
 │   └── build_rootfs.sh      # Builds minimal rootfs from host binaries (BINS includes `ip`, `curl`, `python3`, `nano`, `sleep`; bundles xterm terminfo for ncurses binaries; NSS modules + CA bundle for DNS/TLS)
 ├── docs/
-│   └── decisions.md         # Design decisions (now through #37: hardening + atomic state/claim-id) and error log (Errors #1–#26)
-├── Makefile                 # Build system (HELPER_OBJS aggregates every helper .o — inspector.o / hardening.o / init.o included — and links libprocfs.a)
+│   └── decisions.md         # Design decisions (now through #37: hardening + atomic state/claim-id) and error log (Errors #1–#27)
+├── Makefile                 # Build system (HELPER_OBJS aggregates every helper .o — inspector.o / hardening.o / init.o / oci.o / pull.o included — and links libprocfs.a)
 └── README.md                # This file
 ```
 
@@ -558,6 +599,10 @@ Helper modules unchanged from Phase 7a:
 - Phase 6: `net.c` (`net_exec`) supersedes `cgroup.c` as the top-level exec module
 - **Phase 7a:** every `*_exec()` collapsed into `container_exec()` in `core.c`. The helper modules (mount.c, overlay.c, uts.c, cgroup.c, net.c) keep their helpers (`setup_*`, `cleanup_*`) — they no longer carry the orchestration boilerplate.
 - **Phase 7b:** `container_exec()` splits into `container_start()` + `container_wait()`. New modules `cli.c` (subcommand dispatch + handlers), `state.c` (state file I/O + canonical container_id), `pty.c` (SCM_RIGHTS PTY handoff), `cleanup.c` (stale-resource sweeper). `mount.c` gains `bind_mount_apply` + `mount_devpts`. `setup_rootfs` applies bind mounts onto the new root before `pivot_root` (so the host source still resolves); `core.c`'s `child_func` then runs `mount_proc`, `mount_devpts` (after `mount_proc`), and the optional PTY allocation block (after `mount_devpts`). `main.c` becomes a thin dispatcher.
+- **Phase 8a:** `inspector.c` + the `libprocfs` static library (submodule) add the live-introspection handlers `cmd_stats` / `cmd_top` / `cmd_netstat` and upgrade `cmd_inspect`. No change to `child_func`.
+- **Phase 8b:** `hardening.c` adds `drop_capabilities` / `apply_no_new_privs` / `apply_seccomp_filter`, run last in `child_func` (after `close_inherited_fds`, before `execve`) under `--secure`; `mount_sys_ro` slots in after `mount_devpts`. `state_save` becomes atomic and `state_claim_id` is added.
+- **Phase 8b+:** `init.c` adds the optional PID-1 supervisor — under `--init`, `child_func` calls `run_init_supervisor` (which `fork`s the workload) instead of `execve`-ing it directly, after the hardening step.
+- **Phase 8c:** `oci.c` (config.json parser + translator) and `pull.c` (`cmd_pull`) are added. `parse_run_flags` gains an argv pre-scan for `--bundle` plus a conditional override tail; `child_func` gains, inside the rootfs block, OCI non-bind mounts (after `setup_rootfs`), then masked paths / readonly paths / root-readonly remount / `chdir(cwd)` (after `mount_sys_ro`). `mount.c` gains `apply_oci_mount` / `apply_masked_path` / `apply_readonly_path`; `state.c` gains `oci_state_save` / `oci_state_remove`.
 
 **Why the duplication existed (and why 7a removed it):** Each phase's
 `*_exec()` shared ~90% of its structure with the previous phase —
@@ -984,8 +1029,9 @@ inspect the result, and then exit:
 ```bash
 $ sudo ./minicontainer --pid --rootfs ./rootfs --overlay --net /bin/sh
 
-# Inside the container (no PS1 prompt — Phase 7b adds proper PTY/TTY
-# allocation; today the shell runs in line-mode without job control):
+# Inside the container (no PS1 prompt — this example omits --interactive,
+# so the shell runs in line-mode without job control; add -i / --interactive
+# for a full PTY with Ctrl-C and line editing, see the PTY example above):
 curl -sS --connect-timeout 5 --max-time 20 -o /tmp/curl_out -w "%{http_code}\n" https://enginerd2019.dev
 # 200
 
@@ -996,10 +1042,10 @@ head -c 80 /tmp/curl_out
 # <!doctype html><html lang="en"><head><title>Example Domain</title>
 
 exit
-# Note: exiting the shell currently emits a benign error (Phase 7b
-# adds proper PTY teardown). The container has already exited cleanly
-# by the time you see it; minicontainer is just unwinding the parent
-# side without a TTY to release.
+# Note: without --interactive there is no PTY, so exiting the shell may
+# emit a benign job-control message. The container has already exited
+# cleanly by the time you see it; minicontainer is just unwinding the
+# parent side without a TTY to release. Run with -i for a clean teardown.
 
 # Back on the host. The overlay's upperdir has been torn down:
 $ ls rootfs/tmp/curl_out
@@ -1268,6 +1314,23 @@ make test
 
 Each test_bind case forks into its own `unshare(CLONE_NEWNS)` + `mount("/", MS_REC|MS_PRIVATE)` child, so the bind mounts the test creates never leak to the host.
 
+**Phase 8a inspector test** (`test_inspector.sh` - requires root + `./rootfs`):
+- ✓ `inspect` / `stats` / `top` / `netstat` produce live reports against a running container (integration shell script, not a C unit suite)
+
+**Phase 8b hardening tests** (`test_hardening` - root runs the cap cases; unprivileged subset SKIPs them):
+- ✓ `NO_NEW_PRIVS` is set; seccomp allow/deny (incl. the `clone3` → `ENOSYS` path); capability drop reduces the bounding/effective set
+- ✓ full hardening chain end-to-end; `state_claim_id` produces unique IDs and creates the state dir
+
+**Phase 8b+ init tests** (`test_init` - no root needed):
+- ✓ exit-code propagation, terminating-signal mirroring, and signal forwarding through the forked PID-1 supervisor
+
+**Phase 8c OCI tests** (`test_oci` - no root needed):
+- ✓ `oci_parse_config` parses minimal + full `config.json` fixtures; rejects unsupported `ociVersion`, malformed JSON, and a missing file
+- ✓ `oci_to_container_config` maps cwd default, rootfs invariants (mount-ns + pid-ns), terminal→PTY, flat uid/gid maps, cgroup limits, and the bind-vs-non-bind mount split; rejects empty `process.args`
+
+**Phase 8c pull tests** (`test_pull` - hermetic, no network, no root):
+- ✓ `cmd_pull` rejects a missing tag, an unknown tag, and an empty tag (the download path is exercised by a live `pull alpine`, not the hermetic suite)
+
 ### Manual Testing
 
 ```bash
@@ -1375,7 +1438,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - Mount propagation (MS_PRIVATE | MS_REC) before pivot_root
 - Lazy unmount (MNT_DETACH) for old root and overlay cleanup
 - Modular design (mount.c/overlay.c/uts.c/cgroup.c/net.c — helpers retained after Phase 7a consolidation)
-- All errors found and fixed during implementation (Errors #1–#18)
+- All errors found and fixed during implementation (Errors #1–#27)
 
 ---
 
@@ -1388,8 +1451,8 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 5. ~~**No mount hardening**~~ — **Fixed in Phase 3** via `MS_NODEV | MS_NOSUID`
 6. ~~**Single command** — Runs one command then exits (no daemon mode)~~ — **Mitigated in Phase 7b** via the `start` subcommand (detached mode — parent exits, child reparents to init) and `exec` (run a command inside an already-running container). The container itself still runs one entrypoint, but the runtime now supports multi-process workflows.
 7. ~~**Requires root for namespaces**~~ — **Mitigated in Phase 4b** via `CLONE_NEWUSER` and `--user` flag (rootless containers). `/proc` mount may be restricted by AppArmor in user namespace mode
-8. **Rootfs must be pre-built** — No image pull or layer support; rootfs directory must exist before running
-9. **No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up
+8. ~~**Rootfs must be pre-built** — No image pull or layer support~~ — **Mitigated in Phase 8c** via `pull <tag>` (downloads a whitelisted alpine/ubuntu rootfs into a bundle via `curl` + `tar` — a toy, not a registry client) and `--bundle <dir>` (runs a prepared OCI bundle: `<dir>/config.json` + `<dir>/rootfs/`). There is still no image-layer support — a single rootfs directory is used as-is.
+9. ~~**No tmpfs mounts** — Only `/proc` is mounted automatically; `/tmp`, `/dev`, etc. are not set up~~ — **Updated:** `/proc` plus a private `devpts` instance (with `/dev/ptmx`) are mounted automatically whenever a rootfs is set (Phase 7b), and an OCI bundle's `mounts[]` can request `tmpfs`/`sysfs` mounts and `maskedPaths`/`readonlyPaths` (Phase 8c). There is still no automatic `/dev` or `/tmp` for a bare `--rootfs` run without a bundle.
 10. ~~**No hostname isolation**~~ — **Fixed in Phase 4** via `CLONE_NEWUTS` and `--hostname`
 11. ~~**No resource limits**~~ — **Fixed in Phase 5** via cgroups v2 (`--memory`, `--cpus`, `--pids`). Cgroup operations require root (`/sys/fs/cgroup/` is root-owned); `--user` does not grant write access there.
 12. ~~**No network isolation**~~ — **Fixed in Phase 6** via `CLONE_NEWNET` + veth pair (`--net`). Network setup uses `fork+exec` of `ip(8)` (and optionally `iptables`), so the host must have `iproute2` installed; the rootfs must include `/bin/ip` (handled by `BINS` in `build_rootfs.sh`). `--net` requires root because veth creation, namespace move, and iptables manipulation all need `CAP_NET_ADMIN` in the root user namespace.
@@ -1505,11 +1568,11 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 - [x] Three new test suites — `test_cli`, `test_state`, `test_bind` — that exposed two latent state.c bugs the Phase 0–7a integration suite never reached (decisions.md Errors #20 and #21)
 - [x] `build_rootfs.sh` bundles xterm terminfo (so ncurses-linked binaries find their terminal description files inside the container)
 
-### 📋 Phase 8: Inspector + Hardening + OCI Bundles
+### ✅ Phase 8: Inspector + Hardening + OCI Bundles
 - [x] **8a:** Static `libprocfs.a` extracted as a sibling project; cgroup read-side + `/proc` parsing reused by container `inspect` / `stats` / `top` / `netstat` subcommands
 - [x] **8b:** Production hardening — opt-in `--secure` flag: capability dropping (raw `capset(2)`, no libcap), `PR_SET_NO_NEW_PRIVS`, seccomp BPF allow-list (raw `prctl(PR_SET_SECCOMP)`, no libseccomp), read-only `/sys`, atomic state-file writes, container ID collision retry
 - [x] **8b+:** `--init` PID-1 supervisor — in-process tini-style init: forwards signals to the workload and reaps orphaned zombies so `stop` is prompt (opt-in, independent of `--secure`)
-- [ ] **8c:** OCI Runtime Spec compliance — hand-rolled `config.json` parser, `--bundle <dir>` flag, minimal `pull <tag>` whitelist (alpine/ubuntu, explicitly not a registry client), `oci-state.json` round-trip with runc-compatible tools
+- [x] **8c:** OCI Runtime Spec compliance — hand-rolled `config.json` parser (`oci.c`), `--bundle <dir>` flag (mutually exclusive with `--rootfs`, flags override regardless of order, positional command overrides `process.args`), minimal `pull <tag>` whitelist (alpine/ubuntu, explicitly not a registry client), OCI mounts/masked/readonly/cwd handling, and a runc-schema `oci-state.json` written alongside `state.json`
 
 ---
 
@@ -1519,7 +1582,7 @@ See [docs/decisions.md](docs/decisions.md) for detailed rationale on:
 
 ```bash
 make              # Build minicontainer
-make test         # Build and run all tests (Phase 0 through 8b+: core/mount/overlay/uts/cgroup/net/state/bind/cli/hardening/init + 8a inspector)
+make test         # Build and run all tests (Phase 0 through 8c: core/mount/overlay/uts/cgroup/net/state/bind/cli/hardening/init/oci/pull + 8a inspector)
 make clean        # Remove build artifacts
 make debug        # Build with debug symbols (-g)
 make valgrind     # Run memory leak detection
@@ -1669,7 +1732,7 @@ for v in $(ip -o link show | awk -F: '/veth_h_/ {print $2}'); do
 done
 ```
 
-A `minicontainer cleanup` subcommand (Phase 7) will handle this automatically.
+The `minicontainer cleanup` subcommand handles this automatically — it removes orphan `veth_h_*` interfaces with no live owner (along with stale state dirs, empty cgroups, and dangling iptables/overlay debris).
 
 ---
 
@@ -1864,7 +1927,7 @@ done
 sudo rmdir /sys/fs/cgroup/minicontainer_XXX
 ```
 
-Phase 7 will add a `minicontainer cleanup` subcommand to handle this.
+The `minicontainer cleanup` subcommand handles this automatically — it removes empty orphan `minicontainer_*` cgroups (those with an empty `cgroup.procs`).
 
 ---
 

@@ -13,6 +13,7 @@
 // Anything more complex than this belongs in cli.c.
 
 #include "cli.h"
+#include "pull.h"   /* Phase 8c: cmd_pull */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,7 @@ int main(int argc, char *argv[]) {
         case SUBCMD_STATS:   return cmd_stats  (argc - 1, argv + 1);  /* NEW in 8a */
         case SUBCMD_TOP:     return cmd_top    (argc - 1, argv + 1);  /* NEW in 8a */
         case SUBCMD_NETSTAT: return cmd_netstat(argc - 1, argv + 1);  /* NEW in 8a */
+        case SUBCMD_PULL:    return cmd_pull   (argc - 1, argv + 1);  /* NEW in 8c */
         case SUBCMD_UNKNOWN:
             break;  /* fall through to implicit-run logic below */
     }

@@ -463,6 +463,10 @@ int state_remove(const char *id) {
     char dir[PATH_MAX], path[PATH_MAX];
     state_dir_path(id, dir, sizeof(dir));
 
+    /* Phase 8c: remove oci-state.json first (if present) — declared in
+     * state.h, defined below.  No-op for non-bundle containers. */
+    oci_state_remove(id);
+
     /* Best-effort cleanup.  Each snprintf return is checked against the
      * buffer size; on truncation (only possible with a pathologically
      * long state_dir_root()+id, never reached in practice) we skip the
@@ -481,5 +485,85 @@ int state_remove(const char *id) {
     n = snprintf(path, sizeof(path), "%s/logs", dir);
     if (n > 0 && (size_t)n < sizeof(path)) rmdir(path);
     rmdir(dir);
+    return 0;
+}
+
+/* ===== Phase 8c — OCI runc-compatible state file ===== */
+
+/* No timestamp helper needed: container_state_t.started_at already
+ * holds the container's start time in exactly the ISO-8601 form OCI's
+ * "created" field wants (state_from_config formats it with strftime).
+ * Regenerating it here with time(NULL) would make "created" drift
+ * forward on every re-save. */
+int oci_state_save(const container_state_t *s)
+{
+    if (!s || s->bundle_path[0] == '\0') return 0;  /* no bundle, no oci-state */
+
+    char dir[PATH_MAX], tmp_path[PATH_MAX], final_path[PATH_MAX];
+    state_dir_path(s->id, dir, sizeof(dir));
+
+    /* snprintf truncation checks — same hygiene as state_save. */
+    int n;
+    n = snprintf(tmp_path, sizeof(tmp_path), "%s/.oci-state.json.tmp", dir);
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        fprintf(stderr, "oci_state_save: tmp_path truncated for id %s\n", s->id);
+        return -1;
+    }
+    n = snprintf(final_path, sizeof(final_path), "%s/oci-state.json", dir);
+    if (n < 0 || (size_t)n >= sizeof(final_path)) {
+        fprintf(stderr, "oci_state_save: final_path truncated for id %s\n", s->id);
+        return -1;
+    }
+
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) {
+        perror("fopen(.oci-state.json.tmp)");
+        return -1;
+    }
+
+    /* Determine status. Phase 7b's state_t doesn't have an explicit
+     * status field; derive: pid > 0 + state_dir present = running. */
+    const char *status = (s->pid > 0) ? "running" : "stopped";
+
+    fprintf(f,
+        "{\n"
+        "    \"ociVersion\": \"1.0.2\",\n"
+        "    \"id\":         \"%s\",\n"
+        "    \"pid\":         %d,\n"
+        "    \"status\":     \"%s\",\n"
+        "    \"bundle\":     \"%s\",\n"
+        "    \"rootfs\":     \"%s\",\n"
+        "    \"created\":    \"%s\",\n"
+        "    \"owner\":      \"\"\n"
+        "}\n",
+        s->id, s->pid, status, s->bundle_path, s->rootfs, s->started_at);
+
+    if (fflush(f) != 0 || fsync(fileno(f)) < 0) {
+        perror("fflush/fsync(.oci-state.json.tmp)");
+        fclose(f);
+        unlink(tmp_path);
+        return -1;
+    }
+    fclose(f);
+
+    if (rename(tmp_path, final_path) < 0) {
+        perror("rename(.oci-state.json.tmp -> oci-state.json)");
+        unlink(tmp_path);
+        return -1;
+    }
+    return 0;
+}
+
+int oci_state_remove(const char *id)
+{
+    if (!id) return 0;
+    char dir[PATH_MAX], path[PATH_MAX];
+    state_dir_path(id, dir, sizeof(dir));
+    int n = snprintf(path, sizeof(path), "%s/oci-state.json", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;  /* unreachable; skip */
+    if (unlink(path) < 0 && errno != ENOENT) {
+        perror("unlink(oci-state.json)");
+        return -1;
+    }
     return 0;
 }

@@ -11,6 +11,7 @@
 #include "net.h"      // veth_config_t, net_context_t
 #include "state.h"
 #include "mount.h"
+#include "oci.h"      // Phase 8c: oci_mount_t, OCI_MAX_* (one-directional: core.h -> oci.h)
 
 /**
  * Unified container configuration. Supersedes every prior *_config_t
@@ -87,6 +88,19 @@ typedef struct {
      * workload in an in-process tini-style supervisor: forwards signals,
      * reaps orphans, mirrors exit status. Default false. */
     bool enable_init;
+
+    /* Phase 8c — OCI bundle integration. All zero-init friendly: empty
+     * bundle_path and zero counts mean "no bundle / no OCI features",
+     * so every non-bundle run behaves exactly as in Phase 0-8b+. */
+    char        bundle_path[PATH_MAX];
+    char        cwd[PATH_MAX];
+    bool        rootfs_readonly;
+    oci_mount_t oci_mounts[OCI_MAX_MOUNTS];
+    int         oci_mount_count;
+    char        masked_paths[OCI_MAX_MASKED][OCI_MAX_PATH];
+    int         masked_count;
+    char        readonly_paths[OCI_MAX_READONLY][OCI_MAX_PATH];
+    int         readonly_count;
 } container_config_t;
 
 /**

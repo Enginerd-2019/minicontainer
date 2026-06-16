@@ -30,6 +30,7 @@ subcommand_t parse_subcommand(const char *arg) {
     if (strcmp(arg, "stats") == 0)   return SUBCMD_STATS;    /* NEW in 8a */
     if (strcmp(arg, "top") == 0)     return SUBCMD_TOP;      /* NEW in 8a */
     if (strcmp(arg, "netstat") == 0) return SUBCMD_NETSTAT;  /* NEW in 8a */
+    if (strcmp(arg, "pull") == 0)    return SUBCMD_PULL;     /* NEW in 8c */
     return SUBCMD_UNKNOWN;
 }
 
@@ -95,10 +96,13 @@ static long parse_cpu_limit(const char *str) {
 static int parse_run_flags(int argc, char *argv[],
                            container_config_t *out_cfg,
                            char **custom_env, int *env_count,
-                           bool *out_detach) {
+                           bool *out_detach,
+                           char ***out_oci_env, int *out_oci_envc) {
     /* Reset state — getopt_long is stateful across calls in the
      * same process. */
     optind = 1;
+    *out_oci_env  = NULL;   /* Phase 8c: empty unless a --bundle supplies env */
+    *out_oci_envc = 0;
 
     bool enable_pid_namespace = false;
     bool enable_user_namespace = false;
@@ -123,6 +127,65 @@ static int parse_run_flags(int argc, char *argv[],
     *env_count = 0;
     out_cfg->mount_count = 0;
 
+    /* File-scope-lifetime static storage for the parsed OCI config and
+     * the argv/env pointer arrays.  Must outlive parse_run_flags: the
+     * program/argv/rootfs pointers we hand to cmd_run point INTO this
+     * storage and travel all the way into the cloned child.  Strictly
+     * single-use per process (Phase 7b's parse is one-shot). */
+    static oci_config_t oci_cfg_storage;
+    static char *oci_argv[OCI_MAX_ARGS + 1];
+    static char *oci_env[OCI_MAX_ENV + 1];
+
+    /* ---------- PRE-SCAN: find and apply --bundle BEFORE the getopt loop.
+     * CLI flags must override bundle fields REGARDLESS of where --bundle
+     * sits on the command line.  Parsing it inside the loop would let a
+     * bundle clobber an earlier flag, so apply it first and let the
+     * normal loop treat every flag as an override.  The 'B' case in the
+     * loop is then a no-op. ---------- */
+    const char *bundle_dir = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
+            bundle_dir = argv[i + 1];
+            break;
+        }
+        if (strncmp(argv[i], "--bundle=", 9) == 0) {
+            bundle_dir = argv[i] + 9;
+            break;
+        }
+    }
+    if (bundle_dir) {
+        memset(&oci_cfg_storage, 0, sizeof(oci_cfg_storage));
+        char err[256] = {0};
+        char config_path[PATH_MAX];
+        snprintf(config_path, sizeof(config_path), "%s/config.json", bundle_dir);
+
+        if (oci_parse_config(config_path, &oci_cfg_storage, err, sizeof(err)) < 0) {
+            fprintf(stderr, "Failed to parse %s: %s\n", config_path, err);
+            return 1;
+        }
+        if (oci_to_container_config(bundle_dir, &oci_cfg_storage, out_cfg) < 0) {
+            fprintf(stderr, "Failed to translate OCI config\n");
+            return 1;
+        }
+
+        /* Stage the argv pointers — they point into oci_cfg_storage's
+         * proc_args buffer (static storage), valid through cmd_run. */
+        for (int i = 0; i < oci_cfg_storage.proc_argc; i++) {
+            oci_argv[i] = oci_cfg_storage.proc_args[i];
+        }
+        oci_argv[oci_cfg_storage.proc_argc] = NULL;
+        out_cfg->program = oci_argv[0];
+        out_cfg->argv    = oci_argv;
+
+        /* Stage the env pointers — same lifetime as argv. */
+        for (int i = 0; i < oci_cfg_storage.proc_env_count; i++) {
+            oci_env[i] = oci_cfg_storage.proc_env[i];
+        }
+        oci_env[oci_cfg_storage.proc_env_count] = NULL;
+        *out_oci_env  = oci_env;
+        *out_oci_envc = oci_cfg_storage.proc_env_count;
+    }
+
     static struct option long_options[] = {
         {"debug",            no_argument,       NULL, 'd'},
         {"pid",              no_argument,       NULL, 'p'},
@@ -145,13 +208,14 @@ static int parse_run_flags(int argc, char *argv[],
         {"detach",           no_argument,       NULL, 'D'},      /* Phase 7b */
         {"secure",           no_argument,       NULL, 'S'},      /* Phase 8b */
         {"init",             no_argument,       NULL,  5 },      /* Phase 8b+ (long-only) */
+        {"bundle",           required_argument, NULL, 'B'},      /* Phase 8c */
         {"env",              required_argument, NULL, 'e'},
         {"help",             no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:uIm:C:P:Nv:iDSe:h",
+    while ((opt = getopt_long(argc, argv, "+dpr:oc:H:uIm:C:P:Nv:iDSB:e:h",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': enable_debug = true; break;
@@ -200,6 +264,9 @@ static int parse_run_flags(int argc, char *argv[],
             case 5:   /* --init (long-only) */
                 enable_init = true;
                 break;
+            case 'B':
+                /* --bundle: already applied by the pre-scan above. */
+                break;
             case 'e':
                 if (*env_count >= MAX_ENV_ENTRIES - 1) {
                     fprintf(stderr, "Too many --env entries\n");
@@ -212,10 +279,9 @@ static int parse_run_flags(int argc, char *argv[],
         }
     }
 
-    if (optind >= argc) {
-        fprintf(stderr, "Error: No command specified\n");
-        return 1;
-    }
+    /* Phase 8c: the "No command specified" check moved to the tail — a
+     * --bundle run can supply the program via process.args, and a
+     * positional command (if any) overrides it there. */
 
     /* Phase 3 invariant carried forward. */
     if (enable_overlay && !rootfs_path) {
@@ -238,40 +304,80 @@ static int parse_run_flags(int argc, char *argv[],
         return 1;
     }
 
-    // Phase 8b invariant: --secure requires --rootfs.  Use the LOCAL
-    // rootfs_path (like the --overlay check above): out_cfg->rootfs_path
-    // is not assigned until the config-build block below, so checking it
-    // here would always read NULL and reject every --secure run.
-    if (out_cfg->enable_hardening && !rootfs_path) {
+    /* Phase 8c invariant: --bundle and --rootfs are mutually exclusive.
+     * `rootfs_path` is the flag-derived LOCAL, so this catches exactly
+     * "the user passed --rootfs", independent of the bundle's
+     * root.path. */
+    if (bundle_dir && rootfs_path) {
+        fprintf(stderr,
+            "Error: --bundle and --rootfs are mutually exclusive "
+            "(bundle's root.path implies --rootfs)\n");
+        return 1;
+    }
+
+    // Phase 8b invariant: --secure requires a rootfs.  Accept either the
+    // --rootfs flag (LOCAL rootfs_path) OR a bundle that supplied one
+    // (the pre-scan set out_cfg->rootfs_path).  For a non-bundle run
+    // out_cfg->rootfs_path is still NULL here (the tail assigns it
+    // below), so this reduces to the Phase 8b "--secure needs --rootfs".
+    if (out_cfg->enable_hardening && !rootfs_path && !out_cfg->rootfs_path) {
         fprintf(stderr,
             "Error: --secure requires --rootfs "
             "(hardening only makes sense with its own mount namespace)\n");
         return 1;
     }
 
-    /* Build the config. */
-    out_cfg->program = argv[optind];
-    out_cfg->argv = &argv[optind];
+    /* Build the config — Phase 8c reworked tail.  The pre-scan above may
+     * already have populated out_cfg from a --bundle config.json, so
+     * every assignment here is an OVERRIDE, conditional on the matching
+     * flag actually having been passed (booleans only turn ON via the
+     * CLI, so `if (local)` means "the flag was passed"; rootfs/hostname
+     * use pointer presence the same way).  Leaving these unconditional
+     * (the Phase 7b/8b form) would WIPE bundle-populated fields — worst
+     * case enable_mount_namespace=false while a bundle set a rootfs,
+     * running pivot_root against the HOST mount table. */
     out_cfg->enable_debug = enable_debug;
-    /* Phase 4b auto-enable: --rootfs implies --pid */
-    out_cfg->enable_pid_namespace = enable_pid_namespace || (rootfs_path != NULL);
-    out_cfg->enable_mount_namespace = (rootfs_path != NULL);
-    out_cfg->enable_uts_namespace = (hostname != NULL);
-    out_cfg->enable_user_namespace = enable_user_namespace;
-    out_cfg->enable_ipc_namespace = enable_ipc_namespace;
-    out_cfg->enable_network = enable_network;
-    out_cfg->rootfs_path = rootfs_path;
-    out_cfg->enable_overlay = enable_overlay;
-    out_cfg->container_dir = container_dir;
-    out_cfg->hostname = hostname;
-    out_cfg->uid_map_inside = 0;
-    out_cfg->uid_map_outside = getuid();
-    out_cfg->uid_map_range = 1;
-    out_cfg->gid_map_inside = 0;
-    out_cfg->gid_map_outside = getgid();
-    out_cfg->gid_map_range = 1;
-    out_cfg->cgroup_limits = limits;
-    out_cfg->enable_cgroup = enable_cgroup;
+    if (rootfs_path)           out_cfg->rootfs_path   = rootfs_path;
+    if (hostname)              out_cfg->hostname      = hostname;
+    if (container_dir)         out_cfg->container_dir = container_dir;
+    if (enable_pid_namespace)  out_cfg->enable_pid_namespace  = true;
+    if (enable_user_namespace) out_cfg->enable_user_namespace = true;
+    if (enable_ipc_namespace)  out_cfg->enable_ipc_namespace  = true;
+    if (enable_network)        out_cfg->enable_network        = true;
+    if (enable_overlay)        out_cfg->enable_overlay        = true;
+    /* Cgroup limits merge PER FIELD so e.g. --pids doesn't wipe a
+     * bundle-provided memory limit. */
+    if (enable_cgroup) {
+        if (limits.memory_limit)
+            out_cfg->cgroup_limits.memory_limit = limits.memory_limit;
+        if (limits.cpu_quota) {
+            out_cfg->cgroup_limits.cpu_quota  = limits.cpu_quota;
+            out_cfg->cgroup_limits.cpu_period = limits.cpu_period;
+        }
+        if (limits.pid_limit)
+            out_cfg->cgroup_limits.pid_limit = limits.pid_limit;
+        out_cfg->enable_cgroup = true;
+    }
+
+    /* Invariants, re-derived from the EFFECTIVE (bundle + flags) config. */
+    if (out_cfg->rootfs_path) {
+        out_cfg->enable_pid_namespace   = true;   /* Phase 4b auto-enable */
+        out_cfg->enable_mount_namespace = true;   /* Phase 2 */
+    }
+    if (out_cfg->hostname) out_cfg->enable_uts_namespace = true;
+
+    /* UID/GID default mapping — only when the bundle didn't supply one
+     * (the translator fills uid_map_* from uidMappings[0] if present). */
+    if (out_cfg->uid_map_range == 0) {
+        out_cfg->uid_map_inside  = 0;
+        out_cfg->uid_map_outside = getuid();
+        out_cfg->uid_map_range   = 1;
+    }
+    if (out_cfg->gid_map_range == 0) {
+        out_cfg->gid_map_inside  = 0;
+        out_cfg->gid_map_outside = getgid();
+        out_cfg->gid_map_range   = 1;
+    }
     out_cfg->veth.enable_nat = !no_nat;
     out_cfg->veth.host_ip[0] = '\0';
     out_cfg->veth.container_ip[0] = '\0';
@@ -288,11 +394,33 @@ static int parse_run_flags(int argc, char *argv[],
                 sizeof(out_cfg->veth.netmask) - 1);
     }
 
-    out_cfg->enable_pty = enable_pty;
-    out_cfg->enable_init = enable_init;
+    /* enable_pty is conditional — a bundle's process.terminal:true may
+     * already have set it; an unconditional assignment would wipe that
+     * when -i is absent. */
+    if (enable_pty) out_cfg->enable_pty = true;
+    out_cfg->enable_init = enable_init;   /* no bundle equivalent */
     out_cfg->stdout_fd = -1;
     out_cfg->stderr_fd = -1;
     out_cfg->detach = detach;
+
+    /* Positional command vs bundle process.args (Phase 8c).  Replaces
+     * Phase 7b's early "No command specified" check: with a bundle the
+     * program may come from process.args, and a positional command
+     * OVERRIDES it (Docker `run image CMD...` semantics). */
+    if (optind < argc) {
+        out_cfg->program = argv[optind];
+        out_cfg->argv    = &argv[optind];
+    } else if (out_cfg->program == NULL) {
+        fprintf(stderr, "Error: No command specified\n");
+        return 1;
+    }
+
+    if (out_cfg->enable_debug && bundle_dir &&
+        oci_cfg_storage.ignored_count > 0) {
+        fprintf(stderr,
+            "[oci] Parsed %s/config.json; ignored %d unsupported field(s)\n",
+            bundle_dir, oci_cfg_storage.ignored_count);
+    }
 
     *out_detach = detach;
     return 0;
@@ -335,6 +463,11 @@ static void state_from_config(const container_config_t *cfg,
         strncpy(state->hostname, cfg->hostname,
                 sizeof(state->hostname) - 1);
     }
+
+    /* Phase 8c: carry the bundle path so oci_state_save knows whether to
+     * emit oci-state.json.  Empty for flag-driven runs. */
+    strncpy(state->bundle_path, cfg->bundle_path,
+            sizeof(state->bundle_path) - 1);
 }
 
 int cmd_run(int argc, char *argv[]) {
@@ -343,9 +476,12 @@ int cmd_run(int argc, char *argv[]) {
     memset(custom_env, 0, sizeof(custom_env));
     int env_count = 0;
     bool detach = false;
+    char **oci_env = NULL;     /* Phase 8c: bundle process.env (if any) */
+    int    oci_env_count = 0;
 
     int rc = parse_run_flags(argc, argv, &cfg, custom_env,
-                             &env_count, &detach);
+                             &env_count, &detach,
+                             &oci_env, &oci_env_count);
     if (rc < 0) return 0;  /* --help printed */
     if (rc > 0) return rc; /* parse error */
 
@@ -375,9 +511,20 @@ int cmd_run(int argc, char *argv[]) {
      * container_start handles the socketpair handoff and returns the
      * master fd on result.pty_master_fd.  cmd_run just sets the flag. */
 
-    /* Container env. Phase 3 correction carried forward. */
+    /* Container env. Phase 3 correction carried forward.  Phase 8c:
+     * compose bundle process.env first, then CLI --env (CLI takes
+     * precedence — later duplicate keys win in build_container_env).
+     * For a non-bundle run oci_env_count is 0, so this reduces to the
+     * Phase 7b `custom_env`-only path. */
+    char *combined_env[MAX_ENV_ENTRIES];
+    int   combined_count = 0;
+    for (int i = 0; i < oci_env_count && combined_count < MAX_ENV_ENTRIES; i++)
+        combined_env[combined_count++] = oci_env[i];
+    for (int i = 0; i < env_count && combined_count < MAX_ENV_ENTRIES; i++)
+        combined_env[combined_count++] = custom_env[i];
+
     char **container_env = build_container_env(
-        env_count > 0 ? custom_env : NULL, cfg.enable_debug);
+        combined_count > 0 ? combined_env : NULL, cfg.enable_debug);
     if (!container_env) {
         return 1;
     }
@@ -430,6 +577,12 @@ int cmd_run(int argc, char *argv[]) {
                 sizeof(state.veth_netmask) - 1);
     }
     state_save(&state);
+
+    /* Phase 8c: also emit runc-compatible oci-state.json if this run
+     * came from a bundle (no-op otherwise). */
+    if (state.bundle_path[0] != '\0') {
+        oci_state_save(&state);
+    }
 
     /* Interactive mode: forward stdio between user's terminal and
      * the PTY master while the child runs. pty_forward blocks until
@@ -524,9 +677,12 @@ int cmd_start(int argc, char *argv[]) {
     memset(custom_env, 0, sizeof(custom_env));
     int env_count = 0;
     bool detach_was_set = false;
+    char **oci_env = NULL;     /* Phase 8c: bundle process.env (if any) */
+    int    oci_env_count = 0;
 
     int rc = parse_run_flags(argc, argv, &cfg, custom_env,
-                             &env_count, &detach_was_set);
+                             &env_count, &detach_was_set,
+                             &oci_env, &oci_env_count);
     if (rc < 0) return 0;
     if (rc > 0) return rc;
 
@@ -539,9 +695,18 @@ int cmd_start(int argc, char *argv[]) {
     }
     cfg.detach = true;
 
-    /* Container env. */
+    /* Container env. Phase 8c: bundle process.env first, then CLI --env
+     * (CLI precedence).  Non-bundle runs (oci_env_count == 0) keep the
+     * Phase 7b custom_env-only behavior. */
+    char *combined_env[MAX_ENV_ENTRIES];
+    int   combined_count = 0;
+    for (int i = 0; i < oci_env_count && combined_count < MAX_ENV_ENTRIES; i++)
+        combined_env[combined_count++] = oci_env[i];
+    for (int i = 0; i < env_count && combined_count < MAX_ENV_ENTRIES; i++)
+        combined_env[combined_count++] = custom_env[i];
+
     char **container_env = build_container_env(
-        env_count > 0 ? custom_env : NULL, cfg.enable_debug);
+        combined_count > 0 ? combined_env : NULL, cfg.enable_debug);
     if (!container_env) return 1;
     cfg.envp = container_env;
 
@@ -643,6 +808,12 @@ int cmd_start(int argc, char *argv[]) {
                 sizeof(state.veth_netmask) - 1);
     }
     state_save(&state);
+
+    /* Phase 8c: emit runc-compatible oci-state.json for bundle-started
+     * detached containers (no-op otherwise). */
+    if (state.bundle_path[0] != '\0') {
+        oci_state_save(&state);
+    }
 
     /* Print the container ID and exit. We deliberately do NOT call
      * container_wait or container_cleanup — the child is detached
@@ -897,7 +1068,8 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  top      Show the container's process tree (via nsenter)\n");
     fprintf(stderr, "  netstat  Show the container's network connections (-v for the table)\n");
     fprintf(stderr, "  list     List running containers\n");
-    fprintf(stderr, "  cleanup  Remove stale state from crashed containers\n\n");
+    fprintf(stderr, "  cleanup  Remove stale state from crashed containers\n");
+    fprintf(stderr, "  pull     Download a whitelisted rootfs into a bundle (alpine, ubuntu)\n\n");
     fprintf(stderr, "Run-mode options (run | start):\n");
     fprintf(stderr, "  --debug                  Enable debug output\n");
     fprintf(stderr, "  --pid                    Enable PID namespace\n");
@@ -919,6 +1091,7 @@ void cli_usage(const char *progname) {
     fprintf(stderr, "  --interactive            Allocate PTY (run only)\n");
     fprintf(stderr, "  --secure                 Drop caps + NO_NEW_PRIVS + seccomp + RO /sys (Phase 8b)\n");
     fprintf(stderr, "  --init                   Run a PID-1 init shim (forward signals, reap zombies) (Phase 8b+)\n");
+    fprintf(stderr, "  --bundle <dir>           Run an OCI bundle: <dir>/config.json + <dir>/rootfs/ (Phase 8c)\n");
     fprintf(stderr, "  --env KEY=VALUE          Set environment variable\n");
     fprintf(stderr, "  --help                   Show this help\n\n");
     fprintf(stderr, "Backwards compat: %s [options] <command> [args]\n", progname);

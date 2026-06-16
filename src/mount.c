@@ -326,3 +326,227 @@ int mount_sys_ro(bool enable_debug)
     }
     return 0;
 }
+
+/* ===== Phase 8c — OCI mount / masked-path / readonly-path helpers ===== */
+
+/* Split a comma-joined OCI mount-option string into VFS mount flags
+ * (MS_*) and a residual filesystem-specific data string.  The OCI
+ * `options` array conflates the two: "nosuid"/"nodev"/"noexec"/"ro"/...
+ * are VFS flags the kernel wants as the mountflags argument, while
+ * "mode=755"/"size=65536k"/... are tmpfs data.  Passing a VFS-flag
+ * token through mount(2)'s data argument makes the call fail EINVAL
+ * (the filesystem doesn't understand it) — real umoci bundles mount
+ * tmpfs at /dev with exactly such mixed options, so the two must be
+ * separated the way mount(8) / util-linux does. */
+static unsigned long parse_mount_options(const char *opts,
+                                         char *data_out, size_t data_size)
+{
+    unsigned long flags = 0;
+    if (data_out && data_size) data_out[0] = '\0';
+    if (!opts || !*opts) return 0;
+
+    char buf[256];
+    strncpy(buf, opts, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    size_t dlen = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        if      (strcmp(tok, "ro") == 0)          flags |= MS_RDONLY;
+        else if (strcmp(tok, "rw") == 0)          flags &= ~(unsigned long)MS_RDONLY;
+        else if (strcmp(tok, "nosuid") == 0)      flags |= MS_NOSUID;
+        else if (strcmp(tok, "suid") == 0)        flags &= ~(unsigned long)MS_NOSUID;
+        else if (strcmp(tok, "nodev") == 0)       flags |= MS_NODEV;
+        else if (strcmp(tok, "dev") == 0)         flags &= ~(unsigned long)MS_NODEV;
+        else if (strcmp(tok, "noexec") == 0)      flags |= MS_NOEXEC;
+        else if (strcmp(tok, "exec") == 0)        flags &= ~(unsigned long)MS_NOEXEC;
+        else if (strcmp(tok, "noatime") == 0)     flags |= MS_NOATIME;
+        else if (strcmp(tok, "nodiratime") == 0)  flags |= MS_NODIRATIME;
+        else if (strcmp(tok, "relatime") == 0)    flags |= MS_RELATIME;
+        else if (strcmp(tok, "strictatime") == 0) flags &= ~(unsigned long)(MS_RELATIME | MS_NOATIME);
+        else if (strcmp(tok, "sync") == 0)        flags |= MS_SYNCHRONOUS;
+        else if (strcmp(tok, "dirsync") == 0)     flags |= MS_DIRSYNC;
+        else {
+            /* fs-specific data: mode=, size=, uid=, gid=, nr_inodes=, ... */
+            size_t tlen = strlen(tok);
+            if (data_out && dlen + tlen + (dlen ? 1u : 0u) < data_size) {
+                if (dlen) data_out[dlen++] = ',';
+                memcpy(data_out + dlen, tok, tlen);
+                dlen += tlen;
+                data_out[dlen] = '\0';
+            }
+        }
+    }
+    return flags;
+}
+
+/* Apply a single OCI mount entry. Dispatches by mount.type. */
+int apply_oci_mount(const oci_mount_t *m, bool enable_debug)
+{
+    if (m == NULL || m->destination[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* /proc is handled by mount_proc — skip here. The OCI bundle
+     * typically requests /proc as type "proc"; we honor it by
+     * doing nothing (mount_proc runs separately and does the work). */
+    if (strcmp(m->type, "proc") == 0 && strcmp(m->destination, "/proc") == 0) {
+        if (enable_debug) {
+            fprintf(stderr,
+                "[oci-mount] Deferring /proc to mount_proc()\n");
+        }
+        return 0;
+    }
+
+    /* /dev/pts is handled by mount_devpts (Phase 7b §7.2.2 — runs
+     * unconditionally when a rootfs is set, with the newinstance +
+     * ptmxmode options the PTY path depends on).  Defer like /proc;
+     * umoci bundles routinely include a devpts entry. */
+    if (strcmp(m->type, "devpts") == 0) {
+        if (enable_debug) {
+            fprintf(stderr,
+                "[oci-mount] Deferring /dev/pts to mount_devpts()\n");
+        }
+        return 0;
+    }
+
+    /* /sys handled by mount_sys_ro when --secure. If --secure was not
+     * passed and the OCI requests /sys, mount it RW (default sysfs). */
+    if (strcmp(m->type, "sysfs") == 0 && strcmp(m->destination, "/sys") == 0) {
+        if (mount("sysfs", "/sys", "sysfs", 0, NULL) < 0) {
+            if (errno != EBUSY) {
+                perror("mount(sysfs)");
+                return -1;
+            }
+        }
+        if (enable_debug) {
+            fprintf(stderr, "[oci-mount] /sys mounted (sysfs)\n");
+        }
+        return 0;
+    }
+
+    if (strcmp(m->type, "tmpfs") == 0) {
+        /* Real bundles mount tmpfs at /dev, /dev/shm, etc. — the
+         * mountpoint may not exist in the extracted rootfs, and
+         * mount(2) fails ENOENT without it.  Same EEXIST-tolerant
+         * mkdir bind_mount_apply uses for its targets. */
+        if (mkdir(m->destination, 0755) < 0 && errno != EEXIST) {
+            perror("mkdir(tmpfs destination)");
+            return -1;
+        }
+        /* Separate VFS flags (nosuid/nodev/...) from tmpfs data
+         * (mode=/size=/...) — passing the raw options string as data
+         * fails EINVAL on the flag tokens. */
+        char data[256];
+        unsigned long mflags = parse_mount_options(m->options, data, sizeof(data));
+        if (mount("tmpfs", m->destination, "tmpfs", mflags,
+                  data[0] ? data : NULL) < 0) {
+            perror("mount(tmpfs)");
+            return -1;
+        }
+        if (enable_debug) {
+            fprintf(stderr, "[oci-mount] tmpfs at %s (flags=0x%lx data=%s)\n",
+                    m->destination, mflags, data);
+        }
+        return 0;
+    }
+
+    if (strcmp(m->type, "bind") == 0 || m->type[0] == '\0') {
+        /* Bind mounts have a HOST source, which is unreachable here:
+         * apply_oci_mount runs AFTER setup_rootfs's pivot_root, and the
+         * old root is detached by then (decisions.md Error #22). So
+         * bind-type OCI mounts are NOT applied here — they are converted
+         * to bind_mount_t entries at parse time, appended to
+         * config->mounts[], and applied by setup_rootfs BEFORE the pivot
+         * (the same path --volume binds use). Reaching this branch means
+         * a bind entry slipped past that conversion; treat it as a bug
+         * rather than doing an inline mount whose source won't resolve. */
+        fprintf(stderr,
+            "[oci-mount] bind %s -> %s reached apply_oci_mount; bind "
+            "mounts must be hoisted to the pre-pivot path (Error #22)\n",
+            m->source, m->destination);
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Other types (cgroup, devpts, mqueue, ...) — silently skipped for now.
+     * A production runtime handles each. Educational simplification. */
+    if (enable_debug) {
+        fprintf(stderr, "[oci-mount] Unsupported type '%s' — skipped\n",
+                m->type);
+    }
+    return 0;
+}
+
+/* Mask a path by bind-mounting /dev/null over it. The /dev/null device
+ * must exist inside the container — typically does after setup_rootfs
+ * pivots in a real rootfs. */
+int apply_masked_path(const char *path, bool enable_debug)
+{
+    if (!path) return 0;
+
+    /* If the target doesn't exist, OCI says skip silently. */
+    if (access(path, F_OK) < 0) {
+        if (enable_debug) {
+            fprintf(stderr, "[masked] %s missing, skipping\n", path);
+        }
+        return 0;
+    }
+
+    /* If it's a directory, bind-mount an empty tmpfs over it instead
+     * of /dev/null (since /dev/null is a char device, can't replace a
+     * dir). */
+    struct stat sb;
+    if (stat(path, &sb) < 0) {
+        perror("stat(masked path)");
+        return -1;
+    }
+
+    if (S_ISDIR(sb.st_mode)) {
+        if (mount("tmpfs", path, "tmpfs", MS_RDONLY, NULL) < 0) {
+            perror("mount(tmpfs over masked dir)");
+            return -1;
+        }
+    } else {
+        if (mount("/dev/null", path, NULL, MS_BIND, NULL) < 0) {
+            perror("mount(/dev/null bind over masked path)");
+            return -1;
+        }
+    }
+
+    if (enable_debug) {
+        fprintf(stderr, "[masked] %s\n", path);
+    }
+    return 0;
+}
+
+/* Remount a path as read-only via MS_BIND | MS_REMOUNT | MS_RDONLY.
+ * Same kernel quirk as Phase 7b's MS_RDONLY bind mounts. */
+int apply_readonly_path(const char *path, bool enable_debug)
+{
+    if (!path) return 0;
+
+    if (access(path, F_OK) < 0) {
+        if (enable_debug) {
+            fprintf(stderr, "[readonly] %s missing, skipping\n", path);
+        }
+        return 0;
+    }
+
+    /* First mount(MS_BIND) to make it a self-bind, then remount RO. */
+    if (mount(path, path, NULL, MS_BIND, NULL) < 0) {
+        perror("mount(self-bind for readonly path)");
+        return -1;
+    }
+    if (mount(NULL, path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) {
+        perror("mount(remount-RO)");
+        return -1;
+    }
+
+    if (enable_debug) {
+        fprintf(stderr, "[readonly] %s\n", path);
+    }
+    return 0;
+}

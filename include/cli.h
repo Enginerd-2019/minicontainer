@@ -19,6 +19,7 @@ typedef enum {
     SUBCMD_STATS,       /* NEW in 8a */
     SUBCMD_TOP,         /* NEW in 8a */
     SUBCMD_NETSTAT,     /* NEW in 8a */
+    SUBCMD_PULL,        /* NEW in 8c */
 } subcommand_t;
 
 /**

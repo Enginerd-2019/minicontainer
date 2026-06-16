@@ -3297,6 +3297,62 @@ CLI-layer logic through at least one end-to-end test.
 
 ---
 
+### Error #27: OCI `tmpfs` Mounts Failed `EINVAL` — Mount-Option String Passed as `data` Instead of Split into VFS Flags (Phase 8c)
+
+**Symptom:** Running a bundle whose `config.json` mounts a tmpfs with the
+ordinary options `["nosuid","nodev"]` aborted the child immediately:
+
+```
+mount(tmpfs): Invalid argument
+[child] Failed to apply OCI mount tmpfs -> /mnt-tmp
+```
+
+A bundle that mounted tmpfs with *no* options, or only data-style options
+(`mode=755`), worked. Since `umoci`/`buildah` bundles routinely mount
+tmpfs at `/dev` with `["nosuid","strictatime","mode=755","size=65536k"]`,
+this broke essentially every real-world bundle.
+
+**Cause:** `apply_oci_mount` joined the OCI `mounts[].options` array into a
+single comma string and handed it to `mount(2)` as the **fifth argument
+(`data`)**:
+
+```c
+mount("tmpfs", m->destination, "tmpfs", 0, m->options);  /* "nosuid,nodev" as data */
+```
+
+But the OCI options array conflates two distinct things: **VFS mount
+flags** (`nosuid`→`MS_NOSUID`, `nodev`→`MS_NODEV`, `ro`→`MS_RDONLY`, …),
+which belong in the **fourth argument (`mountflags`)**, and
+**filesystem-specific data** (`mode=`, `size=`, …), which belong in
+`data`. tmpfs's data parser does not recognize `nosuid`/`nodev` as data
+keys, so it rejects the mount with `EINVAL`. The runtime is responsible
+for splitting the array the way `mount(8)`/util-linux does.
+
+**Why the tests missed it:** the OCI unit tests validate the parser and
+the config translator (e.g. that the options join to `"nosuid,nodev"` —
+correct as a *parse* result). They never call `mount(2)`, which requires
+root and a real mount namespace. The defect was entirely in the consume
+side, which runs only inside the cloned child of a privileged `--bundle`
+launch; it surfaced only on a live end-to-end run as root — the same
+"bug one layer below the unit test's reach" shape as Error #26.
+
+**Fix Applied:** 2026-06-16 — added a `parse_mount_options()` helper to
+`mount.c` that tokenizes the options, maps the VFS-flag tokens
+(`ro/rw/nosuid/suid/nodev/dev/noexec/exec/noatime/nodiratime/relatime/
+strictatime/sync/dirsync`) to their `MS_*` bits, and accumulates the
+remaining unrecognized tokens into a residual `data` string.
+`apply_oci_mount`'s tmpfs branch now calls
+`mount("tmpfs", dst, "tmpfs", mflags, data[0] ? data : NULL)`. Verified:
+`mount` inside the container reports
+`tmpfs on /mnt-tmp type tmpfs (rw,nosuid,nodev,relatime,inode64)` — the
+flags land as flags. Lesson: a flat option-string array is a lossy
+encoding of (flags, data); the consumer must restore the split, and the
+naive `mount(…, 0, options)` compiles, parses, and passes parser-level
+tests while still being wrong against any real input that carries a flag
+token.
+
+---
+
 ---
 
 ## Known Limitations

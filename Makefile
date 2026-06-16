@@ -39,7 +39,8 @@ HELPER_OBJS = $(BUILD_DIR)/core.o $(BUILD_DIR)/env.o \
               $(BUILD_DIR)/cleanup.o \
               $(BUILD_DIR)/inspector.o \
               $(BUILD_DIR)/hardening.o \
-              $(BUILD_DIR)/init.o
+              $(BUILD_DIR)/init.o \
+              $(BUILD_DIR)/oci.o $(BUILD_DIR)/pull.o
 
 # Executables
 MINICONTAINER  = minicontainer
@@ -54,6 +55,8 @@ TEST_BIND      = test_bind
 TEST_CLI       = test_cli
 TEST_HARDENING = test_hardening
 TEST_INIT      = test_init
+TEST_OCI       = test_oci
+TEST_PULL      = test_pull
 
 # Default target
 .PHONY: all
@@ -137,10 +140,21 @@ $(TEST_INIT): $(BUILD_DIR)/test_init.o $(HELPER_OBJS) $(LIBPROCFS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built $(TEST_INIT) successfully!"
 
+# Phase 8c: OCI config.json parser + translator tests (no root required)
+$(TEST_OCI): $(BUILD_DIR)/test_oci.o $(HELPER_OBJS) $(LIBPROCFS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_OCI) successfully!"
+
+# Phase 8c: pull whitelist tests (no root; download cases SKIP when offline)
+$(TEST_PULL): $(BUILD_DIR)/test_pull.o $(HELPER_OBJS) $(LIBPROCFS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built $(TEST_PULL) successfully!"
+
 # Build and run all tests
 .PHONY: test
 test: $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
-      $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING) $(TEST_INIT)
+      $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING) $(TEST_INIT) $(TEST_OCI) \
+      $(TEST_PULL)
 	@echo "=== Running Phase 7a core tests (bare_exec + pid_only, requires root) ==="
 	sudo ./$(TEST_CORE)
 	@echo ""
@@ -181,6 +195,12 @@ test: $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TE
 	@echo ""
 	@echo "=== Running Phase 8b+ init-supervisor tests (signal forwarding / reaping / status; no root needed) ==="
 	./$(TEST_INIT)
+	@echo ""
+	@echo "=== Running Phase 8c OCI parser/translator tests (no root needed) ==="
+	./$(TEST_OCI)
+	@echo ""
+	@echo "=== Running Phase 8c pull whitelist tests (no root; downloads SKIP offline) ==="
+	./$(TEST_PULL)
 
 # Build with debug symbols
 .PHONY: debug
@@ -248,7 +268,7 @@ uninstall-apparmor:
 clean:
 	@rm -rf $(BUILD_DIR)
 	@rm -f $(MINICONTAINER) $(TEST_CORE) $(TEST_MOUNT) $(TEST_OVERLAY) $(TEST_UTS) $(TEST_CGROUP) $(TEST_NET) \
-	       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING) $(TEST_INIT)
+	       $(TEST_STATE) $(TEST_BIND) $(TEST_CLI) $(TEST_HARDENING) $(TEST_INIT) $(TEST_OCI) $(TEST_PULL)
 	@echo "Cleaned build artifacts"
 
 # Run example commands

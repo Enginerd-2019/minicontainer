@@ -49,6 +49,19 @@ typedef struct {
     int  stderr_fd;           // -1 = leave alone
     bool enable_hardening;    // Phase 8b: gates cap drop / NO_NEW_PRIVS / seccomp (and mount_sys_ro)
     bool enable_init;         // Phase 8b+: wrap workload in the PID-1 init supervisor
+
+    /* Phase 8c — OCI bundle integration (snapshotted from config before
+     * clone(2); all gated on bundle_path[0] != '\0' except rootfs_readonly
+     * / cwd which a plain --rootfs run also leaves zero/"/"). */
+    char        bundle_path[PATH_MAX];
+    char        cwd[PATH_MAX];
+    bool        rootfs_readonly;
+    oci_mount_t oci_mounts[OCI_MAX_MOUNTS];
+    int         oci_mount_count;
+    char        masked_paths[OCI_MAX_MASKED][OCI_MAX_PATH];
+    int         masked_count;
+    char        readonly_paths[OCI_MAX_READONLY][OCI_MAX_PATH];
+    int         readonly_count;
 } child_args_t;
 
 /**
@@ -147,6 +160,27 @@ static int child_func(void *arg)
             return 1;
         }
 
+        /* 3b (Phase 8c — NEW): OCI NON-bind mounts (tmpfs/sysfs; /proc and
+         * devpts entries defer to mount_proc/mount_devpts below).  Bind-type
+         * OCI mounts were hoisted into setup_rootfs's pre-pivot pass above
+         * (decisions.md Error #22), so they are skipped here.  Whole block
+         * gated on bundle_path so a plain --rootfs run skips it entirely. */
+        if (args->bundle_path[0] != '\0') {
+            for (int i = 0; i < args->oci_mount_count; i++) {
+                if (strcmp(args->oci_mounts[i].type, "bind") == 0 ||
+                    args->oci_mounts[i].type[0] == '\0')
+                    continue;   /* applied pre-pivot via bind_mount_t */
+                if (apply_oci_mount(&args->oci_mounts[i],
+                                     args->enable_debug) < 0) {
+                    fprintf(stderr,
+                        "[child] Failed to apply OCI mount %s -> %s\n",
+                        args->oci_mounts[i].source,
+                        args->oci_mounts[i].destination);
+                    return 1;
+                }
+            }
+        }
+
         /* 4. /proc with Phase 4b graceful degradation. */
         if (mount_proc(args->enable_debug) < 0) {
             if (args->user_namespace_active) {
@@ -177,6 +211,63 @@ static int child_func(void *arg)
             if (mount_sys_ro(args->enable_debug) < 0) {
                 fprintf(stderr, "[child] Failed to mount /sys read-only\n");
                 return 1;
+            }
+        }
+
+        /* 7 (Phase 8c — NEW): OCI masked paths.  AFTER mount_proc — they
+         * overlay paths inside /proc (e.g. /proc/kcore). */
+        if (args->bundle_path[0] != '\0') {
+            for (int i = 0; i < args->masked_count; i++) {
+                if (apply_masked_path(args->masked_paths[i],
+                                       args->enable_debug) < 0) {
+                    fprintf(stderr,
+                        "[child] Failed to apply masked path %s\n",
+                        args->masked_paths[i]);
+                    return 1;
+                }
+            }
+        }
+
+        /* 8 (Phase 8c — NEW): OCI readonly paths. */
+        if (args->bundle_path[0] != '\0') {
+            for (int i = 0; i < args->readonly_count; i++) {
+                if (apply_readonly_path(args->readonly_paths[i],
+                                         args->enable_debug) < 0) {
+                    fprintf(stderr,
+                        "[child] Failed to apply readonly path %s\n",
+                        args->readonly_paths[i]);
+                    return 1;
+                }
+            }
+        }
+
+        /* 9 (Phase 8c — NEW): remount the rootfs read-only if
+         * root.readonly was set.  Must come AFTER mount_devpts — its
+         * mkdir("/dev/pts") would fail EROFS on a read-only root. */
+        if (args->rootfs_readonly) {
+            if (mount(NULL, "/", NULL,
+                      MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) {
+                fprintf(stderr,
+                    "[child] Failed to remount rootfs read-only: %s\n",
+                    strerror(errno));
+                return 1;
+            }
+            if (args->enable_debug) {
+                fprintf(stderr, "[child] rootfs remounted read-only\n");
+            }
+        }
+
+        /* 10 (Phase 8c — NEW): chdir to OCI process.cwd (resolved inside
+         * the pivoted container root). */
+        if (args->cwd[0] != '\0' && strcmp(args->cwd, "/") != 0) {
+            if (chdir(args->cwd) < 0) {
+                fprintf(stderr,
+                    "[child] Failed to chdir to %s: %s\n",
+                    args->cwd, strerror(errno));
+                return 1;
+            }
+            if (args->enable_debug) {
+                fprintf(stderr, "[child] cwd -> %s\n", args->cwd);
             }
         }
     }
@@ -468,11 +559,37 @@ container_result_t container_start(const container_config_t *config) {
         .stdout_fd = config->stdout_fd,
         .stderr_fd = config->stderr_fd,
         .enable_hardening = config->enable_hardening,  // Phase 8b
-        .enable_init = config->enable_init             // Phase 8b+
+        .enable_init = config->enable_init,            // Phase 8b+
+        /* Phase 8c — OCI scalar/count fields (the arrays are copied
+         * below; designated init zeroes everything not named here). */
+        .rootfs_readonly = config->rootfs_readonly,
+        .oci_mount_count = config->oci_mount_count,
+        .masked_count    = config->masked_count,
+        .readonly_count  = config->readonly_count
     };
     if (config->mount_count > 0) {
         memcpy(child_args.mounts, config->mounts,
                sizeof(bind_mount_t) * (size_t)config->mount_count);
+    }
+
+    /* Phase 8c: snapshot the OCI bundle arrays/strings into child_args
+     * BEFORE clone (Phase 6 §3.4.1 — post-clone parent writes are
+     * invisible to the child).  All no-ops for a non-bundle run:
+     * bundle_path stays empty, counts zero, cwd empty. */
+    memcpy(child_args.bundle_path, config->bundle_path,
+           sizeof(child_args.bundle_path));
+    memcpy(child_args.cwd, config->cwd, sizeof(child_args.cwd));
+    if (config->oci_mount_count > 0) {
+        memcpy(child_args.oci_mounts, config->oci_mounts,
+               sizeof(oci_mount_t) * (size_t)config->oci_mount_count);
+    }
+    if (config->masked_count > 0) {
+        memcpy(child_args.masked_paths, config->masked_paths,
+               sizeof(config->masked_paths[0]) * (size_t)config->masked_count);
+    }
+    if (config->readonly_count > 0) {
+        memcpy(child_args.readonly_paths, config->readonly_paths,
+               sizeof(config->readonly_paths[0]) * (size_t)config->readonly_count);
     }
 
     /* Step 6: clone flags */
