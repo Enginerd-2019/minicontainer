@@ -1174,7 +1174,7 @@ plus the unprivileged subset of `test_uts`.
 
 ### 31. `user_ns_mapping_t` Replaces the Synthetic `uts_config_t` Workaround (Phase 7a)
 
-**Decision:** Introduce a five-field struct `user_ns_mapping_t` in
+**Decision:** Introduce a seven-field struct `user_ns_mapping_t` in
 `uts.h` and change `setup_user_namespace_mapping()`'s signature from
 `(pid_t child_pid, const uts_config_t *config)` to `(pid_t child_pid,
 const user_ns_mapping_t *config)`. The new struct contains only the
@@ -3186,7 +3186,7 @@ it. `container_id` was wired end-to-end *except* for the one assignment
 in the CLI handlers, and nothing downstream of an empty value was ever
 run.
 
-**Fix Applied:** 2026-06-07
+**Fix Applied:** 2026-06-08
 
 ---
 
@@ -3275,7 +3275,7 @@ enforced" are different claims; only the latter requires the placement
 to win the race, and the deterministic way to win it is to gate the
 child until placement is done.
 
-**Fix Applied:** 2026-06-07
+**Fix Applied:** 2026-06-08
 
 ---
 
