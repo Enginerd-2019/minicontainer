@@ -2732,7 +2732,27 @@ told). This generalizes beyond AppArmor (SELinux, Landlock, Lockdown
 mode) — each LSM has its own knobs that can produce identical
 `EPERM` surface from inside a "successfully created" namespace.
 
-**Fix Applied:** 2026-05-14 (documentation)
+**Fix Applied:** 2026-05-14 (documentation; the per-binary AppArmor profile shipped the same day — see the update below)
+
+**Update (2026-10-12) — option 2 shipped the same day.** The per-binary
+AppArmor profile described above as "rejected (for now)" was in fact
+adopted in the Phase 7a commit of 2026-05-14. It ships as
+`scripts/apparmor/minicontainer.profile.in`; `make install-apparmor`
+renders the built binary's absolute path into it, installs it as
+`/etc/apparmor.d/minicontainer`, and loads it with `apparmor_parser -r`
+(`make uninstall-apparmor` reverses both steps). The profile carries a
+single rule, `userns,`, under `flags=(unconfined)` — plus an
+`include if exists <local/minicontainer>` hook for site additions — so it
+opts this one binary into unprivileged-userns creation and sandboxes
+nothing else, the same pattern Docker, Podman, Chromium, and Firefox use.
+The README's rootless quickstart now presents that one command as the
+recommended one-time setup, and its troubleshooting entry lists the
+remaining alternatives as a complain-mode-confined parent, `sudo`, or
+disabling the sysctl host-wide (marked not recommended). The "too
+invasive" objection was resolved by making the install an optional
+Makefile target rather than a required step: nothing changes for users
+who never run it. The analysis above is preserved as originally written;
+this note corrects the record of what was actually done.
 
 ---
 
