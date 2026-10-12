@@ -20,7 +20,7 @@
  */
 
 /*
- * Drop all Linux capabilities except a minimal whitelist (~14).
+ * Drop all Linux capabilities except a minimal whitelist (14).
  * Modifies all four cap sets (permitted, effective, inheritable,
  * bounding) so dropped caps can never be reacquired.
  *
@@ -48,8 +48,8 @@ int drop_capabilities(bool enable_debug);
 int apply_no_new_privs(bool enable_debug);
 
 /*
- * Install a seccomp BPF filter allowing ~250 of the ~400 kernel
- * syscalls. Dangerous syscalls (mount, unshare, kexec, ptrace, etc.)
+ * Install a seccomp BPF filter allowing 210 kernel syscalls (427 BPF
+ * instructions). Dangerous syscalls (mount, unshare, kexec, ptrace, etc.)
  * are either denied with EPERM or kill the process.
  *
  * MUST be called AFTER apply_no_new_privs() — the kernel requires

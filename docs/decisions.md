@@ -1,8 +1,8 @@
 # Design Decisions and Error Log
 
 **Project:** minicontainer - Minimal Container Runtime
-**Phase:** 8a - Process Inspector Integration (libprocfs)
-**Last Updated:** 2026-06-09
+**Phase:** 8c - OCI Bundle Support
+**Last Updated:** 2026-10-12
 
 ---
 
@@ -611,7 +611,7 @@ retained and imported for its lifecycle helpers (`setup_cgroup`,
   of a new feature in the same phase would obscure both.
 
 **Trade-offs:**
-- Five copies of `child_func()` now exist (`namespace.c`, `mount.c`,
+- Six copies of `child_func()` now exist (`namespace.c`, `mount.c`,
   `overlay.c`, `uts.c`, `cgroup.c`, `net.c`). Phase 7a will collapse them
   to one. Until then, the symmetry is the documentation.
 
@@ -944,17 +944,18 @@ commands required.
 ### 30. Execution-Core Consolidation: Five `*_exec()` Functions Become One (Phase 7a)
 
 **Decision:** Replace the five per-phase orchestrators (`mount_exec`,
-`overlay_exec`, `uts_exec`, `cgroup_exec`, `net_exec` — plus the
-already-deleted `spawn_process` / `namespace_exec`) with a single
+`overlay_exec`, `uts_exec`, `cgroup_exec`, `net_exec` — plus the two
+earlier launchers they had superseded, `spawn_process` / `namespace_exec`,
+deleted in this same refactor) with a single
 `container_exec(const container_config_t *)` in a new `core.c`
 module. The new function takes one unified `container_config_t`
 covering every flag and parameter; behavior in each phase is recovered
 by setting the corresponding flag.
 
-The five duplicate `child_func` definitions, five duplicate
-`close_inherited_fds` definitions, and five file-local `child_args_t`
-struct definitions collapse to one canonical copy each, also in
-`core.c`. `build_container_env()` (decisions.md #21 prepared this
+The six duplicate `child_func` definitions (`namespace.c` through
+`net.c`), four duplicate `close_inherited_fds` definitions (`overlay.c`,
+`uts.c`, `cgroup.c`, `net.c`), and six file-local `child_args_t` struct
+definitions collapse to one canonical copy each, also in `core.c`. `build_container_env()` (decisions.md #21 prepared this
 specifically) moves out of `main.c` into its own `env.c` / `env.h`
 module so tests and future subcommands can use it without dragging in
 the CLI layer.
@@ -970,8 +971,9 @@ By Phase 6 the superseding module pattern (decisions.md #7, #9, #13,
    additions).
 2. A `static close_inherited_fds(bool enable_debug)` — the
    CVE-2024-21626 / CVE-2016-9962 mitigation, defined `static` in
-   `uts.c` first, then copy-pasted into `cgroup.c`, `net.c`, and
-   `overlay.c` because cross-module `static` symbols aren't reachable.
+   `overlay.c` first (Phase 3, Decision #15), then copy-pasted into
+   `uts.c`, `cgroup.c`, and `net.c` because cross-module `static`
+   symbols aren't reachable.
 3. A `static child_func(void *arg)` — the child-side lifecycle (sync
    wait → setup_uts → setup_rootfs → mount_proc → close_inherited_fds
    → execve), extended in each phase with one new step
@@ -1539,9 +1541,10 @@ to 48 bits. That was fine in isolation — the overlay ID was internal
 to overlay.c's directory naming and never had to agree with any
 other module's view of the container.
 
-Phase 5 onward gradually erased that isolation: cgroup directories
-adopted the overlay's ID via parameter passing, then veth interface
-names did the same. By Phase 7a the overlay-generated ID was the
+Phase 6 onward gradually erased that isolation: veth interface names
+adopted the overlay's ID via parameter passing (the Phase 5 cgroup
+directory did not and still does not — it is named
+`minicontainer_<sec>_<nsec>` from a timestamp). By Phase 7a the overlay-generated ID was the
 container's identity *implicitly*, but nothing in the source code
 documented that — `overlay.c::generate_container_id` was still
 `static` and the function name was still generic.
@@ -1582,8 +1585,10 @@ one for the same container.
 **Rationale:**
 
 - **One source of truth for identity.** The same container's state
-  file, overlay directory, cgroup directory, and veth name all
-  agree on a single 12-hex ID. `cleanup`'s pairing logic works.
+  file, overlay directory, and veth name all agree on a single
+  12-hex ID (the cgroup directory keeps its timestamp name,
+  `minicontainer_<sec>_<nsec>`, and is linked to the ID through
+  `state.json`'s `cgroup_path`). `cleanup`'s pairing logic works.
 - **No timestamp leakage.** `/dev/urandom` reveals no operational
   metadata — wall-clock time of container start, PID-namespace
   position, host load — all of which a `time^pid` hash exposes.
@@ -1725,7 +1730,7 @@ library:
    inheritable (`capset(2)` with `_LINUX_CAPABILITY_VERSION_3`). No libcap.
 2. **`NO_NEW_PRIVS`** — `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
 3. **Seccomp BPF allow-list** — a hand-assembled `struct sock_filter`
-   program (~165 allow-listed syscalls) installed via
+   program (210 allow-listed syscalls, 427 BPF instructions) installed via
    `prctl(PR_SET_SECCOMP)`. No libseccomp.
 4. **Read-only `/sys`** — `mount_sys_ro` mounts sysfs `MS_RDONLY`.
 
@@ -1824,6 +1829,134 @@ tests) and the on-disk contract are unaffected.
 (`cmd_run`/`cmd_start` call `state_claim_id`).
 
 **Implemented:** 2026-06-16
+
+---
+
+### 38. OCI Bundle Support — Hand-Rolled `config.json` Parser, `--bundle`, `pull`, and `oci-state.json` (Phase 8c)
+
+**Recorded:** 2026-10-12, retroactively, for the work shipped at tag
+`phase-8c` (commit `ffd6621`). Until this entry the only Phase 8c record
+in this file was Error #27; the design lived in `src/oci.c` comments and
+`README.md`.
+
+**Decision:** Add `--bundle <dir>` (runs an OCI runtime bundle from
+`<dir>/config.json` + `<dir>/rootfs/`), a `pull <tag>` subcommand, and a
+runc-schema `oci-state.json`, built on a hand-rolled parser rather than a
+JSON library.
+
+**Parser (`src/oci.c`, `include/oci.h`):**
+- Recursive-descent JSON parser, depth-limited (`JSON_MAX_DEPTH 16`). No
+  jansson/cJSON/json-c — zero runtime dependencies, and the parser is
+  itself teaching material (continues the hand-rolled `state.json`
+  parser from Phase 7b).
+- `ociVersion` must start with `"1."`; anything else is rejected.
+- About 22 fields are consumed; everything else is silently skipped and
+  counted in `ignored_count` (logged under `--debug`). The parsed-vs-
+  ignored split is listed in the `oci_config_t` comment in `oci.h`.
+
+**CLI semantics (`src/cli.c`):**
+- `--bundle` and `--rootfs` are mutually exclusive.
+- `argv` is pre-scanned for `--bundle` before the getopt loop, so CLI
+  flags override bundle fields regardless of argument order.
+- The config-build tail of `parse_run_flags` assigns a field only when
+  its flag was actually passed; an unconditional tail would overwrite
+  every bundle-populated field (worst case: a bundle-supplied rootfs
+  with `enable_mount_namespace` recomputed false, i.e. `pivot_root`
+  against the host mount table). Namespace invariants are re-derived
+  from the effective config.
+- A positional command overrides `process.args` (Docker-style); the
+  Phase 7b "No command specified" error is relaxed when the bundle
+  supplies the program.
+
+**Mounts and paths (`src/oci.c`, `src/mount.c`, `src/core.c`):**
+- **Bundles are trusted input.** A bundle's `mounts[]` lets the bundle
+  author — not the user — choose host bind-mount sources, under sudo.
+  Bind sources are `realpath`-validated and a loud warning is printed
+  when one resolves outside the bundle directory.
+- `bind`-type (or untyped) entries are converted to `bind_mount_t` at
+  parse time and applied inside `setup_rootfs` *before* `pivot_root`
+  (Error #22: host sources stop resolving after the pivot). `tmpfs`,
+  `sysfs`, `proc`, and `devpts` entries are applied post-pivot by
+  `apply_oci_mount`, which splits VFS flag tokens from filesystem data
+  (Error #27).
+- `linux.maskedPaths` / `linux.readonlyPaths` are applied after
+  `mount_proc`; `root.readonly` remounts the root read-only last;
+  `process.cwd` is honored with `chdir`.
+- Hardening is never auto-enabled from a bundle: `process.noNewPrivileges`
+  and `linux.seccomp` are ignored. `--secure` remains the only way to
+  harden (it accepts a bundle-supplied rootfs).
+
+**`oci-state.json` (`src/state.c`):** written atomically (`.tmp` +
+`rename`) next to `state.json` for bundle-started containers, with
+`ociVersion` (`"1.0.2"`), `id`, `pid`, `status` (`running`/`stopped`),
+`bundle`, `rootfs`, `created` (reuses `started_at`), `owner` (empty);
+removed by `state_remove`. It follows the documented output schema of
+`runc state`; it does not read, and is not read by, runc's private
+on-disk layout.
+
+**`pull <tag>` (`src/pull.c`):** a hardcoded two-entry whitelist
+(`alpine` → Alpine minirootfs, `ubuntu` → Ubuntu jammy cloud-image root
+tarball) fetched with `curl`/`wget` + `tar`, writing a default
+`config.json`. Explicitly **not** a registry client; arbitrary images
+are out of scope (`skopeo` + `umoci unpack`). Extraction runs as root
+and HTTPS authenticates the CDN, not the bytes — pinned sha256 per entry
+is the recommended hardening.
+
+**Trade-offs:**
+- A ~22-field subset means real bundles may carry fields that are
+  silently ignored (capabilities, rlimits, seccomp, devices, hooks,
+  annotations, ...). Debug mode reports the count, not the names.
+- The parser's unit tests validate parsing and translation only; the
+  consume side (`mount(2)` in the cloned child, as root) is covered by
+  live runs, which is where Error #27 surfaced.
+
+**Files affected:** `src/oci.c`, `include/oci.h`, `src/pull.c`,
+`include/pull.h`, `src/cli.c`, `src/core.c`, `src/mount.c`,
+`include/mount.h`, `src/state.c`, `include/state.h`, `include/core.h`,
+`include/cli.h`, `src/main.c`, `tests/test_oci.c`, `tests/test_pull.c`,
+`Makefile`.
+
+**Related:** Error #22 (why bind mounts go pre-pivot), Error #26 (the
+same "tail overwrites earlier state" hazard in `parse_run_flags`),
+Error #27, Decision #37 (the atomic-write pattern `oci-state.json`
+reuses).
+
+---
+
+### 39. Opt-In `--init` PID-1 Supervisor (Phase 8b+)
+
+**Recorded:** 2026-10-12, retroactively, for commit `14c9ffc` (tag
+`phase-8b-plus`).
+
+**Decision:** Add an opt-in `--init` flag that runs the workload under a
+minimal in-process init (`src/init.c`, `include/init.h`) — the
+equivalent of `docker run --init` (tini / dumb-init), compiled into
+minicontainer rather than shipped as a separate binary.
+
+**Rationale:** the container's entry process is PID 1 of its PID
+namespace, and PID 1 only receives a signal from an ancestor namespace if
+it has installed a handler for it (`man 7 pid_namespaces`). A workload
+without a `SIGTERM` handler therefore silently ignores `minicontainer
+stop`'s `kill(pid, SIGTERM)`, and `stop` always waits out its grace
+timer before `SIGKILL`.
+
+**Mechanism:** `run_init_supervisor` is called from `child_func` in place
+of the direct `execve` when `--init` is set. It forks: the child
+`execve`s the workload exactly as the no-init path would; the parent
+stays as PID 1 and forwards `SIGTERM`/`SIGINT`/`SIGQUIT`/`SIGHUP`/
+`SIGUSR1`/`SIGUSR2` to the workload, reaps orphaned grandchildren that
+reparent to it, and exits with the workload's status — `WEXITSTATUS` on
+a normal exit, or re-raising the terminating signal so the host-side
+`waitpid` observes the same `WIFSIGNALED` result as without `--init`.
+It runs after the Phase 8b hardening steps, so both the supervisor and
+the workload inherit the `--secure` envelope.
+
+**Trade-offs:** the workload becomes PID 2, which is visible to anything
+that inspects its own PID; `--init` is independent of `--secure` and
+off by default, so Phase 0–8b behavior is unchanged without it.
+
+**Files affected:** `src/init.c`, `include/init.h`, `src/core.c`,
+`include/core.h`, `src/cli.c`, `tests/test_init.c`, `Makefile`.
 
 ---
 
@@ -3430,7 +3563,12 @@ commands can be run inside a live container via `exec`.
 
 ---
 
-### 4. Rootfs Must Be Pre-Built
+### 4. Rootfs Must Be Pre-Built — Mitigated in Phase 8c
+
+> **Status:** Mitigated since this was written. `pull <tag>` (Phase 8c,
+> Decision #38) downloads a whitelisted rootfs (`alpine`, `ubuntu`) into a
+> ready-to-run bundle. There is still no registry client or layer
+> extraction.
 
 **Limitation:** The `--rootfs` flag expects a pre-existing directory with a complete filesystem tree. There is no image pull, layer extraction, or rootfs generation.
 
@@ -3768,7 +3906,7 @@ the specific PID, not a namespace-wide listing).
 
 ---
 
-### Phase 7: CLI & Lifecycle (Split into 7a + 7b — Designed, Not Yet Implemented)
+### Phase 7: CLI & Lifecycle (Split into 7a + 7b — Complete)
 
 **Phase 7a — Execution-Core Consolidation (refactor, no new features):**
 - New `core.c`/`core.h` with unified `container_exec()` collapsing five
@@ -3794,8 +3932,11 @@ the specific PID, not a namespace-wide listing).
 - Bind mounts (`--volume host:container[:ro]`) — note the `MS_RDONLY`
   remount quirk: first `mount(MS_BIND)` silently ignores `MS_RDONLY`,
   a second `mount(MS_BIND|MS_REMOUNT|MS_RDONLY)` is required
-- PTY allocation (`--interactive`) via `posix_openpt` → `grantpt` →
-  `unlockpt` → `ptsname`
+- PTY allocation (`--interactive`): the pair is opened *inside* the
+  child after `mount_devpts` (`posix_openpt` → `grantpt` → `unlockpt` →
+  `ptsname` against the container's own devpts) and the master fd is
+  passed back to the parent over `SCM_RIGHTS`; a slave *path* generated
+  in the parent would not resolve inside the container's devpts
 - `cmd_exec` uses `setns(2)` then `clone()` WITHOUT `CLONE_NEW*` flags
   (joining existing namespaces vs. creating fresh ones)
 - `cmd_start` runs `container_start()` and exits — child orphaned to init,
@@ -3803,7 +3944,7 @@ the specific PID, not a namespace-wide listing).
 
 ---
 
-### Phase 8: Inspector / Hardening / OCI — Split into 8a/8b/8c (8a + 8b implemented; 8c designed)
+### Phase 8: Inspector / Hardening / OCI — Split into 8a/8b/8c (all implemented; 8b+ `--init` added — Decision #39)
 
 - **8a (IMPLEMENTED 2026-06-09):** `libprocfs` extracted into a sibling
   static library — read-side of cgroups (`memory.current`, `cpu.stat`,
@@ -3814,7 +3955,7 @@ the specific PID, not a namespace-wide listing).
   (`prctl(PR_SET_SECCOMP)`, no libseccomp), read-only `/sys`; plus atomic
   state writes and container-ID collision retry. See Decisions #36 and
   #37, and Error #26.
-- **8c (designed, not yet implemented):** OCI runtime-spec compliance
+- **8c (implemented — Decision #38):** OCI runtime-spec compliance
   (`config.json`, bundle format), minimal image extraction from tarballs.
 
 ---

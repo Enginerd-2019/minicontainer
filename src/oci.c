@@ -8,7 +8,7 @@
  *
  * Scope: parses ~22 of the ~120 OCI fields; silently ignores the rest
  * (counted in ignored_count, logged in debug mode). The parsed-vs-
- * ignored field split is documented on oci_config_t in oci.h.
+ * ignored field split is listed in the oci_config_t comment in oci.h.
  */
 
 #include "oci.h"

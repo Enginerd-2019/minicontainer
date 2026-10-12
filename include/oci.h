@@ -25,7 +25,22 @@ typedef struct {
 /* Parsed representation of an OCI config.json.
  * Fields are populated by oci_parse_config; consumed by
  * oci_to_container_config. Fields not present in the JSON are
- * left zero-initialized. */
+ * left zero-initialized.
+ *
+ * PARSED (consumed by the translator):
+ *   ociVersion; hostname; process.args, process.env, process.cwd,
+ *   process.terminal, process.user.uid/gid; root.path, root.readonly;
+ *   mounts[].destination/source/type/options; linux.namespaces[].type;
+ *   linux.uidMappings[0], linux.gidMappings[0];
+ *   linux.resources.memory.limit, .cpu.quota, .cpu.period, .pids.limit;
+ *   linux.maskedPaths, linux.readonlyPaths.
+ * IGNORED (skipped by the parser and counted in ignored_count):
+ *   process.capabilities, process.rlimits, process.noNewPrivileges,
+ *   process.oomScoreAdj, process.selinuxLabel, process.apparmorProfile;
+ *   linux.seccomp, linux.devices, linux.cgroupsPath,
+ *   linux.rootfsPropagation, linux.intelRdt, unknown namespace types,
+ *   linux.resources.devices/blockIO/hugepageLimits/network;
+ *   hooks, annotations, solaris, windows, vm. */
 typedef struct {
     char     oci_version[16];
     char     hostname[256];
